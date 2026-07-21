@@ -1,0 +1,14 @@
+name: "dataarrowrsbuild-py$PYTHON"
+froms: ["cr.ray.io/rayproject/datalbuild-py$PYTHON"]
+dockerfile: ci/docker/dataarrowrs.build.Dockerfile
+srcs:
+  - python/ray/data/_internal/datasource_v2/native/ray_data_arrow_rs/Cargo.toml
+  - python/ray/data/_internal/datasource_v2/native/ray_data_arrow_rs/Cargo.lock
+  - python/ray/data/_internal/datasource_v2/native/ray_data_arrow_rs/pyproject.toml
+  - python/ray/data/_internal/datasource_v2/native/ray_data_arrow_rs/README.md
+  - python/ray/data/_internal/datasource_v2/native/ray_data_arrow_rs/src/lib.rs
+build_args:
+  - DOCKER_IMAGE_BASE_BUILD=cr.ray.io/rayproject/datalbuild-py$PYTHON
+  - PYTHON=$PYTHON
+tags:
+  - cr.ray.io/rayproject/dataarrowrsbuild-py$PYTHON

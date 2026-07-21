@@ -119,6 +119,26 @@ py_test(
     ],
 )
 
+# Exercises the experimental arrow-rs Parquet reader. Tagged "arrow_rs" so only
+# the dedicated CI step (which builds the native `ray_data_arrow_rs` crate into
+# its image) runs it; the main data suites exclude the tag. The test itself
+# skips gracefully when the crate isn't importable, so it is safe to run
+# anywhere.
+py_test(
+    name = "test_arrow_rs_parquet_reader",
+    size = "small",
+    srcs = ["tests/datasource/test_arrow_rs_parquet_reader.py"],
+    tags = [
+        "arrow_rs",
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
 py_test(
     name = "test_strict_mode",
     size = "small",

@@ -79,6 +79,14 @@ DEFAULT_READ_OP_MIN_NUM_BLOCKS = 200
 
 DEFAULT_USE_DATASOURCE_V2 = env_bool("RAY_DATA_USE_DATASOURCE_V2", False)
 
+# Prototype flag: route the V2 Parquet read path through the experimental
+# arrow-rs (Rust) reader instead of PyArrow. Only takes effect when
+# ``use_datasource_v2`` is also set. Requires the native ``ray_data_arrow_rs``
+# module to be installed. Defaults to False.
+DEFAULT_USE_ARROW_RS_PARQUET_READER = env_bool(
+    "RAY_DATA_USE_ARROW_RS_PARQUET_READER", False
+)
+
 # Default target chunk size for ``ParquetFileChunker``. ``None`` means the chunker
 # uses its built-in default (currently 1 GiB).
 DEFAULT_PARQUET_CHUNKER_TARGET_CHUNK_SIZE: Optional[int] = None
@@ -537,6 +545,12 @@ class DataContext:
             driver-side first-file sampling for schema inference,
             ``ParquetScanner`` / ``ParquetFileReader``). Defaults to False — V1
             remains the production path while V2 bakes.
+        use_arrow_rs_parquet_reader: Prototype flag. When True (and
+            ``use_datasource_v2`` is also True), ``ParquetScanner.create_reader()``
+            returns the experimental arrow-rs (Rust) reader
+            (``ArrowRsParquetFileReader``) instead of the PyArrow
+            ``ParquetFileReader``. Requires the native ``ray_data_arrow_rs``
+            module. Defaults to False.
         parquet_chunker_target_chunk_size: Target on-disk bytes per chunk used
             by ``ParquetFileChunker``. The chunker reads each file's footer at
             listing time and bundles consecutive row groups until their on-disk
@@ -804,6 +818,7 @@ class DataContext:
     min_parallelism: int = DEFAULT_MIN_PARALLELISM
     read_op_min_num_blocks: int = DEFAULT_READ_OP_MIN_NUM_BLOCKS
     use_datasource_v2: bool = DEFAULT_USE_DATASOURCE_V2
+    use_arrow_rs_parquet_reader: bool = DEFAULT_USE_ARROW_RS_PARQUET_READER
     # Target on-disk bytes per chunk for ``ParquetFileChunker`` (bundles
     # consecutive row groups up to this size, >= 1 row group). When ``None``,
     # falls back to ``target_min_block_size``.

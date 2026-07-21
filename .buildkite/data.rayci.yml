@@ -47,6 +47,14 @@ steps:
       PYTHON: "3.12"
     tags: cibase
 
+  - name: dataarrowrsbuild-multipy
+    label: "wanda: dataarrowrsbuild-py3.12"
+    wanda: ci/docker/dataarrowrs.build.wanda.yaml
+    env:
+      PYTHON: "3.12"
+    depends_on: datalbuild-multipy(python=3.12)
+    tags: cibase
+
   - name: docgpubuild-py312
     label: "wanda: docgpubuild-py3.12"
     wanda: ci/docker/docgpu.build.wanda.yaml
@@ -76,7 +84,7 @@ steps:
         --workers "$${BUILDKITE_PARALLEL_JOB_COUNT}"
         --worker-id "$${BUILDKITE_PARALLEL_JOB}" --parallelism-per-worker 3
         --build-name data17build-py3.10 --python-version 3.10
-        --except-tags data_integration,doctest,data_non_parallel,dask,needs_credentials,tensorflow_datasets,cudf
+        --except-tags data_integration,doctest,data_non_parallel,dask,needs_credentials,tensorflow_datasets,cudf,arrow_rs
     depends_on: data17build-multipy(python=3.10)
 
   - label: ":database: data: tensorflow-datasets tests"
@@ -90,6 +98,18 @@ steps:
         --build-name datatfdsbuild-py3.12 --python-version 3.12
         --only-tags tensorflow_datasets
     depends_on: datatfdsbuild-multipy
+
+  - label: ":database: data: arrow-rs reader tests"
+    key: data_arrow_rs_tests
+    tags:
+      - python
+      - data
+    instance_type: medium
+    commands:
+      - bazel run //ci/ray_ci:test_in_docker -- //python/ray/data/... data
+        --build-name dataarrowrsbuild-py3.12 --python-version 3.12
+        --only-tags arrow_rs
+    depends_on: dataarrowrsbuild-multipy
 
   - label: ":database: data: arrow v17 tests (data_non_parallel)"
     tags:
@@ -118,7 +138,7 @@ steps:
         --workers "$${BUILDKITE_PARALLEL_JOB_COUNT}"
         --worker-id "$${BUILDKITE_PARALLEL_JOB}" --parallelism-per-worker 3
         --build-name datalbuild-py3.10 --python-version 3.10
-        --except-tags data_integration,doctest,data_non_parallel,dask,needs_credentials,tensorflow_datasets,cudf
+        --except-tags data_integration,doctest,data_non_parallel,dask,needs_credentials,tensorflow_datasets,cudf,arrow_rs
     depends_on: datalbuild-multipy(python=3.10)
 
   - label: ":database: data: arrow v23 tests (data_non_parallel)"
@@ -148,7 +168,7 @@ steps:
       - bazel run //ci/ray_ci:test_in_docker -- //python/ray/data/... //python/ray/air/... data
         --workers 2 --worker-id {{array.worker_id}} --parallelism-per-worker 3
         --build-name datalbuild-py{{array.python}} --python-version {{array.python}}
-        --except-tags data_integration,doctest,data_non_parallel,dask,needs_credentials,tensorflow_datasets,cudf
+        --except-tags data_integration,doctest,data_non_parallel,dask,needs_credentials,tensorflow_datasets,cudf,arrow_rs
     depends_on: datalbuild-multipy($)
     array:
       python: ["3.12"]
@@ -182,7 +202,7 @@ steps:
         --workers "$${BUILDKITE_PARALLEL_JOB_COUNT}"
         --worker-id "$${BUILDKITE_PARALLEL_JOB}" --parallelism-per-worker 3
         --build-name datanbuild-py3.10 --python-version 3.10
-        --except-tags data_integration,doctest,data_non_parallel,dask,needs_credentials,tensorflow_datasets,cudf
+        --except-tags data_integration,doctest,data_non_parallel,dask,needs_credentials,tensorflow_datasets,cudf,arrow_rs
     depends_on: datanbuild-multipy
     soft_fail: true
 

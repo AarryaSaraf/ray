@@ -1,0 +1,8 @@
+# Regenerable benchmark scratch — never commit.
+# Fixtures (26 GB of parquet), per-worker USS traces, and generated figures are
+# all produced by bench_suite.py / summarize.py and should stay local.
+data/
+runs/
+figs/
+__pycache__/
+*.pyc
