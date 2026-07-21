@@ -405,9 +405,17 @@ fn open_local_reader(
     k: usize,
     split_threshold_bytes: u64,
 ) -> Result<Box<dyn RecordBatchReader + Send>, ParquetError> {
-    // Optional page index: loaded if present. Needed for the K-split RowSelection
-    // to skip pages by byte range; the whole-group K=1 path doesn't require it.
-    let opts = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
+    // Lean footer parse (#6): the page index is only needed for the K-split
+    // RowSelection (to skip pages by byte range). K-split can only fire when k > 1,
+    // so for the common k == 1 local path we Skip the page index entirely — a
+    // cheaper footer parse that matters on many-row-group files. When k > 1 we load
+    // it Optional so the lone-big-row-group split can use it if present.
+    let policy = if k > 1 {
+        PageIndexPolicy::Optional
+    } else {
+        PageIndexPolicy::Skip
+    };
+    let opts = ArrowReaderOptions::new().with_page_index_policy(policy);
     let meta = ArrowReaderMetadata::load(&File::open(&path)?, opts)?;
     let mask = projection_mask(meta.metadata().file_metadata().schema_descr(), &columns);
     let selected: Vec<usize> = match row_groups {

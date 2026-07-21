@@ -7,7 +7,13 @@ a single command:
     RAY_DATA_ARROW_RS_S3_BENCH_PATH=s3://your-bucket/some/prefix \\
         python run_s3_benchmark.py
 
-which will, in order:
+ALWAYS run the fast smoke check first (writes one small file, reads it both ways,
+asserts the crate drives the read and row counts agree) before the full suite:
+
+    RAY_DATA_ARROW_RS_S3_BENCH_PATH=s3://your-bucket/some/prefix \\
+        python run_s3_benchmark.py smoke
+
+The full run (no `smoke` arg) will, in order:
   1. generate the target fixtures ON S3 if not already there — N files, each ONE big
      row group (the layout Ray sees most), `write_page_index=True`, snappy;
   2. run the sweep: a PyArrow baseline vs arrow-rs across fetch-window sizes
@@ -122,9 +128,82 @@ def ensure_fixtures(base):
     return uri
 
 
+def smoke(base):
+    """Tiny end-to-end check BEFORE the big suite: writes one small file to S3, reads
+    it both ways under real Ray sessions, and asserts (a) the crate imported and drove
+    the read (native > 0, fallback == 0 — i.e. we did NOT silently fall back to
+    PyArrow), and (b) arrow-rs and PyArrow agree on the row count. Fast (~seconds) and
+    cheap; if this fails, fix it before spending money/time on the full sweep."""
+    rows = 200_000
+    schema = os.environ.get("RAY_DATA_ARROW_RS_SMOKE_SCHEMA", "huge_str")
+    uri = f"{base}/smoke/{schema}_{rows}_1f_1rg"
+    key = uri[len("s3://") :]
+    filesystem = _s3_filesystem()
+
+    sel = pafs.FileSelector(key, allow_not_found=True, recursive=True)
+    have = [f for f in filesystem.get_file_info(sel) if f.path.endswith(".parquet")]
+    if not have:
+        print(f"  writing smoke fixture -> {uri}")
+        rng = np.random.default_rng(0)
+        table = pa.table(fx.SCHEMA_BUILDERS[schema](rng, rows))
+        pq.write_table(
+            table,
+            f"{key}/part-0000.parquet",
+            filesystem=filesystem,
+            row_group_size=rows,
+            write_page_index=True,
+            compression="snappy",
+        )
+    else:
+        print(f"  smoke fixture present at {uri} — reusing")
+
+    import ray
+
+    def _read(reader):
+        d = bench_suite._run_dir(f"smoke__{reader}")
+        bench_suite._fresh_session(
+            reader, d, budget_bytes=2 * bench_suite.MB, fetch_window_mb=16
+        )
+        n = bench_suite.consume(ray.data.read_parquet(uri), "iter_batches")
+        nat, fb = bench_suite._count_paths(d)
+        ray.shutdown()
+        return n, nat, fb
+
+    pa_rows, _, _ = _read("pyarrow")
+    rs_rows, nat, fb = _read("arrow_rs")
+    print(
+        f"  pyarrow rows={pa_rows}  arrow_rs rows={rs_rows}  "
+        f"native={nat} fallback={fb}"
+    )
+    problems = []
+    if rs_rows != pa_rows:
+        problems.append(f"row-count mismatch: arrow_rs={rs_rows} vs pyarrow={pa_rows}")
+    if nat == 0:
+        problems.append("arrow_rs took 0 native fragments (crate not driving the read)")
+    if fb != 0:
+        problems.append(
+            f"arrow_rs fell back to PyArrow on {fb} fragment(s) "
+            "(unsupported schema? the sweep would misattribute memory)"
+        )
+    if problems:
+        print("\nSMOKE FAILED:")
+        for p in problems:
+            print(f"  - {p}")
+        sys.exit(1)
+    print(
+        "\nSMOKE PASSED — crate drives the read, native-only, row counts agree. "
+        "Safe to run the full suite (drop the `smoke` arg)."
+    )
+
+
 def main():
     base = _s3_base()
     os.makedirs(bench_suite.OUT, exist_ok=True)
+
+    if len(sys.argv) > 1 and sys.argv[1] == "smoke":
+        print("===== SMOKE TEST =====")
+        smoke(base)
+        return
 
     print("===== FIXTURES =====")
     read_uri = ensure_fixtures(base)

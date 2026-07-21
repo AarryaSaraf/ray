@@ -40,7 +40,7 @@ WARM = {"rows": 10_000, "num_files": 1, "row_group_size": 10_000, "schema": "int
 
 
 def _fresh_session(reader, trace_dir, budget_bytes=8 * MB, k=1, num_cpus=4,
-                   fetch_window_mb=16, malloc_arena_max=None):
+                   fetch_window_mb=16, malloc_arena_max=None, ld_preload=None):
     ray.shutdown()
     env_vars = {
         "RAY_MEM_TRACE_DIR": trace_dir,
@@ -60,6 +60,14 @@ def _fresh_session(reader, trace_dir, budget_bytes=8 * MB, k=1, num_cpus=4,
     # on macOS. `None` leaves the env untouched (the uncapped baseline).
     if malloc_arena_max is not None:
         env_vars["MALLOC_ARENA_MAX"] = str(malloc_arena_max)
+    # Swap the allocator for the WHOLE worker process (Python + Rust + PyArrow) with
+    # no recompile (#9): point LD_PRELOAD at a libmimalloc/libjemalloc .so. Unlike the
+    # crate's compile-time `mimalloc` feature (which segfaults under Ray workers — a
+    # global_allocator in a cdylib fights the host process), LD_PRELOAD interposes
+    # malloc process-wide and sidesteps that. Linux-only; `None` = the ambient
+    # (system glibc) allocator. See Agents.md §7.8 for how to find the .so path.
+    if ld_preload is not None:
+        env_vars["LD_PRELOAD"] = str(ld_preload)
     ray.init(
         num_cpus=num_cpus, include_dashboard=False, ignore_reinit_error=True,
         log_to_driver=False,
@@ -636,8 +644,12 @@ def axis_s3():
         batching). Swept {2, 8, 32} MiB at a fixed 16 MiB window to confirm the
         standalone finding that budget is the *floor* knob (small mem effect) while
         the window is the lever. Default is 2 MiB (was 8; lowered per the local win).
-      * ``MALLOC_ARENA_MAX`` — glibc arena cap (§7.8), the retention lever for the
-        default build. One capped run isolates its effect on node-sum peak.
+      * allocator — the retention lever (§7.8), all env-only / no recompile:
+        ``MALLOC_ARENA_MAX=2`` (glibc arena cap) always runs; and if you export
+        ``RAY_DATA_ARROW_RS_MIMALLOC_SO`` / ``RAY_DATA_ARROW_RS_JEMALLOC_SO`` to the
+        respective ``.so``, an ``LD_PRELOAD`` run for each is added (swaps the whole
+        worker's allocator — Python + Rust + PyArrow — sidestepping the compile-time
+        mimalloc segfault). PyArrow itself always uses its bundled jemalloc.
     PyArrow is the baseline. K stays 1 for the per-file layout (Ray's pool
     parallelizes files); the lone-big-row-group K-split is a separate fixture.
     """
@@ -647,29 +659,42 @@ def axis_s3():
               "Linux+real-S3 box — S3 perf is not meaningful on macOS/moto)")
         return []
 
-    # (reader, fetch_window_mb, budget_mb, malloc_arena_max) configs.
-    # window/budget/arena are ignored by the pyarrow baseline. The two sweeps
-    # cross at (window=16, budget=2, arena=None) so that point is shared.
+    # (reader, fetch_window_mb, budget_mb, malloc_arena_max, ld_preload) configs.
+    # window/budget/arena/preload are ignored by the pyarrow baseline. The window
+    # and budget sweeps cross at (window=16, budget=2) so that point is shared.
     configs = [
-        ("pyarrow", None, None, None),
+        ("pyarrow", None, None, None, None),
         # --- window sweep @ fixed 2 MiB budget (the memory lever) ---
-        ("arrow_rs", 4, 2, None),
-        ("arrow_rs", 16, 2, None),
-        ("arrow_rs", 64, 2, None),
-        ("arrow_rs", 0, 2, None),    # no window cap (control: shows the win's size)
+        ("arrow_rs", 4, 2, None, None),
+        ("arrow_rs", 16, 2, None, None),
+        ("arrow_rs", 64, 2, None, None),
+        ("arrow_rs", 0, 2, None, None),   # no window cap (control: shows win's size)
         # --- budget sweep @ fixed 16 MiB window (the floor knob) ---
-        ("arrow_rs", 16, 8, None),
-        ("arrow_rs", 16, 32, None),
-        # --- arena lever @ window 16 / budget 2 (isolates glibc retention) ---
-        ("arrow_rs", 16, 2, 2),
+        ("arrow_rs", 16, 8, None, None),
+        ("arrow_rs", 16, 32, None, None),
+        # --- allocator sweep @ window 16 / budget 2 (all env-only, no recompile) ---
+        ("arrow_rs", 16, 2, 2, None),     # glibc + MALLOC_ARENA_MAX=2
     ]
+    # LD_PRELOAD allocator A/B (#9): only added when the .so path is provided, so a
+    # box without the lib installed just skips it. Find paths with e.g.
+    #   dpkg -L libmimalloc2 | grep '\.so'   /   dpkg -L libjemalloc2 | grep '\.so'
+    mi = os.environ.get("RAY_DATA_ARROW_RS_MIMALLOC_SO")
+    je = os.environ.get("RAY_DATA_ARROW_RS_JEMALLOC_SO")
+    if mi:
+        configs.append(("arrow_rs", 16, 2, None, mi))    # LD_PRELOAD mimalloc
+    if je:
+        configs.append(("arrow_rs", 16, 2, None, je))    # LD_PRELOAD jemalloc
     results = []
-    for reader, window, budget_mb, arena in configs:
+    for reader, window, budget_mb, arena, preload in configs:
+        alloc = ("mi" if preload and "mimalloc" in preload
+                 else "je" if preload and "jemalloc" in preload
+                 else f"arena{arena}" if arena else "sys")
         tag = (reader if reader == "pyarrow"
-               else f"arrow_rs_w{window}_b{budget_mb}_a{arena}")
+               else f"arrow_rs_w{window}_b{budget_mb}_{alloc}")
         d = _run_dir(f"s3__{tag}")
         _fresh_session(reader, d, budget_bytes=(budget_mb or 2) * MB,
-                       fetch_window_mb=(window or 0), malloc_arena_max=arena)
+                       fetch_window_mb=(window or 0), malloc_arena_max=arena,
+                       ld_preload=preload)
         _warm(reader, d)  # warms worker imports on a tiny local fixture
         t0 = time.time()
         rows = consume(ray.data.read_parquet(s3_path), "iter_batches",
@@ -679,6 +704,7 @@ def axis_s3():
         nat, fb = _count_paths(d)
         results.append({"reader": reader, "tag": tag, "fetch_window_mb": window,
                         "budget_mb": budget_mb, "malloc_arena_max": arena,
+                        "ld_preload": preload, "alloc": alloc,
                         "wall_s": t1 - t0, "rows": rows, "t0": t0, "t1": t1,
                         "node_sum_peak_mb": peak, "native": nat, "fallback": fb})
         print(f"  s3 {tag}: wall={t1-t0:.3f}s peak={peak:.0f}MB rows={rows} "

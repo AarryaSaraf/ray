@@ -697,11 +697,10 @@ def plot_s3():
         if ct is not None:
             ax.step(ct, cy, where="post", color=colors["arrow_rs"], lw=2.2,
                     label=f"arrow_rs {cfg['node_sum_peak_mb']:.0f}MB")
-        w, b, a = (cfg.get("fetch_window_mb"), cfg.get("budget_mb"),
-                   cfg.get("malloc_arena_max"))
+        w, b = cfg.get("fetch_window_mb"), cfg.get("budget_mb")
         wl = "no-cap" if not w else f"{w}MB"
         bl = f" bud{b}" if b else ""
-        al = f" +arena{a}" if a else ""
+        al = f" {cfg.get('alloc')}" if cfg.get("alloc") and cfg["alloc"] != "sys" else ""
         pr, rr = base["node_sum_peak_mb"], cfg["node_sum_peak_mb"] or 1
         ax.set_title(f"win={wl}{bl}{al}\npa {pr:.0f}/rs {rr:.0f}MB ({pr / rr:.2f}x)\n"
                      f"wall {cfg['wall_s'] / (base['wall_s'] or 1):.2f}x",
