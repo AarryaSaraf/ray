@@ -73,28 +73,25 @@ def _fresh_session(reader, trace_dir, budget_bytes=8 * MB, k=1, num_cpus=4,
         "worker_process_setup_hook": "worker_mem_sampler.setup",
         "env_vars": env_vars,
     }
-    # Start a PRIVATE local Ray with num_cpus PINNED, even on an Anyscale workspace
-    # where a shared cluster is already running: address="local" spins up a fresh
-    # instance and ignores RAY_ADDRESS / the running cluster. This is deliberate and
-    # matters for the single-fat-node precise run:
-    #   * faithful concurrency — the num_cpus knob the concurrency/files axes vary
-    #     actually takes effect (when ATTACHED you may not pass num_cpus, so every
-    #     config silently ran at the whole node's core count and those axes were
-    #     meaningless);
-    #   * clean memory — only our ~num_cpus workers exist, so node-sum USS isn't
-    #     inflated by the shared cluster's dozens of idle workers (whose baseline
-    #     heaps otherwise swamp the decode signal; see _node_sum_incr_peak_mb).
-    # The multi-node correctness pass (run_s3_benchmark distributed-check) attaches
-    # to the real cluster on its own; it does not go through here.
-    try:
-        ray.init(address="local", num_cpus=num_cpus, include_dashboard=False,
-                 ignore_reinit_error=True, log_to_driver=False,
-                 runtime_env=runtime_env)
-    except Exception:
-        # Some environments disallow a private local cluster; attach instead (can't
-        # pin num_cpus -> concurrency becomes the node's core count, but incremental
-        # USS still isolates the workers that actually decoded).
+    # If a cluster is already running (Anyscale workspace: RAY_ADDRESS set), ATTACH
+    # to it. Do NOT start a private local cluster on the workspace — address="local"
+    # spins up a fresh dashboard agent that imports Ray's bundled dashboard modules
+    # (including a test file) and dies on a missing pytest, spraying tracebacks.
+    # Attaching sidesteps that. You may not pass num_cpus when attaching, so
+    # concurrency becomes the node's core count; that only weakens the num_cpus-
+    # varying axes (concurrency/files) — incremental USS (_node_sum_incr_peak_mb)
+    # still isolates the workers that actually decoded from the shared cluster's
+    # idle ones. On a PLAIN box (no cluster running) start an isolated local cluster
+    # with num_cpus pinned, so those axes' knob does take effect there.
+    cluster_running = bool(os.environ.get("RAY_ADDRESS")) or os.path.exists(
+        "/tmp/ray/ray_current_cluster"
+    )
+    if cluster_running:
         ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False,
+                 runtime_env=runtime_env)
+    else:
+        ray.init(num_cpus=num_cpus, include_dashboard=False,
+                 ignore_reinit_error=True, log_to_driver=False,
                  runtime_env=runtime_env)
     from ray.data.context import DataContext
     ctx = DataContext.get_current()
