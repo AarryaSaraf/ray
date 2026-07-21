@@ -105,7 +105,31 @@ def _fresh_session(reader, trace_dir, budget_bytes=8 * MB, k=1, num_cpus=4,
     ctx.use_datasource_v2 = True
     ctx.use_arrow_rs_parquet_reader = (reader == "arrow_rs")
     ctx.execution_options.preserve_order = True  # so parity hashes are comparable
+    # Record Ray's own per-task memory expectation next to the traces, so the
+    # per-task graphs (task_mem.py) can draw it as the reference line. This is
+    # NOT a number we chose: context.py:44 justifies the default block size with
+    # "memory footprint will be about 2 * num_cpus * target_max_block_size",
+    # i.e. 2 x target_max_block_size per task.
+    _write_meta(trace_dir, {
+        "reader": reader,
+        "expected_task_mb": 2 * ctx.target_max_block_size / MB,
+        "budget_mb": budget_bytes / MB,
+    })
     return ctx
+
+
+def _write_meta(trace_dir, updates):
+    """Merge updates into trace_dir/meta.json (read-modify-write, driver-side)."""
+    p = os.path.join(trace_dir, "meta.json")
+    meta = {}
+    if os.path.exists(p):
+        try:
+            meta = json.load(open(p))
+        except Exception:
+            meta = {}
+    meta.update(updates)
+    with open(p, "w") as fh:
+        json.dump(meta, fh)
 
 
 def consume(ds, mode, progress_path=None):
@@ -185,6 +209,9 @@ def _warm(reader, trace_dir):
             os.remove(f)
         except OSError:
             pass
+    # Stamp the warm/measured boundary so per-task graphs can exclude the warmup
+    # read's task windows (they're real tasks, but of the tiny warm fixture).
+    _write_meta(trace_dir, {"warm_end": time.time()})
 
 
 # --------------------------------------------------------------------------- #
@@ -859,11 +886,13 @@ AXES = {"layout": axis_layout, "schema": axis_schema, "tuning": axis_tuning,
 
 def write_summary_csv():
     """Flatten every runs/results_*.json into ONE runs/summary.csv (also echoed to
-    stdout): axis, config, reader, wall_s, abs_peak_mb, incr_peak_mb, rows, path.
-    One row per measured read across ALL axes — the machine-readable digest to paste
-    back for analysis. Pyarrow and arrow_rs rows share the same (axis, config), so
-    the mem/speed ratios are a one-line pairing away; incr_peak_mb is the column that
-    matters (baseline-subtracted; see _node_sum_incr_peak_mb)."""
+    stdout): one row per measured read across ALL axes — the machine-readable
+    digest to paste back for analysis. Memory verdicts do NOT live here: the
+    metric of record is the per-task absolute-USS-over-time graph vs Ray's
+    expectation line (task_mem.py). This table keeps wall time + the raw
+    node-sum absolute peak as a node-level sanity number only; the windowed
+    incremental columns were retired (baseline subtraction systematically
+    flattered whichever reader retains more warm heap — see Agents.md §3.5)."""
     import csv as _csv
 
     def _config(axis, r):
@@ -887,8 +916,8 @@ def write_summary_csv():
         v = r.get(k)
         return round(v, 3) if isinstance(v, (int, float)) else ""
 
-    fields = ["axis", "config", "reader", "wall_s", "abs_peak_mb", "incr_peak_mb",
-              "max_task_mb", "n_grown", "n_workers", "rows", "native", "fallback"]
+    fields = ["axis", "config", "reader", "wall_s", "abs_peak_mb",
+              "rows", "native", "fallback"]
     out_rows = []
     for f in sorted(glob.glob(os.path.join(OUT, "results_*.json"))):
         axis = os.path.basename(f)[len("results_"):-len(".json")]
@@ -901,15 +930,10 @@ def write_summary_csv():
         for r in data:
             if not isinstance(r, dict) or "reader" not in r:
                 continue
-            wk = r.get("workers") or {}
             out_rows.append({
                 "axis": axis, "config": _config(axis, r),
                 "reader": r.get("reader", ""), "wall_s": _num(r, "wall_s"),
                 "abs_peak_mb": _num(r, "node_sum_peak_mb"),
-                "incr_peak_mb": _num(r, "node_sum_incr_mb"),
-                "max_task_mb": wk.get("max_worker_incr_mb", ""),
-                "n_grown": wk.get("n_grown", ""),
-                "n_workers": wk.get("n_workers", ""),
                 "rows": r.get("rows", ""), "native": r.get("native", ""),
                 "fallback": r.get("fallback", ""),
             })

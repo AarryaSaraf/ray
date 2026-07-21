@@ -333,100 +333,14 @@ def table_workloads(rows):
               f"{r['node_sum_peak_mb']:11.0f}MB {path:>10s}")
 
 
-def plot_workloads():
-    rows = _load("workloads")
-    if not rows:
-        print("  (no workloads results — run: bench_suite.py workloads)")
-        return
-    order = []
-    for r in rows:
-        if r["workload"] not in order:
-            order.append(r["workload"])
-    by = {(r["workload"], r["reader"]): r["node_sum_peak_mb"] for r in rows}
-    pa = [by.get((w, "pyarrow"), 0) for w in order]
-    rs = [by.get((w, "arrow_rs"), 0) for w in order]
-    _mem_bars(order, pa, rs,
-              "Decode-heavy, output-light workloads (4M int, one big row group):\n"
-              "full decode, ~nothing emitted — the real 'blind scheduler' cases",
-              os.path.join(FIG, "workloads_mem.png"))
-
-
-def _mem_bars(labels, pa_vals, rs_vals, title, out, ylabel="node-sum peak USS (MB)"):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
-    os.makedirs(FIG, exist_ok=True)
-    x = np.arange(len(labels))
-    w = 0.38
-    fig, ax = plt.subplots(figsize=(max(7, 1.3 * len(labels)), 4.8))
-    b1 = ax.bar(x - w / 2, pa_vals, w, label="pyarrow", color="#c0392b")
-    b2 = ax.bar(x + w / 2, rs_vals, w, label="arrow_rs", color="#2471a3")
-    for bars in (b1, b2):
-        for bar in bars:
-            h = bar.get_height()
-            ax.annotate(f"{h:.0f}", (bar.get_x() + bar.get_width() / 2, h),
-                        ha="center", va="bottom", fontsize=8)
-    for i, (p, r) in enumerate(zip(pa_vals, rs_vals)):
-        if r > 0:
-            ax.annotate(f"{p / r:.2f}x", (i, max(p, r)), xytext=(0, 12),
-                        textcoords="offset points", ha="center", fontsize=8,
-                        color="#196f3d", weight="bold")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=20, ha="right")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.legend()
-    ax.grid(alpha=0.2, axis="y")
-    fig.tight_layout()
-    fig.savefig(out, dpi=120)
-    plt.close(fig)
-    print(f"  wrote {out}")
-
-
-def mem_layout():
-    """Windowed incremental peak per layout, from results_layout.json (the same
-    numbers the table reports — NOT recomputed raw from traces, which would put
-    idle warm-worker baselines back into the bars)."""
-    rows = _load("layout")
-    if not rows:
-        print("  (no layout results — run: bench_suite.py layout)")
-        return
-    labels = []
-    by = {}
-    for r in rows:
-        if r["layout"] not in labels:
-            labels.append(r["layout"])
-        by[(r["layout"], r["reader"])] = r.get("node_sum_incr_mb",
-                                               r.get("node_sum_peak_mb", 0))
-    pa = [by.get((n, "pyarrow"), 0) for n in labels]
-    rs = [by.get((n, "arrow_rs"), 0) for n in labels]
-    _mem_bars(labels, pa, rs,
-              "Extra memory the read caused, by file/row-group layout (wide_str)\n"
-              "(windowed incremental node-sum USS — warm-worker baselines removed)",
-              os.path.join(FIG, "mem_layout.png"),
-              ylabel="node-sum incr USS (MB)")
-
-
-def mem_mixed():
-    rows = _load("mixed")
-    if not rows:
-        print("  (no mixed results — run: bench_suite.py mixed)")
-        return
-    by = {r["reader"]: r.get("node_sum_incr_mb", r.get("node_sum_peak_mb", 0))
-          for r in rows}
-    _mem_bars(["mixed_schemas"], [by.get("pyarrow", 0)], [by.get("arrow_rs", 0)],
-              "Extra memory: heterogeneous-schema files, one dataset\n"
-              "(windowed incremental node-sum USS)",
-              os.path.join(FIG, "mem_mixed.png"),
-              ylabel="node-sum incr USS (MB)")
-
-
-# NOTE: there are deliberately no mem_scaling / mem_schema / mem_tuning graphs.
-# Those axes measure wall time, parity, and path-taken only — they run without a
-# USS trace dir, so any "memory" graph for them could only ever show zeros
-# (which is exactly the bug this note replaces). Memory axes: layout, mixed,
-# the sweeps, workloads, concurrency, s3.
+# NOTE: there are deliberately no per-axis memory BAR graphs (and none for
+# scaling/schema/tuning, which never record USS traces). The memory metric of
+# record is the per-task absolute-USS-over-time graph vs Ray's expectation
+# line — one figure per config, both readers overlaid — produced by
+# task_mem.py from the tasks_*.csv + uss_*.csv traces. Peak/incremental
+# scalars were retired: windowed baseline subtraction systematically
+# flattered whichever reader retains more warm heap (Agents.md §3.5), and
+# single-number peaks invite selective reading.
 
 
 def plot_leak(rows):
@@ -582,36 +496,27 @@ def table_concurrency(rows):
 
 
 def table_s3(rows):
-    """Peak + wall summary for the S3 sweep, with arrow-rs stated relative to the
-    PyArrow baseline (memory-first: >1x mem = arrow-rs uses less; wall ~1.0x = the
-    speed-parity bar)."""
+    """Wall summary for the S3 sweep. Memory verdicts live in the per-task
+    graphs (task_mem.py); this table keeps wall time + the raw absolute
+    node-sum peak as node-level sanity only."""
     print("\n## S3 (real bucket): PyArrow baseline vs arrow-rs (window + budget + allocator sweep)")
     if not rows:
         print("  (no s3 results)")
         return
     base = next((r for r in rows if r["reader"] == "pyarrow"), None)
-
-    def _incr(r):
-        # incremental peak (baseline-subtracted) is the number to compare; fall back
-        # to absolute for results produced before that column existed.
-        return r.get("node_sum_incr_mb", r.get("node_sum_peak_mb", 0))
-
-    print(f"{'config':24s} {'wall_s':>8s} {'abs peak':>10s} {'incr peak':>11s} "
-          f"{'mem vs pa':>10s} {'wall vs pa':>11s} {'path':>9s}")
+    print(f"{'config':24s} {'wall_s':>8s} {'abs peak':>10s} "
+          f"{'wall vs pa':>11s} {'path':>9s}")
     for r in rows:
         path = f"{r.get('native', 0)}/{r.get('fallback', 0)}"
-        memr = wallr = ""
+        wallr = ""
         if base and r["reader"] == "arrow_rs":
-            memr = f"{_incr(base) / (_incr(r) or 1):.2f}x"
             wallr = f"{r['wall_s'] / (base['wall_s'] or 1):.2f}x"
         print(f"{r.get('tag', r['reader']):24s} {r['wall_s']:8.2f} "
-              f"{r['node_sum_peak_mb']:7.0f}MB {_incr(r):8.0f}MB "
-              f"{memr:>10s} {wallr:>11s} {path:>9s}")
+              f"{r['node_sum_peak_mb']:7.0f}MB {wallr:>11s} {path:>9s}")
     if base:
-        print("  (incr peak = extra heap the read caused, each worker's warm baseline "
-              "removed — THE number to compare; abs peak = raw node-sum for the "
-              "platform dashboard. mem vs pa on incr: >1.0 ⇒ arrow-rs uses LESS. "
-              "wall vs pa = arrow_rs/pyarrow; ~1.0 ⇒ speed parity, the bar.)")
+        print("  (wall vs pa = arrow_rs/pyarrow; ~1.0 ⇒ speed parity, the bar. "
+              "Memory: see figs/task_mem/ — per-task absolute USS vs Ray's "
+              "expectation line, no baseline subtraction.)")
 
 
 def plot_s3():
@@ -638,41 +543,39 @@ def plot_s3():
         return
     colors = {"pyarrow": "#c0392b", "arrow_rs": "#2471a3"}
 
-    def _incr(r):
-        return r.get("node_sum_incr_mb", r.get("node_sum_peak_mb", 0))
-
     # --- memory over time: one panel per arrow_rs config, PyArrow overlaid.
-    # baseline=True subtracts each worker's warm heap so idle pre-started workers
-    # (a big flat plateau on a many-core node) cancel and the decode signal shows.
+    # ABSOLUTE node-sum USS (baseline=False): the OOM killer sees absolute
+    # memory, so no per-worker warm-baseline subtraction (retired — it
+    # systematically flattered whichever reader retains more warm heap).
+    # Per-task graphs (figs/task_mem/) are the metric of record; this panel is
+    # the node-level view of the same traces.
     bt, by = _node_sum_series_windowed(
-        os.path.join(OUT, "s3__pyarrow"), base["t0"], base["t1"], baseline=True)
+        os.path.join(OUT, "s3__pyarrow"), base["t0"], base["t1"])
     n = len(configs)
     fig, axes = plt.subplots(1, n, figsize=(3.8 * n, 4.4), squeeze=False)
     for ax, cfg in zip(axes[0], configs):
         if bt is not None:
             ax.step(bt, by, where="post", color=colors["pyarrow"], lw=2.2,
-                    label=f"pyarrow {_incr(base):.0f}MB")
+                    label=f"pyarrow {base['node_sum_peak_mb']:.0f}MB")
         ct, cy = _node_sum_series_windowed(
-            os.path.join(OUT, f"s3__{cfg['tag']}"), cfg["t0"], cfg["t1"],
-            baseline=True)
+            os.path.join(OUT, f"s3__{cfg['tag']}"), cfg["t0"], cfg["t1"])
         if ct is not None:
             ax.step(ct, cy, where="post", color=colors["arrow_rs"], lw=2.2,
-                    label=f"arrow_rs {_incr(cfg):.0f}MB")
+                    label=f"arrow_rs {cfg['node_sum_peak_mb']:.0f}MB")
         w, b = cfg.get("fetch_window_mb"), cfg.get("budget_mb")
         wl = "no-cap" if not w else f"{w}MB"
         bl = f" bud{b}" if b else ""
         al = f" {cfg.get('alloc')}" if cfg.get("alloc") and cfg["alloc"] != "sys" else ""
-        pr, rr = _incr(base), _incr(cfg) or 1
-        ax.set_title(f"win={wl}{bl}{al}\npa {pr:.0f}/rs {rr:.0f}MB ({pr / rr:.2f}x)\n"
+        ax.set_title(f"win={wl}{bl}{al}\n"
                      f"wall {cfg['wall_s'] / (base['wall_s'] or 1):.2f}x",
                      fontsize=8)
         ax.set_xlabel("seconds")
         ax.grid(alpha=0.2)
         ax.legend(fontsize=7, loc="upper left")
-    axes[0][0].set_ylabel("node-sum USS above warm baseline (MB)")
+    axes[0][0].set_ylabel("node-sum USS (MB, absolute)")
     fig.suptitle(
         "S3 memory-over-time — PyArrow vs arrow-rs (fetch-window + allocator sweep)\n"
-        "extra heap above warm baseline; smaller window ⇒ lower, flatter peak; wall ~1.0x = speed parity (the bar)",
+        "absolute node-sum private heap; per-task view in figs/task_mem/; wall ~1.0x = speed parity (the bar)",
         fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.88])
     out = os.path.join(FIG, "s3_mem_time.png")
@@ -729,17 +632,24 @@ def main():
         except Exception as e:
             print(f"  (skip mixed_time: {type(e).__name__}: {e})")
 
-    # Memory (USS) graphs for every axis — the verdict axis. Built from the
-    # per-run uss_*.csv already on disk (no re-run needed).
-    print("\n## MEMORY GRAPHS (node-sum peak USS)")
-    for name, fn in [("layout", mem_layout), ("mixed", mem_mixed),
-                     ("time_showcase", mem_time_showcase),
+    # THE memory graphs: per-task absolute USS over time vs Ray's expectation
+    # line, one figure per config, both readers overlaid (task_mem.py). Built
+    # from the tasks_*.csv + uss_*.csv already on disk (no re-run needed).
+    print("\n## MEMORY GRAPHS (per-task USS vs Ray expectation -> figs/task_mem/)")
+    try:
+        import task_mem
+        task_mem.main()
+    except Exception as e:
+        print(f"  (skip task_mem: {type(e).__name__}: {e})")
+
+    print("\n## SUPPORTING GRAPHS")
+    for name, fn in [("time_showcase", mem_time_showcase),
                      ("speed_showcase", speed_time_showcase),
-                     ("workloads", plot_workloads), ("s3", plot_s3)]:
+                     ("s3", plot_s3)]:
         try:
             fn()
         except Exception as e:  # a missing axis run shouldn't kill the rest
-            print(f"  (skip mem_{name}: {type(e).__name__}: {e})")
+            print(f"  (skip {name}: {type(e).__name__}: {e})")
 
     # One-variable sweeps: 5-panel memory-vs-time, everything else fixed.
     sweeps = [
