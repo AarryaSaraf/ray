@@ -216,12 +216,15 @@ def axis_layout():
                 peak = _node_sum_peak_mb(d, t0, t1)
                 incr = _node_sum_incr_peak_mb(d, t0, t1)
                 nat, fb = _count_paths(d)
+                wk = _worker_breakdown(d, t0, t1)
                 results.append({"layout": name, "reader": reader, "mode": mode,
                                 "wall_s": wall, "rows": rows, "t0": t0, "t1": t1,
                                 "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
-                                "native": nat, "fallback": fb})
+                                "native": nat, "fallback": fb, "workers": wk})
                 print(f"  {label}: wall={wall:.3f}s abs={peak:.0f}MB incr={incr:.0f}MB "
-                      f"rows={rows} native={nat} fallback={fb}")
+                      f"rows={rows} native={nat} fallback={fb} "
+                      f"workers={wk['n_grown']}/{wk['n_workers']} "
+                      f"max_task={wk['max_worker_incr_mb']:.0f}MB")
     json.dump(results, open(os.path.join(OUT, "results_layout.json"), "w"), indent=2)
     return results
 
@@ -332,11 +335,15 @@ def axis_mixed():
         nat, fb = _count_paths(rd)
         peak = _node_sum_peak_mb(rd, t0, t1)
         incr = _node_sum_incr_peak_mb(rd, t0, t1)
+        wk = _worker_breakdown(rd, t0, t1)
         results.append({"reader": reader, "wall_s": wall, "rows": rows,
                         "t0": t0, "t1": t1, "node_sum_peak_mb": peak,
-                        "node_sum_incr_mb": incr, "native": nat, "fallback": fb})
+                        "node_sum_incr_mb": incr, "native": nat, "fallback": fb,
+                        "workers": wk})
         print(f"  mixed {reader}: wall={wall:.3f}s rows={rows} abs={peak:.0f}MB "
-              f"incr={incr:.0f}MB native={nat} fallback={fb}")
+              f"incr={incr:.0f}MB native={nat} fallback={fb} "
+              f"workers={wk['n_grown']}/{wk['n_workers']} "
+              f"max_task={wk['max_worker_incr_mb']:.0f}MB")
     json.dump(results, open(os.path.join(OUT, "results_mixed.json"), "w"), indent=2)
     return results
 
@@ -361,7 +368,13 @@ def _node_sum_peak_mb(trace_dir, t0, t1):
     total = np.zeros_like(grid)
     for ep, uss in series:
         idx = np.searchsorted(ep, grid, side="right") - 1
-        total += np.where(idx >= 0, uss[np.clip(idx, 0, len(uss) - 1)], 0.0)
+        held = np.where(idx >= 0, uss[np.clip(idx, 0, len(uss) - 1)], 0.0)
+        # Alive-gate: don't forward-fill a worker's last sample past its final
+        # sample — an exited worker would otherwise contribute a constant across
+        # the rest of the window. (The §5.0 dead-worker double-count check from
+        # the mac run, now applied by default; the incr variant already had it.)
+        alive = (grid >= ep.min()) & (grid <= ep.max())
+        total += np.where(alive, held, 0.0)
     return float(total.max()) / MB
 
 
@@ -406,6 +419,46 @@ def _node_sum_incr_peak_mb(trace_dir, t0, t1):
         baseline = held[int(np.argmax(valid))]
         total += np.where(valid, held - baseline, 0.0)
     return float(total.max()) / MB
+
+
+def _worker_breakdown(trace_dir, t0, t1):
+    """Per-worker decomposition of the measured window — the disaggregation a
+    node-sum scalar can't give. One 150 MB decoder plus idle workers must be
+    distinguishable from several workers each paying a ~100 MB cold-start import
+    ramp inside the window; a single incr number conflates them (that conflation
+    is exactly how the layout small_many_grp anomaly slipped in).
+
+    Reports: n_workers (traces present), n_grown (>5 MB windowed growth — the
+    actual decoders), max_worker_incr_mb (largest single-worker windowed delta ≈
+    the true per-task working set), max_worker_minmax_mb (largest full-trace
+    min→max growth — the mac-methodology per-PID number, immune to the
+    warm-baseline hiding that understates a reader whose warmup retained heap).
+    """
+    import csv
+
+    import numpy as np
+
+    n = grown = 0
+    max_incr = max_minmax = 0.0
+    for f in glob.glob(os.path.join(trace_dir, "uss_*.csv")):
+        rows = list(csv.reader(open(f)))[1:]
+        if not rows:
+            continue
+        ep = np.array([float(r[0]) for r in rows])
+        uss = np.array([float(r[1]) for r in rows])
+        n += 1
+        max_minmax = max(max_minmax, float(uss.max() - uss.min()) / MB)
+        in_w = (ep >= t0) & (ep <= t1)
+        if not in_w.any():
+            continue
+        w = uss[in_w]
+        delta = float(w.max() - w[0]) / MB
+        if delta > 5.0:
+            grown += 1
+        max_incr = max(max_incr, delta)
+    return {"n_workers": n, "n_grown": grown,
+            "max_worker_incr_mb": round(max_incr, 1),
+            "max_worker_minmax_mb": round(max_minmax, 1)}
 
 
 def axis_scaling():
@@ -541,14 +594,18 @@ def _run_sweep(name, levels, mode="iter_batches", num_cpus=4):
             peak = _node_sum_peak_mb(d, t0, t1)
             incr = _node_sum_incr_peak_mb(d, t0, t1)
             nat, fb = _count_paths(d)
+            wk = _worker_breakdown(d, t0, t1)
             results.append({"sweep": name, "level": lv["label"], "reader": reader,
                             "wall_s": t1 - t0, "node_sum_peak_mb": peak,
                             "node_sum_incr_mb": incr, "rows": rows,
                             "t0": t0, "t1": t1, "budget_mb": budget // MB,
-                            "num_cpus": ncpu, "native": nat, "fallback": fb})
+                            "num_cpus": ncpu, "native": nat, "fallback": fb,
+                            "workers": wk})
             print(f"  sweep[{name}] {lv['label']} {reader}: wall={t1-t0:.3f}s "
                   f"abs={peak:.0f}MB incr={incr:.0f}MB rows={rows} "
-                  f"native={nat} fallback={fb}")
+                  f"native={nat} fallback={fb} "
+                  f"workers={wk['n_grown']}/{wk['n_workers']} "
+                  f"max_task={wk['max_worker_incr_mb']:.0f}MB")
     json.dump(results, open(os.path.join(OUT, f"results_sweep_{name}.json"), "w"), indent=2)
     return results
 
@@ -665,12 +722,15 @@ def axis_workloads():
         peak = _node_sum_peak_mb(d, t0, t1)
         incr = _node_sum_incr_peak_mb(d, t0, t1)
         nat, fb = _count_paths(d)
+        wk = _worker_breakdown(d, t0, t1)
         results.append({"workload": "sum(i0)", "reader": reader, "wall_s": t1 - t0,
                         "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
                         "out": str(total), "t0": t0, "t1": t1,
-                        "native": nat, "fallback": fb})
+                        "native": nat, "fallback": fb, "workers": wk})
         print(f"  wl sum {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
-              f"incr={incr:.0f}MB native={nat} fallback={fb}")
+              f"incr={incr:.0f}MB native={nat} fallback={fb} "
+              f"workers={wk['n_grown']}/{wk['n_workers']} "
+              f"max_task={wk['max_worker_incr_mb']:.0f}MB")
         # Selective read-time filter: decode all, keep a sliver. Non-empty
         # projection so the arrow-rs path runs (count() would empty-project → fallback).
         d = _run_dir(f"wl__filter__{reader}")
@@ -684,12 +744,15 @@ def axis_workloads():
         peak = _node_sum_peak_mb(d, t0, t1)
         incr = _node_sum_incr_peak_mb(d, t0, t1)
         nat, fb = _count_paths(d)
+        wk = _worker_breakdown(d, t0, t1)
         results.append({"workload": "filter(i0>hi)", "reader": reader, "wall_s": t1 - t0,
                         "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
                         "kept_rows": kept, "t0": t0, "t1": t1,
-                        "native": nat, "fallback": fb})
+                        "native": nat, "fallback": fb, "workers": wk})
         print(f"  wl filter {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
-              f"incr={incr:.0f}MB kept={kept} native={nat} fallback={fb}")
+              f"incr={incr:.0f}MB kept={kept} native={nat} fallback={fb} "
+              f"workers={wk['n_grown']}/{wk['n_workers']} "
+              f"max_task={wk['max_worker_incr_mb']:.0f}MB")
     json.dump(results, open(os.path.join(OUT, "results_workloads.json"), "w"), indent=2)
     return results
 
@@ -825,7 +888,7 @@ def write_summary_csv():
         return round(v, 3) if isinstance(v, (int, float)) else ""
 
     fields = ["axis", "config", "reader", "wall_s", "abs_peak_mb", "incr_peak_mb",
-              "rows", "native", "fallback"]
+              "max_task_mb", "n_grown", "n_workers", "rows", "native", "fallback"]
     out_rows = []
     for f in sorted(glob.glob(os.path.join(OUT, "results_*.json"))):
         axis = os.path.basename(f)[len("results_"):-len(".json")]
@@ -838,11 +901,15 @@ def write_summary_csv():
         for r in data:
             if not isinstance(r, dict) or "reader" not in r:
                 continue
+            wk = r.get("workers") or {}
             out_rows.append({
                 "axis": axis, "config": _config(axis, r),
                 "reader": r.get("reader", ""), "wall_s": _num(r, "wall_s"),
                 "abs_peak_mb": _num(r, "node_sum_peak_mb"),
                 "incr_peak_mb": _num(r, "node_sum_incr_mb"),
+                "max_task_mb": wk.get("max_worker_incr_mb", ""),
+                "n_grown": wk.get("n_grown", ""),
+                "n_workers": wk.get("n_workers", ""),
                 "rows": r.get("rows", ""), "native": r.get("native", ""),
                 "fallback": r.get("fallback", ""),
             })
