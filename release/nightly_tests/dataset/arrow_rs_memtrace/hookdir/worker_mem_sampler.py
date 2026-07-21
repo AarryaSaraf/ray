@@ -14,6 +14,7 @@ Line-buffered writes so a killed/reused worker still leaves its samples.
 """
 import atexit
 import os
+import socket
 import threading
 import time
 
@@ -35,7 +36,12 @@ def setup():
 
     proc = psutil.Process()
     pid = proc.pid
-    path = os.path.join(trace_dir, f"uss_{pid}.csv")
+    # Namespace by hostname so multiple nodes writing to a SHARED trace dir (the
+    # multi-node verification: RAY_MEM_TRACE_DIR on Anyscale /mnt/cluster_storage)
+    # never collide on pid. Single-node is unaffected (one hostname). The reader's
+    # `uss_*.csv` glob still matches, and the host prefix lets us group by node.
+    host = socket.gethostname()
+    path = os.path.join(trace_dir, f"uss_{host}_{pid}.csv")
     fh = open(path, "w", buffering=1)  # line-buffered
     fh.write("epoch_s,uss_bytes,rss_bytes\n")
 

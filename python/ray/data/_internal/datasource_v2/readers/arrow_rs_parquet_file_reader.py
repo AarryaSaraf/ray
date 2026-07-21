@@ -136,8 +136,14 @@ def _trace_reader_path(supported: bool) -> None:
     if not trace_dir:
         return
     try:
+        import socket
+
+        # Namespace by hostname so nodes writing to a shared trace dir (multi-node
+        # verification) don't collide on pid; the harness's ``path_*.log`` glob
+        # still matches. Single-node is unaffected.
         line = "native\n" if supported else "fallback\n"
-        with open(os.path.join(trace_dir, f"path_{os.getpid()}.log"), "a") as fh:
+        fname = f"path_{socket.gethostname()}_{os.getpid()}.log"
+        with open(os.path.join(trace_dir, fname), "a") as fh:
             fh.write(line)
     except Exception:
         pass

@@ -7,13 +7,21 @@ a single command:
     RAY_DATA_ARROW_RS_S3_BENCH_PATH=s3://your-bucket/some/prefix \\
         python run_s3_benchmark.py
 
-ALWAYS run the fast smoke check first (writes one small file, reads it both ways,
-asserts the crate drives the read and row counts agree) before the full suite:
+Three modes:
+  * `smoke`  — fast gate: write one small file, read both ways, assert the crate
+    drives the read and row counts agree. ALWAYS run this first.
+  * (no arg) — the full single-node memory/speed sweep (the precise headline; run on
+    a single fat node — see below).
+  * `distributed-check` — attach to the CURRENT multi-node cluster and verify the
+    reader works under real distributed scheduling: same row count as PyArrow, crate
+    drove every fragment on every node, plus a directional per-node memory readout.
 
     RAY_DATA_ARROW_RS_S3_BENCH_PATH=s3://your-bucket/some/prefix \\
-        python run_s3_benchmark.py smoke
+        python run_s3_benchmark.py smoke              # 1. gate
+    RAY_DATA_ARROW_RS_S3_BENCH_PATH=... python run_s3_benchmark.py                # 2. sweep
+    RAY_DATA_ARROW_RS_S3_BENCH_PATH=... python run_s3_benchmark.py distributed-check  # 3. verify
 
-The full run (no `smoke` arg) will, in order:
+The full run (no arg) will, in order:
   1. generate the target fixtures ON S3 if not already there — N files, each ONE big
      row group (the layout Ray sees most), `write_page_index=True`, snappy;
   2. run the sweep: a PyArrow baseline vs arrow-rs across fetch-window sizes
@@ -41,6 +49,7 @@ Scale knobs (env, optional) — bump these on a big box to make the memory gap o
 """
 import os
 import sys
+import time
 
 import numpy as np
 import pyarrow as pa
@@ -196,6 +205,172 @@ def smoke(base):
     )
 
 
+def _shared_trace_root():
+    """A trace dir visible on EVERY node, so the multi-node check can aggregate
+    across the cluster. On Anyscale, ``/mnt/cluster_storage`` is shared cluster-wide.
+    Returns None if none is found (the check then reports head-node only)."""
+    override = os.environ.get("RAY_DATA_ARROW_RS_SHARED_TRACE_DIR")
+    if override:
+        return override
+    for cand in ("/mnt/cluster_storage", "/mnt/shared_storage"):
+        if os.path.isdir(cand):
+            return os.path.join(cand, "arrow_rs_bench_traces")
+    return None
+
+
+def _per_node_peaks(trace_dir, t0, t1):
+    """Group ``uss_<host>_<pid>.csv`` by host, return {host: peak-of-sum USS (MB)}
+    within [t0, t1] — the per-node physical memory the concurrent read workers held.
+    This is the multi-node analogue of bench_suite._node_sum_peak_mb, split per node."""
+    import csv as _csv
+    from collections import defaultdict
+
+    import numpy as np
+
+    from glob import glob as _glob
+
+    by_host = defaultdict(list)
+    for f in _glob(os.path.join(trace_dir, "uss_*.csv")):
+        host = os.path.basename(f)[len("uss_") : -len(".csv")].rsplit("_", 1)[0]
+        rows = list(_csv.reader(open(f)))[1:]
+        if rows:
+            by_host[host].append(
+                (
+                    np.array([float(r[0]) for r in rows]),
+                    np.array([float(r[1]) for r in rows]),
+                )
+            )
+    grid = np.linspace(t0, t1, 500)
+    out = {}
+    for host, series in by_host.items():
+        total = np.zeros_like(grid)
+        for ep, uss in series:
+            idx = np.searchsorted(ep, grid, side="right") - 1
+            total += np.where(idx >= 0, uss[np.clip(idx, 0, len(uss) - 1)], 0.0)
+        out[host] = float(total.max()) / bench_suite.MB
+    return out
+
+
+def distributed_check(base):
+    """Verification pass on the CURRENT (multi-node) cluster — NOT a fresh local one.
+
+    Attaches to the running workspace cluster (``ray.init(address='auto')``), reads
+    the same S3 fixtures both ways, and:
+      * asserts correctness under real distributed scheduling — arrow-rs and PyArrow
+        return the SAME row count, and the crate drove every fragment on every node
+        (native > 0, fallback == 0), aggregated cluster-wide via a SHARED trace dir;
+      * reports a per-node USS peak for each reader — a *directional* multi-node
+        memory readout (coarser sampling; the precise headline stays the single fat
+        node run). Cross-check it against the Anyscale/Ray memory dashboard.
+
+    Needs a trace dir visible on all nodes (Anyscale /mnt/cluster_storage, or set
+    RAY_DATA_ARROW_RS_SHARED_TRACE_DIR); without one, readouts are head-node only.
+    """
+    import glob as _globmod
+
+    import ray
+
+    read_uri = ensure_fixtures(base)  # same fixtures as the single-node run
+    root = _shared_trace_root()
+    if root is None:
+        root = os.path.join(bench_suite.OUT, "dist_check")
+        print(
+            "  WARNING: no shared cluster storage found — path/memory readouts will "
+            "reflect the HEAD node ONLY. Set RAY_DATA_ARROW_RS_SHARED_TRACE_DIR to a "
+            "cluster-shared path for full-cluster aggregation. (Correctness/count "
+            "check is still valid.)"
+        )
+
+    def _read(reader):
+        ray.shutdown()
+        d = os.path.join(root, reader)
+        os.makedirs(d, exist_ok=True)
+        for f in _globmod.glob(os.path.join(d, "uss_*.csv")) + _globmod.glob(
+            os.path.join(d, "path_*.log")
+        ):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        env_vars = {
+            "RAY_MEM_TRACE_DIR": d,
+            "RAY_MEM_TRACE_INTERVAL_S": "0.05",  # coarser: many nodes -> shared FS
+            "RAY_DATA_ARROW_RS_PATH_TRACE": d,
+            "RAY_DATA_USE_DATASOURCE_V2": "1",
+            "RAY_DATA_USE_ARROW_RS_PARQUET_READER": "1"
+            if reader == "arrow_rs"
+            else "0",
+            "RAY_DATA_ARROW_RS_K": "1",
+            "RAY_DATA_ARROW_RS_DECODE_BUDGET_BYTES": str(2 * bench_suite.MB),
+            "RAY_DATA_ARROW_RS_FETCH_WINDOW_MB": "16",
+        }
+        ray.init(
+            address="auto",
+            ignore_reinit_error=True,
+            log_to_driver=False,
+            runtime_env={
+                "working_dir": bench_suite.HOOKDIR,
+                "worker_process_setup_hook": "worker_mem_sampler.setup",
+                "env_vars": env_vars,
+            },
+        )
+        from ray.data.context import DataContext
+
+        ctx = DataContext.get_current()
+        ctx.use_datasource_v2 = True
+        ctx.use_arrow_rs_parquet_reader = reader == "arrow_rs"
+        ctx.execution_options.preserve_order = True
+        t0 = time.time()
+        n = bench_suite.consume(ray.data.read_parquet(read_uri), "iter_batches")
+        t1 = time.time()
+        time.sleep(0.4)  # let line-buffered samples flush to the shared FS
+        peaks = _per_node_peaks(d, t0, t1)
+        nat, fb = bench_suite._count_paths(d)
+        ray.shutdown()
+        return n, nat, fb, peaks
+
+    print("  reading via PyArrow across the cluster ...")
+    pa_rows, _, _, pa_peaks = _read("pyarrow")
+    print("  reading via arrow-rs across the cluster ...")
+    rs_rows, nat, fb, rs_peaks = _read("arrow_rs")
+
+    nodes = sorted(set(pa_peaks) | set(rs_peaks))
+    print(
+        f"\n  rows: pyarrow={pa_rows}  arrow_rs={rs_rows}   "
+        f"native={nat} fallback={fb}   nodes seen={len(nodes)}"
+    )
+    print(
+        f"\n  {'node':22s} {'pyarrow peak':>14s} {'arrow_rs peak':>14s} {'mem vs pa':>10s}"
+    )
+    for h in nodes:
+        pk, rk = pa_peaks.get(h, 0.0), rs_peaks.get(h, 0.0)
+        ratio = f"{pk / rk:.2f}x" if rk else "-"
+        print(f"  {h:22s} {pk:11.0f}MB {rk:11.0f}MB {ratio:>10s}")
+
+    problems = []
+    if rs_rows != pa_rows:
+        problems.append(f"row-count mismatch: arrow_rs={rs_rows} vs pyarrow={pa_rows}")
+    if nat == 0:
+        problems.append("0 native fragments (crate not driving the read on any node)")
+    if fb != 0:
+        problems.append(f"{fb} fragment(s) fell back to PyArrow (unsupported schema?)")
+    if len(nodes) < 2:
+        problems.append(
+            f"only {len(nodes)} node(s) observed — either the cluster is single-node "
+            "or traces aren't on shared storage (so this isn't verifying multi-node)"
+        )
+    if problems:
+        print("\nDISTRIBUTED CHECK FAILED:")
+        for p in problems:
+            print(f"  - {p}")
+        sys.exit(1)
+    print(
+        "\nDISTRIBUTED CHECK PASSED — correct row count under multi-node scheduling, "
+        "crate drove every fragment on every node, per-node memory listed above "
+        "(directional). Confirm the shape against the Anyscale/Ray memory dashboard."
+    )
+
+
 def main():
     base = _s3_base()
     os.makedirs(bench_suite.OUT, exist_ok=True)
@@ -203,6 +378,11 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "smoke":
         print("===== SMOKE TEST =====")
         smoke(base)
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "distributed-check":
+        print("===== DISTRIBUTED CHECK (current cluster) =====")
+        distributed_check(base)
         return
 
     print("===== FIXTURES =====")
