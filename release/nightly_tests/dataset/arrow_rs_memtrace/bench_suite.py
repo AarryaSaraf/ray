@@ -68,15 +68,30 @@ def _fresh_session(reader, trace_dir, budget_bytes=8 * MB, k=1, num_cpus=4,
     # (system glibc) allocator. See Agents.md §7.8 for how to find the .so path.
     if ld_preload is not None:
         env_vars["LD_PRELOAD"] = str(ld_preload)
-    ray.init(
-        num_cpus=num_cpus, include_dashboard=False, ignore_reinit_error=True,
-        log_to_driver=False,
-        runtime_env={
-            "working_dir": HOOKDIR,
-            "worker_process_setup_hook": "worker_mem_sampler.setup",
-            "env_vars": env_vars,
-        },
+    runtime_env = {
+        "working_dir": HOOKDIR,
+        "worker_process_setup_hook": "worker_mem_sampler.setup",
+        "env_vars": env_vars,
+    }
+    # On an Anyscale workspace a Ray cluster is ALREADY running, so ray.init auto-
+    # connects to it — and you may NOT pass num_cpus when attaching. Detect that
+    # (RAY_ADDRESS set) and attach instead of starting a local cluster; concurrency
+    # is then the node's core count (consistent across configs, since 0 worker nodes
+    # => the head IS the single node). Instrumentation still works: each config's
+    # runtime_env differs (reader flag + knobs), so Ray starts FRESH workers per
+    # config with these env_vars, and only our workers have RAY_MEM_TRACE_DIR set —
+    # so only our workers sample. On a plain box (no RAY_ADDRESS) keep the isolated
+    # local cluster with pinned num_cpus, exactly as before.
+    attached = bool(os.environ.get("RAY_ADDRESS")) or os.path.exists(
+        "/tmp/ray/ray_current_cluster"
     )
+    if attached:
+        ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False,
+                 runtime_env=runtime_env)
+    else:
+        ray.init(num_cpus=num_cpus, include_dashboard=False,
+                 ignore_reinit_error=True, log_to_driver=False,
+                 runtime_env=runtime_env)
     from ray.data.context import DataContext
     ctx = DataContext.get_current()
     ctx.use_datasource_v2 = True
