@@ -105,7 +105,32 @@ def _run_child(mode, path, budget_bytes):
                 total += batch.num_rows
         return total
 
-    fn = {"pyarrow": pyarrow_read, "rs_onecall": rs_onecall, "rs_perloop": rs_perloop}[mode]
+    def baseline():
+        # interpreter + pyarrow floor only (no arrow-rs, no decode) — the constant
+        # that Ray workers already carry in their warm baseline.
+        import pyarrow  # noqa: F401
+
+        return 0
+
+    def rs_import():
+        # + import the native extension and touch it once (build a reader, read
+        # ZERO batches) so first-use init is paid but no row group is decoded. The
+        # delta rs_import - baseline is the fixed per-worker cost that, in Ray, is
+        # NOT in the warm baseline (pyarrow IS) and gets summed across workers.
+        import pyarrow as pa
+        import ray_data_arrow_rs as rs
+
+        stream = rs.read_row_groups(path, [], None, 131072, budget_bytes, 1, 128 * MB)
+        _ = pa.RecordBatchReader.from_stream(stream).schema
+        return 0
+
+    fn = {
+        "baseline": baseline,
+        "rs_import": rs_import,
+        "pyarrow": pyarrow_read,
+        "rs_onecall": rs_onecall,
+        "rs_perloop": rs_perloop,
+    }[mode]
     peak, secs = _peak_uss_while(fn)
     print(f"{mode}\t{n_groups}\t{peak:.1f}\t{secs:.3f}")
 
@@ -123,7 +148,7 @@ def main():
     print(f"file: {path}")
     print(f"budget: {budget_bytes // MB} MiB   LD_PRELOAD={os.environ.get('LD_PRELOAD', '(none)')}")
     print("mode\trow_groups\tpeak_uss_MB\tsecs")
-    for mode in ["pyarrow", "rs_onecall", "rs_perloop"]:
+    for mode in ["baseline", "rs_import", "pyarrow", "rs_onecall", "rs_perloop"]:
         # fresh child per mode so no allocator carryover between modes
         subprocess.run(
             [sys.executable, __file__, mode, path, "__child__", str(budget_bytes)],
