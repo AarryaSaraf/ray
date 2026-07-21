@@ -218,6 +218,45 @@ def _shared_trace_root():
     return None
 
 
+def _crate_wheel():
+    """Path/URI of the built crate wheel to ship to worker nodes via runtime_env.
+
+    Anyscale does NOT propagate a locally `pip install`-ed wheel to worker nodes
+    ("Local packages are not supported across cluster"). Ray's own runtime_env DOES
+    upload to every node, so for the multi-node check we ship the wheel that way.
+    Set RAY_DATA_ARROW_RS_WHEEL to the built .whl (local path or an s3:// URI); if
+    unset, auto-detect the newest wheel under the crate's target/wheels/.
+    """
+    env = os.environ.get("RAY_DATA_ARROW_RS_WHEEL")
+    if env:
+        return env
+    from glob import glob as _glob
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    # release/nightly_tests/dataset/arrow_rs_memtrace -> repo python/ray/data/...
+    guess = os.path.normpath(
+        os.path.join(
+            here,
+            "..",
+            "..",
+            "..",
+            "..",
+            "python",
+            "ray",
+            "data",
+            "_internal",
+            "datasource_v2",
+            "native",
+            "ray_data_arrow_rs",
+            "target",
+            "wheels",
+            "*.whl",
+        )
+    )
+    hits = sorted(_glob(guess))
+    return hits[-1] if hits else None
+
+
 def _per_node_peaks(trace_dir, t0, t1):
     """Group ``uss_<host>_<pid>.csv`` by host, return {host: peak-of-sum USS (MB)}
     within [t0, t1] — the per-node physical memory the concurrent read workers held.
@@ -271,6 +310,15 @@ def distributed_check(base):
     import ray
 
     read_uri = ensure_fixtures(base)  # same fixtures as the single-node run
+    wheel = _crate_wheel()
+    if wheel:
+        print(f"  shipping crate to all nodes via runtime_env py_modules: {wheel}")
+    else:
+        print(
+            "  WARNING: no crate wheel found to ship (set RAY_DATA_ARROW_RS_WHEEL or "
+            "build it under target/wheels/). Worker nodes without the crate installed "
+            "will fail the arrow_rs read — build the wheel first."
+        )
     root = _shared_trace_root()
     if root is None:
         root = os.path.join(bench_suite.OUT, "dist_check")
@@ -304,15 +352,21 @@ def distributed_check(base):
             "RAY_DATA_ARROW_RS_DECODE_BUDGET_BYTES": str(2 * bench_suite.MB),
             "RAY_DATA_ARROW_RS_FETCH_WINDOW_MB": "16",
         }
+        runtime_env = {
+            "working_dir": bench_suite.HOOKDIR,
+            "worker_process_setup_hook": "worker_mem_sampler.setup",
+            "env_vars": env_vars,
+        }
+        # Ship the crate wheel to every node (Anyscale won't propagate a local
+        # pip-installed wheel). py_modules accepts a local .whl or an s3:// URI and
+        # uploads it to the cluster's package store, importable on all workers.
+        if wheel and reader == "arrow_rs":
+            runtime_env["py_modules"] = [wheel]
         ray.init(
             address="auto",
             ignore_reinit_error=True,
             log_to_driver=False,
-            runtime_env={
-                "working_dir": bench_suite.HOOKDIR,
-                "worker_process_setup_hook": "worker_mem_sampler.setup",
-                "env_vars": env_vars,
-            },
+            runtime_env=runtime_env,
         )
         from ray.data.context import DataContext
 
