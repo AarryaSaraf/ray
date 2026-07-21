@@ -11,8 +11,9 @@ which will, in order:
   1. generate the target fixtures ON S3 if not already there — N files, each ONE big
      row group (the layout Ray sees most), `write_page_index=True`, snappy;
   2. run the sweep: a PyArrow baseline vs arrow-rs across fetch-window sizes
-     {4, 16, 64, 0(=no cap)} MB and a `MALLOC_ARENA_MAX` on/off config, each reading
-     the same S3 fixtures under a fresh Ray session with 5 ms node-sum USS sampling;
+     {4, 16, 64, 0(=no cap)} MB (at a 2 MiB budget), decode-budget sizes {2, 8, 32} MB
+     (at a 16 MB window), and a `MALLOC_ARENA_MAX` cap, each reading the same S3
+     fixtures under a fresh Ray session with 5 ms node-sum USS sampling;
   3. write the overlaid figures `figs/s3_mem_time.png` (memory over time, PyArrow vs
      each arrow-rs config) and `figs/s3_speed_time.png` (throughput over time), plus a
      peak+wall summary table to stdout and `runs/results_s3.json`.

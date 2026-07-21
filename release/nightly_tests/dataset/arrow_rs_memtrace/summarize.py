@@ -639,7 +639,7 @@ def table_s3(rows):
     """Peak + wall summary for the S3 sweep, with arrow-rs stated relative to the
     PyArrow baseline (memory-first: >1x mem = arrow-rs uses less; wall ~1.0x = the
     speed-parity bar)."""
-    print("\n## S3 (real bucket): PyArrow baseline vs arrow-rs (fetch-window + allocator sweep)")
+    print("\n## S3 (real bucket): PyArrow baseline vs arrow-rs (window + budget + allocator sweep)")
     if not rows:
         print("  (no s3 results)")
         return
@@ -697,11 +697,13 @@ def plot_s3():
         if ct is not None:
             ax.step(ct, cy, where="post", color=colors["arrow_rs"], lw=2.2,
                     label=f"arrow_rs {cfg['node_sum_peak_mb']:.0f}MB")
-        w, a = cfg.get("fetch_window_mb"), cfg.get("malloc_arena_max")
+        w, b, a = (cfg.get("fetch_window_mb"), cfg.get("budget_mb"),
+                   cfg.get("malloc_arena_max"))
         wl = "no-cap" if not w else f"{w}MB"
+        bl = f" bud{b}" if b else ""
         al = f" +arena{a}" if a else ""
         pr, rr = base["node_sum_peak_mb"], cfg["node_sum_peak_mb"] or 1
-        ax.set_title(f"window={wl}{al}\npa {pr:.0f}/rs {rr:.0f}MB ({pr / rr:.2f}x)\n"
+        ax.set_title(f"win={wl}{bl}{al}\npa {pr:.0f}/rs {rr:.0f}MB ({pr / rr:.2f}x)\n"
                      f"wall {cfg['wall_s'] / (base['wall_s'] or 1):.2f}x",
                      fontsize=8)
         ax.set_xlabel("seconds")

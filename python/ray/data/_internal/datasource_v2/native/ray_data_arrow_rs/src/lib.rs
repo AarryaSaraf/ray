@@ -41,11 +41,11 @@
 //! `pa.RecordBatchReader.from_stream(...)`):
 //!
 //!   read_row_groups(path, row_groups=None, columns=None, batch_size=131072,
-//!                   decode_budget_bytes=8*1024*1024, k=1,
+//!                   decode_budget_bytes=2*1024*1024, k=1,
 //!                   split_threshold_bytes=128*1024*1024)
 //!   read_row_groups_s3(bucket, key, region, anonymous, endpoint=None, ...creds...,
 //!                      row_groups=None, columns=None, batch_size=131072,
-//!                      decode_budget_bytes=8*1024*1024, fetch_window_mb=16, k=1,
+//!                      decode_budget_bytes=2*1024*1024, fetch_window_mb=16, k=1,
 //!                      split_threshold_bytes=128*1024*1024)
 
 use std::fs::File;
@@ -452,7 +452,7 @@ fn open_local_reader(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, row_groups=None, columns=None, batch_size=131072, decode_budget_bytes=8*1024*1024, k=1, split_threshold_bytes=134217728))]
+#[pyo3(signature = (path, row_groups=None, columns=None, batch_size=131072, decode_budget_bytes=2*1024*1024, k=1, split_threshold_bytes=134217728))]
 fn read_row_groups(
     path: String,
     row_groups: Option<Vec<usize>>,
@@ -599,7 +599,7 @@ async fn drive_unit(
 #[pyo3(signature = (bucket, key, region, anonymous, endpoint=None, access_key_id=None,
                     secret_access_key=None, session_token=None, allow_http=false,
                     virtual_hosted_style=false, row_groups=None, columns=None,
-                    batch_size=131072, decode_budget_bytes=8*1024*1024,
+                    batch_size=131072, decode_budget_bytes=2*1024*1024,
                     fetch_window_mb=16, k=1, split_threshold_bytes=134217728))]
 #[allow(clippy::too_many_arguments)]
 fn read_row_groups_s3(

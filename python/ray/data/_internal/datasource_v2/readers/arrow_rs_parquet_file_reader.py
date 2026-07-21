@@ -87,9 +87,13 @@ logger = logging.getLogger(__name__)
 # bytes (not a fixed row count) keeps the transient working set flat across
 # schemas: a wide file gets few rows/batch, a narrow file gets many. Kept far
 # below ``target_block_size`` so the decode transient is bounded while output
-# blocks are still coalesced to the normal Ray block size.
+# blocks are still coalesced to the normal Ray block size. Default 2 MiB: the
+# standalone benchmark found budget is the *floor* knob (it moves peak only ~12 MB
+# across its range; the S3 fetch window is the real lever), and 2 MiB is the lowest
+# that holds throughput — so we take the smaller working set. Swept on the Linux/S3
+# run to confirm it holds under real integration (Agents.md §7.1).
 _ARROW_RS_DECODE_BUDGET_BYTES = env_integer(
-    "RAY_DATA_ARROW_RS_DECODE_BUDGET_BYTES", 8 * MiB
+    "RAY_DATA_ARROW_RS_DECODE_BUDGET_BYTES", 2 * MiB
 )
 
 # Floor on the estimated decode batch size (rows), so a very wide schema can't

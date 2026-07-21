@@ -626,15 +626,18 @@ def axis_s3():
     environment) on the Linux box to run it. The single-big-row-group-per-file
     layout is the target (§0); write fixtures with ``write_page_index=True``.
 
-    This sweeps the two knobs that govern the memory-first claim, since the goal
+    This sweeps the three knobs that govern the memory-first claim, since the goal
     is memory-parity-or-better at speed-parity (NOT max throughput):
       * ``fetch_window_mb`` — compressed bytes in flight per stream. Smaller =
         lower, flatter peak; the whole point is that S3 peak is this knob, not the
         row-group size. ``0`` = no window cap (fetch the whole range — the old
-        behavior, kept as the upper-bound control).
+        behavior, kept as the upper-bound control). Swept at a fixed 2 MiB budget.
+      * ``decode_budget_bytes`` — the decoded working-set floor (byte-budget
+        batching). Swept {2, 8, 32} MiB at a fixed 16 MiB window to confirm the
+        standalone finding that budget is the *floor* knob (small mem effect) while
+        the window is the lever. Default is 2 MiB (was 8; lowered per the local win).
       * ``MALLOC_ARENA_MAX`` — glibc arena cap (§7.8), the retention lever for the
-        default build. Run each window twice (uncapped vs capped) to isolate its
-        effect on node-sum peak.
+        default build. One capped run isolates its effect on node-sum peak.
     PyArrow is the baseline. K stays 1 for the per-file layout (Ray's pool
     parallelizes files); the lone-big-row-group K-split is a separate fixture.
     """
@@ -644,22 +647,29 @@ def axis_s3():
               "Linux+real-S3 box — S3 perf is not meaningful on macOS/moto)")
         return []
 
-    # (reader, fetch_window_mb, malloc_arena_max) configs. window/arena are
-    # ignored by the pyarrow baseline.
+    # (reader, fetch_window_mb, budget_mb, malloc_arena_max) configs.
+    # window/budget/arena are ignored by the pyarrow baseline. The two sweeps
+    # cross at (window=16, budget=2, arena=None) so that point is shared.
     configs = [
-        ("pyarrow", None, None),
-        ("arrow_rs", 4, None),
-        ("arrow_rs", 16, None),
-        ("arrow_rs", 64, None),
-        ("arrow_rs", 0, None),      # no window cap (control: shows the win's size)
-        ("arrow_rs", 16, 2),        # + arena cap (isolates the retention lever)
+        ("pyarrow", None, None, None),
+        # --- window sweep @ fixed 2 MiB budget (the memory lever) ---
+        ("arrow_rs", 4, 2, None),
+        ("arrow_rs", 16, 2, None),
+        ("arrow_rs", 64, 2, None),
+        ("arrow_rs", 0, 2, None),    # no window cap (control: shows the win's size)
+        # --- budget sweep @ fixed 16 MiB window (the floor knob) ---
+        ("arrow_rs", 16, 8, None),
+        ("arrow_rs", 16, 32, None),
+        # --- arena lever @ window 16 / budget 2 (isolates glibc retention) ---
+        ("arrow_rs", 16, 2, 2),
     ]
     results = []
-    for reader, window, arena in configs:
-        tag = reader if reader == "pyarrow" else f"arrow_rs_w{window}_a{arena}"
+    for reader, window, budget_mb, arena in configs:
+        tag = (reader if reader == "pyarrow"
+               else f"arrow_rs_w{window}_b{budget_mb}_a{arena}")
         d = _run_dir(f"s3__{tag}")
-        _fresh_session(reader, d, fetch_window_mb=(window or 0),
-                       malloc_arena_max=arena)
+        _fresh_session(reader, d, budget_bytes=(budget_mb or 2) * MB,
+                       fetch_window_mb=(window or 0), malloc_arena_max=arena)
         _warm(reader, d)  # warms worker imports on a tiny local fixture
         t0 = time.time()
         rows = consume(ray.data.read_parquet(s3_path), "iter_batches",
@@ -668,9 +678,9 @@ def axis_s3():
         peak = _node_sum_peak_mb(d, t0, t1)
         nat, fb = _count_paths(d)
         results.append({"reader": reader, "tag": tag, "fetch_window_mb": window,
-                        "malloc_arena_max": arena, "wall_s": t1 - t0, "rows": rows,
-                        "t0": t0, "t1": t1, "node_sum_peak_mb": peak,
-                        "native": nat, "fallback": fb})
+                        "budget_mb": budget_mb, "malloc_arena_max": arena,
+                        "wall_s": t1 - t0, "rows": rows, "t0": t0, "t1": t1,
+                        "node_sum_peak_mb": peak, "native": nat, "fallback": fb})
         print(f"  s3 {tag}: wall={t1-t0:.3f}s peak={peak:.0f}MB rows={rows} "
               f"native={nat} fallback={fb}")
     json.dump(results, open(os.path.join(OUT, "results_s3.json"), "w"), indent=2)
