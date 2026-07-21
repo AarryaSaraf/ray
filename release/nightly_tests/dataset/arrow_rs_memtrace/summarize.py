@@ -139,29 +139,6 @@ def _load_uss(run_dir):
     return series
 
 
-def _node_sum_peak(run_dir):
-    """Peak of the SUM across all workers' USS over the run, counting each worker
-    only within its own alive window (so a worker that exited early doesn't keep
-    contributing its last sample). This is the physical private-heap RAM the read
-    occupied at its worst instant — the number that decides 'is memory fine'."""
-    import numpy as np
-    series = _load_uss(run_dir)
-    if not series:
-        return 0.0
-    t0 = min(ep.min() for ep, _ in series)
-    t1 = max(ep.max() for ep, _ in series)
-    if t1 <= t0:
-        return max(uss.max() for _, uss in series) / MB
-    grid = np.linspace(t0, t1, 1000)
-    total = np.zeros_like(grid)
-    for ep, uss in series:
-        idx = np.searchsorted(ep, grid, side="right") - 1
-        held = np.where(idx >= 0, uss[np.clip(idx, 0, len(uss) - 1)], 0.0)
-        alive = (grid >= ep.min()) & (grid <= ep.max())
-        total += np.where(alive, held, 0.0)
-    return float(total.max()) / MB
-
-
 def _node_sum_series_windowed(run_dir, t0, t1, n=600, baseline=False):
     """node-sum USS (MB) vs relative time, restricted to the measured read window
     [t0, t1] (epoch seconds) so worker import / warm-up baseline is excluded.
@@ -408,90 +385,48 @@ def _mem_bars(labels, pa_vals, rs_vals, title, out, ylabel="node-sum peak USS (M
 
 
 def mem_layout():
-    labels = ["small_1grp", "small_many_grp", "one_large_grp", "many_large_grp", "mixed_grp"]
-    pa = [_node_sum_peak(os.path.join(OUT, f"layout__{n}__iter_batches__pyarrow")) for n in labels]
-    rs = [_node_sum_peak(os.path.join(OUT, f"layout__{n}__iter_batches__arrow_rs")) for n in labels]
-    _mem_bars(labels, pa, rs, "Peak memory by file/row-group layout (wide_str)",
-              os.path.join(FIG, "mem_layout.png"))
-
-
-def mem_schema():
-    schemas = ["int", "float", "wide_str", "large_str", "huge_str", "struct",
-               "list", "ray_tensor", "canonical_tensor"]
-    schemas = [s for s in schemas
-               if os.path.isdir(os.path.join(OUT, f"schema__{s}__arrow_rs"))]
-    pa = [_node_sum_peak(os.path.join(OUT, f"schema__{s}__pyarrow")) for s in schemas]
-    rs = [_node_sum_peak(os.path.join(OUT, f"schema__{s}__arrow_rs")) for s in schemas]
-    _mem_bars(schemas, pa, rs, "Peak memory by schema (fallback schemas run PyArrow → equal)",
-              os.path.join(FIG, "mem_schema.png"))
+    """Windowed incremental peak per layout, from results_layout.json (the same
+    numbers the table reports — NOT recomputed raw from traces, which would put
+    idle warm-worker baselines back into the bars)."""
+    rows = _load("layout")
+    if not rows:
+        print("  (no layout results — run: bench_suite.py layout)")
+        return
+    labels = []
+    by = {}
+    for r in rows:
+        if r["layout"] not in labels:
+            labels.append(r["layout"])
+        by[(r["layout"], r["reader"])] = r.get("node_sum_incr_mb",
+                                               r.get("node_sum_peak_mb", 0))
+    pa = [by.get((n, "pyarrow"), 0) for n in labels]
+    rs = [by.get((n, "arrow_rs"), 0) for n in labels]
+    _mem_bars(labels, pa, rs,
+              "Extra memory the read caused, by file/row-group layout (wide_str)\n"
+              "(windowed incremental node-sum USS — warm-worker baselines removed)",
+              os.path.join(FIG, "mem_layout.png"),
+              ylabel="node-sum incr USS (MB)")
 
 
 def mem_mixed():
-    pa = [_node_sum_peak(os.path.join(OUT, "mixed__pyarrow"))]
-    rs = [_node_sum_peak(os.path.join(OUT, "mixed__arrow_rs"))]
-    _mem_bars(["mixed_5_schemas"], pa, rs, "Peak memory: 5 files, 5 different schemas, one dataset",
-              os.path.join(FIG, "mem_mixed.png"))
+    rows = _load("mixed")
+    if not rows:
+        print("  (no mixed results — run: bench_suite.py mixed)")
+        return
+    by = {r["reader"]: r.get("node_sum_incr_mb", r.get("node_sum_peak_mb", 0))
+          for r in rows}
+    _mem_bars(["mixed_schemas"], [by.get("pyarrow", 0)], [by.get("arrow_rs", 0)],
+              "Extra memory: heterogeneous-schema files, one dataset\n"
+              "(windowed incremental node-sum USS)",
+              os.path.join(FIG, "mem_mixed.png"),
+              ylabel="node-sum incr USS (MB)")
 
 
-def mem_scaling():
-    """The headline memory graph: peak node-sum USS vs file size, one big row
-    group. arrow-rs stays flat (byte budget); PyArrow grows with the group."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    os.makedirs(FIG, exist_ok=True)
-    rows_list = [1_000_000, 2_000_000, 4_000_000, 8_000_000]
-    xs = [n / 1e6 for n in rows_list]
-    pa = [_node_sum_peak(os.path.join(OUT, f"scale__{n}__pyarrow")) for n in rows_list]
-    rs = [_node_sum_peak(os.path.join(OUT, f"scale__{n}__arrow_rs")) for n in rows_list]
-    fig, ax = plt.subplots(figsize=(8, 4.8))
-    ax.plot(xs, pa, "o-", color="#c0392b", lw=2, label="pyarrow")
-    ax.plot(xs, rs, "o-", color="#2471a3", lw=2, label="arrow_rs")
-    for x, p, r in zip(xs, pa, rs):
-        ax.annotate(f"{p:.0f}", (x, p), xytext=(0, 6), textcoords="offset points",
-                    ha="center", fontsize=8, color="#c0392b")
-        ax.annotate(f"{r:.0f}", (x, r), xytext=(0, -12), textcoords="offset points",
-                    ha="center", fontsize=8, color="#2471a3")
-    ax.set_xlabel("rows (millions), one big row group")
-    ax.set_ylabel("node-sum peak USS (MB)")
-    ax.set_title("Peak memory vs file size (one big row group):\n"
-                 "byte-budget decode stays flat; PyArrow grows with the group")
-    ax.legend()
-    ax.grid(alpha=0.2)
-    fig.tight_layout()
-    out = os.path.join(FIG, "mem_scaling.png")
-    fig.savefig(out, dpi=120)
-    plt.close(fig)
-    print(f"  wrote {out}")
-
-
-def mem_tuning():
-    """Peak node-sum USS vs decode budget (arrow-rs), with the PyArrow baseline as
-    a hline. Shows memory is a knob: bigger budget → more resident, more speed."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    os.makedirs(FIG, exist_ok=True)
-    budgets = [1, 2, 4, 8, 16, 32]
-    budgets = [b for b in budgets
-               if os.path.isdir(os.path.join(OUT, f"tuning__arrow_rs__{b}mb"))]
-    rs = [_node_sum_peak(os.path.join(OUT, f"tuning__arrow_rs__{b}mb")) for b in budgets]
-    base = _node_sum_peak(os.path.join(OUT, "tuning__pyarrow"))
-    fig, ax = plt.subplots(figsize=(8, 4.8))
-    ax.plot(budgets, rs, "o-", color="#2471a3", lw=2, label="arrow_rs")
-    if base:
-        ax.axhline(base, color="#c0392b", ls="--", lw=2, label=f"pyarrow ({base:.0f}MB)")
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("decode_budget_bytes (MB, log2)")
-    ax.set_ylabel("node-sum peak USS (MB)")
-    ax.set_title("Memory is a knob: peak USS vs decode budget (one big row group)")
-    ax.legend()
-    ax.grid(alpha=0.2)
-    fig.tight_layout()
-    out = os.path.join(FIG, "mem_tuning.png")
-    fig.savefig(out, dpi=120)
-    plt.close(fig)
-    print(f"  wrote {out}")
+# NOTE: there are deliberately no mem_scaling / mem_schema / mem_tuning graphs.
+# Those axes measure wall time, parity, and path-taken only — they run without a
+# USS trace dir, so any "memory" graph for them could only ever show zeros
+# (which is exactly the bug this note replaces). Memory axes: layout, mixed,
+# the sweeps, workloads, concurrency, s3.
 
 
 def plot_leak(rows):
@@ -797,9 +732,7 @@ def main():
     # Memory (USS) graphs for every axis — the verdict axis. Built from the
     # per-run uss_*.csv already on disk (no re-run needed).
     print("\n## MEMORY GRAPHS (node-sum peak USS)")
-    for name, fn in [("layout", mem_layout), ("schema", mem_schema),
-                     ("mixed", mem_mixed), ("scaling", mem_scaling),
-                     ("tuning", mem_tuning),
+    for name, fn in [("layout", mem_layout), ("mixed", mem_mixed),
                      ("time_showcase", mem_time_showcase),
                      ("speed_showcase", speed_time_showcase),
                      ("workloads", plot_workloads), ("s3", plot_s3)]:
