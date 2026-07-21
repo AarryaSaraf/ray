@@ -73,24 +73,28 @@ def _fresh_session(reader, trace_dir, budget_bytes=8 * MB, k=1, num_cpus=4,
         "worker_process_setup_hook": "worker_mem_sampler.setup",
         "env_vars": env_vars,
     }
-    # On an Anyscale workspace a Ray cluster is ALREADY running, so ray.init auto-
-    # connects to it — and you may NOT pass num_cpus when attaching. Detect that
-    # (RAY_ADDRESS set) and attach instead of starting a local cluster; concurrency
-    # is then the node's core count (consistent across configs, since 0 worker nodes
-    # => the head IS the single node). Instrumentation still works: each config's
-    # runtime_env differs (reader flag + knobs), so Ray starts FRESH workers per
-    # config with these env_vars, and only our workers have RAY_MEM_TRACE_DIR set —
-    # so only our workers sample. On a plain box (no RAY_ADDRESS) keep the isolated
-    # local cluster with pinned num_cpus, exactly as before.
-    attached = bool(os.environ.get("RAY_ADDRESS")) or os.path.exists(
-        "/tmp/ray/ray_current_cluster"
-    )
-    if attached:
-        ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False,
-                 runtime_env=runtime_env)
-    else:
-        ray.init(num_cpus=num_cpus, include_dashboard=False,
+    # Start a PRIVATE local Ray with num_cpus PINNED, even on an Anyscale workspace
+    # where a shared cluster is already running: address="local" spins up a fresh
+    # instance and ignores RAY_ADDRESS / the running cluster. This is deliberate and
+    # matters for the single-fat-node precise run:
+    #   * faithful concurrency — the num_cpus knob the concurrency/files axes vary
+    #     actually takes effect (when ATTACHED you may not pass num_cpus, so every
+    #     config silently ran at the whole node's core count and those axes were
+    #     meaningless);
+    #   * clean memory — only our ~num_cpus workers exist, so node-sum USS isn't
+    #     inflated by the shared cluster's dozens of idle workers (whose baseline
+    #     heaps otherwise swamp the decode signal; see _node_sum_incr_peak_mb).
+    # The multi-node correctness pass (run_s3_benchmark distributed-check) attaches
+    # to the real cluster on its own; it does not go through here.
+    try:
+        ray.init(address="local", num_cpus=num_cpus, include_dashboard=False,
                  ignore_reinit_error=True, log_to_driver=False,
+                 runtime_env=runtime_env)
+    except Exception:
+        # Some environments disallow a private local cluster; attach instead (can't
+        # pin num_cpus -> concurrency becomes the node's core count, but incremental
+        # USS still isolates the workers that actually decoded).
+        ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False,
                  runtime_env=runtime_env)
     from ray.data.context import DataContext
     ctx = DataContext.get_current()
@@ -203,12 +207,17 @@ def axis_layout():
                 _warm(reader, d)
                 t0 = time.time()
                 rows = consume(ray.data.read_parquet(path), mode)
-                wall = time.time() - t0
+                t1 = time.time(); wall = t1 - t0
                 ray.shutdown(); time.sleep(0.3)
+                peak = _node_sum_peak_mb(d, t0, t1)
+                incr = _node_sum_incr_peak_mb(d, t0, t1)
                 nat, fb = _count_paths(d)
                 results.append({"layout": name, "reader": reader, "mode": mode,
-                                "wall_s": wall, "rows": rows, "native": nat, "fallback": fb})
-                print(f"  {label}: wall={wall:.3f}s rows={rows} native={nat} fallback={fb}")
+                                "wall_s": wall, "rows": rows, "t0": t0, "t1": t1,
+                                "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
+                                "native": nat, "fallback": fb})
+                print(f"  {label}: wall={wall:.3f}s abs={peak:.0f}MB incr={incr:.0f}MB "
+                      f"rows={rows} native={nat} fallback={fb}")
     json.dump(results, open(os.path.join(OUT, "results_layout.json"), "w"), indent=2)
     return results
 
@@ -308,34 +317,22 @@ def axis_mixed():
     # mixed dataset with a NON-native schema (struct) routes cleanly: arrow-rs
     # takes the 5 flat files natively and falls back to PyArrow for the struct
     # file, in one read, without breaking. Struct is the "one with structs" case.
-    d = os.path.join(fx.DATA, "mixed6_struct")
-    if not (os.path.isdir(d) and glob.glob(os.path.join(d, "*.parquet"))):
-        os.makedirs(d, exist_ok=True)
-        import numpy as np
-        import pyarrow.parquet as pq
-        rng = np.random.default_rng(0)
-        specs = [("int", fx._ints), ("float", fx._floats),
-                 ("wide_str", fx._wide_str), ("large_str", fx._large_str),
-                 ("huge_str", fx._huge_str), ("struct", fx._struct)]
-        for i, (nm, build) in enumerate(specs):
-            tbl = pa.table(build(rng, 400_000))
-            pq.write_table(tbl, os.path.join(d, f"part-{i:04d}_{nm}.parquet"),
-                           row_group_size=400_000, write_page_index=True,
-                           compression="snappy")
+    path = fx.make_mixed_fixture("mixed6_struct", per=400_000)
     results = []
     for reader in ["pyarrow", "arrow_rs"]:
         rd = _run_dir(f"mixed__{reader}")
         _fresh_session(reader, rd)
         _warm(reader, rd)
-        t0 = time.time(); rows = consume(ray.data.read_parquet(d), "iter_batches")
+        t0 = time.time(); rows = consume(ray.data.read_parquet(path), "iter_batches")
         t1 = time.time(); wall = t1 - t0; ray.shutdown(); time.sleep(0.3)
         nat, fb = _count_paths(rd)
         peak = _node_sum_peak_mb(rd, t0, t1)
+        incr = _node_sum_incr_peak_mb(rd, t0, t1)
         results.append({"reader": reader, "wall_s": wall, "rows": rows,
                         "t0": t0, "t1": t1, "node_sum_peak_mb": peak,
-                        "native": nat, "fallback": fb})
-        print(f"  mixed {reader}: wall={wall:.3f}s rows={rows} peak={peak:.0f}MB "
-              f"native={nat} fallback={fb}")
+                        "node_sum_incr_mb": incr, "native": nat, "fallback": fb})
+        print(f"  mixed {reader}: wall={wall:.3f}s rows={rows} abs={peak:.0f}MB "
+              f"incr={incr:.0f}MB native={nat} fallback={fb}")
     json.dump(results, open(os.path.join(OUT, "results_mixed.json"), "w"), indent=2)
     return results
 
@@ -461,12 +458,14 @@ def axis_concurrency():
                 t1 = time.time()
                 ray.shutdown(); time.sleep(0.3)
                 peak = _node_sum_peak_mb(d, t0, t1)
+                incr = _node_sum_incr_peak_mb(d, t0, t1)
                 nat, fb = _count_paths(d)
                 results.append({"fixture": fxname, "reader": reader, "num_cpus": ncpu,
-                                "wall_s": t1 - t0, "node_sum_peak_mb": peak, "rows": rows,
-                                "native": nat, "fallback": fb})
+                                "wall_s": t1 - t0, "node_sum_peak_mb": peak,
+                                "node_sum_incr_mb": incr, "rows": rows, "t0": t0,
+                                "t1": t1, "native": nat, "fallback": fb})
                 print(f"  conc {fxname} {reader} cpu={ncpu}: wall={t1-t0:.3f}s "
-                      f"node_sum_peak={peak:.0f}MB native={nat} fallback={fb}")
+                      f"abs={peak:.0f}MB incr={incr:.0f}MB native={nat} fallback={fb}")
     json.dump(results, open(os.path.join(OUT, "results_concurrency.json"), "w"), indent=2)
     return results
 
@@ -500,12 +499,14 @@ def axis_showcase():
             t1 = time.time()
             ray.shutdown(); time.sleep(0.3)
             peak = _node_sum_peak_mb(d, t0, t1)
+            incr = _node_sum_incr_peak_mb(d, t0, t1)
             nat, fb = _count_paths(d)
             results.append({"config": name, "reader": reader, "wall_s": t1 - t0,
-                            "node_sum_peak_mb": peak, "rows": rows, "t0": t0, "t1": t1,
+                            "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
+                            "rows": rows, "t0": t0, "t1": t1,
                             "native": nat, "fallback": fb})
-            print(f"  show {name} {reader}: wall={t1-t0:.3f}s peak={peak:.0f}MB "
-                  f"rows={rows} native={nat} fallback={fb}")
+            print(f"  show {name} {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
+                  f"incr={incr:.0f}MB rows={rows} native={nat} fallback={fb}")
     json.dump(results, open(os.path.join(OUT, "results_showcase.json"), "w"), indent=2)
     return results
 
@@ -534,13 +535,16 @@ def _run_sweep(name, levels, mode="iter_batches", num_cpus=4):
             t1 = time.time()
             ray.shutdown(); time.sleep(0.3)
             peak = _node_sum_peak_mb(d, t0, t1)
+            incr = _node_sum_incr_peak_mb(d, t0, t1)
             nat, fb = _count_paths(d)
             results.append({"sweep": name, "level": lv["label"], "reader": reader,
-                            "wall_s": t1 - t0, "node_sum_peak_mb": peak, "rows": rows,
+                            "wall_s": t1 - t0, "node_sum_peak_mb": peak,
+                            "node_sum_incr_mb": incr, "rows": rows,
                             "t0": t0, "t1": t1, "budget_mb": budget // MB,
                             "num_cpus": ncpu, "native": nat, "fallback": fb})
             print(f"  sweep[{name}] {lv['label']} {reader}: wall={t1-t0:.3f}s "
-                  f"peak={peak:.0f}MB rows={rows} native={nat} fallback={fb}")
+                  f"abs={peak:.0f}MB incr={incr:.0f}MB rows={rows} "
+                  f"native={nat} fallback={fb}")
     json.dump(results, open(os.path.join(OUT, f"results_sweep_{name}.json"), "w"), indent=2)
     return results
 
@@ -655,12 +659,14 @@ def axis_workloads():
         t1 = time.time()
         ray.shutdown(); time.sleep(0.3)
         peak = _node_sum_peak_mb(d, t0, t1)
+        incr = _node_sum_incr_peak_mb(d, t0, t1)
         nat, fb = _count_paths(d)
         results.append({"workload": "sum(i0)", "reader": reader, "wall_s": t1 - t0,
-                        "node_sum_peak_mb": peak, "out": str(total),
+                        "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
+                        "out": str(total), "t0": t0, "t1": t1,
                         "native": nat, "fallback": fb})
-        print(f"  wl sum {reader}: wall={t1-t0:.3f}s peak={peak:.0f}MB "
-              f"native={nat} fallback={fb}")
+        print(f"  wl sum {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
+              f"incr={incr:.0f}MB native={nat} fallback={fb}")
         # Selective read-time filter: decode all, keep a sliver. Non-empty
         # projection so the arrow-rs path runs (count() would empty-project → fallback).
         d = _run_dir(f"wl__filter__{reader}")
@@ -672,12 +678,14 @@ def axis_workloads():
         t1 = time.time()
         ray.shutdown(); time.sleep(0.3)
         peak = _node_sum_peak_mb(d, t0, t1)
+        incr = _node_sum_incr_peak_mb(d, t0, t1)
         nat, fb = _count_paths(d)
         results.append({"workload": "filter(i0>hi)", "reader": reader, "wall_s": t1 - t0,
-                        "node_sum_peak_mb": peak, "kept_rows": kept,
+                        "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
+                        "kept_rows": kept, "t0": t0, "t1": t1,
                         "native": nat, "fallback": fb})
-        print(f"  wl filter {reader}: wall={t1-t0:.3f}s peak={peak:.0f}MB "
-              f"kept={kept} native={nat} fallback={fb}")
+        print(f"  wl filter {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
+              f"incr={incr:.0f}MB kept={kept} native={nat} fallback={fb}")
     json.dump(results, open(os.path.join(OUT, "results_workloads.json"), "w"), indent=2)
     return results
 
@@ -782,12 +790,77 @@ AXES = {"layout": axis_layout, "schema": axis_schema, "tuning": axis_tuning,
         "workloads": axis_workloads, "s3": axis_s3}
 
 
+def write_summary_csv():
+    """Flatten every runs/results_*.json into ONE runs/summary.csv (also echoed to
+    stdout): axis, config, reader, wall_s, abs_peak_mb, incr_peak_mb, rows, path.
+    One row per measured read across ALL axes — the machine-readable digest to paste
+    back for analysis. Pyarrow and arrow_rs rows share the same (axis, config), so
+    the mem/speed ratios are a one-line pairing away; incr_peak_mb is the column that
+    matters (baseline-subtracted; see _node_sum_incr_peak_mb)."""
+    import csv as _csv
+
+    def _config(axis, r):
+        base = axis
+        for k in ("tag", "config", "workload", "layout", "schema", "fixture"):
+            if r.get(k) is not None:
+                base = str(r[k])
+                break
+        if r.get("sweep") is not None and r.get("level") is not None:
+            base = f"{r['sweep']}:{r['level']}"
+        if axis == "scaling" and r.get("rows"):
+            base = f"{r['rows'] // 1_000_000}M"
+        extra = []
+        if r.get("budget_mb") is not None:
+            extra.append(f"b{r['budget_mb']}")
+        if r.get("num_cpus") is not None:
+            extra.append(f"cpu{r['num_cpus']}")
+        return base + (("_" + "_".join(extra)) if extra else "")
+
+    def _num(r, k):
+        v = r.get(k)
+        return round(v, 3) if isinstance(v, (int, float)) else ""
+
+    fields = ["axis", "config", "reader", "wall_s", "abs_peak_mb", "incr_peak_mb",
+              "rows", "native", "fallback"]
+    out_rows = []
+    for f in sorted(glob.glob(os.path.join(OUT, "results_*.json"))):
+        axis = os.path.basename(f)[len("results_"):-len(".json")]
+        try:
+            data = json.load(open(f))
+        except Exception:
+            continue
+        if not isinstance(data, list):
+            continue
+        for r in data:
+            if not isinstance(r, dict) or "reader" not in r:
+                continue
+            out_rows.append({
+                "axis": axis, "config": _config(axis, r),
+                "reader": r.get("reader", ""), "wall_s": _num(r, "wall_s"),
+                "abs_peak_mb": _num(r, "node_sum_peak_mb"),
+                "incr_peak_mb": _num(r, "node_sum_incr_mb"),
+                "rows": r.get("rows", ""), "native": r.get("native", ""),
+                "fallback": r.get("fallback", ""),
+            })
+    path = os.path.join(OUT, "summary.csv")
+    with open(path, "w", newline="") as fh:
+        w = _csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        w.writerows(out_rows)
+    print(f"\n===== SUMMARY CSV ({len(out_rows)} rows) -> {path} =====")
+    print(",".join(fields))
+    for r in out_rows:
+        print(",".join(str(r[k]) for k in fields))
+    return path
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     which = sys.argv[1].split(",") if len(sys.argv) > 1 else list(AXES)
     for axis in which:
         print(f"\n===== AXIS: {axis} =====")
         AXES[axis]()
+    write_summary_csv()
     print("\nALL DONE")
 
 

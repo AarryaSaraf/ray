@@ -452,9 +452,11 @@ def main():
     print("\n===== SUMMARY + PLOTS =====")
     summarize.table_s3(results)
     summarize.plot_s3()
+    bench_suite.write_summary_csv()
     print(
         "\nDONE. Figures in figs/s3_mem_time.png + figs/s3_speed_time.png; "
-        "raw numbers in runs/results_s3.json"
+        "raw numbers in runs/results_s3.json; machine-readable digest in "
+        "runs/summary.csv (paste it back for analysis)."
     )
 
 
