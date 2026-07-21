@@ -42,6 +42,13 @@ WARM = {"rows": 10_000, "num_files": 1, "row_group_size": 10_000, "schema": "int
 def _fresh_session(reader, trace_dir, budget_bytes=8 * MB, k=1, num_cpus=4,
                    fetch_window_mb=16, malloc_arena_max=None, ld_preload=None):
     ray.shutdown()
+    # Let the allocator levers be flipped for the WHOLE suite from the environment,
+    # so an axis that doesn't thread them through (e.g. layout) can still be A/B'd
+    # against the uncapped system allocator without a code edit. Explicit args win.
+    if malloc_arena_max is None:
+        malloc_arena_max = os.environ.get("RAY_DATA_ARROW_RS_MALLOC_ARENA_MAX")
+    if ld_preload is None:
+        ld_preload = os.environ.get("RAY_DATA_ARROW_RS_LD_PRELOAD")
     env_vars = {
         "RAY_MEM_TRACE_DIR": trace_dir,
         "RAY_MEM_TRACE_INTERVAL_S": "0.005",
