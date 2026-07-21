@@ -1072,6 +1072,36 @@ prunes nothing — you still get late materialization (decode fewer *columns*), 
 saving. This is why real systems push users toward sorting / Z-ordering on filter columns;
 the 4 M→6 example above assumes `i0` is clustered.
 
+**Two layers of "pushdown" — Ray already does one of them, and it's not this one.** It's easy
+to confuse two separate wins. Keep them apart:
+
+- **Layer 1 — *where* the filter runs in the plan.** Moving the filter below a join, shuffle,
+  sort, or projection so those expensive operators process fewer rows. This is a big win
+  because joins/shuffles/sorts are super-linear (network, serialization, spill), while a filter
+  is linear with a tiny constant. **Ray already does this** — the `PredicatePushdown` rule
+  (`_internal/logical/rules/predicate_pushdown.py`) relocates an expression filter down through
+  Sort/Shuffle/Repartition (pass-through), Project (with column renaming), Union (into both
+  branches), and **Join** (side-aware and join-type-safe: INNER → either side, LEFT_OUTER →
+  left only, FULL_OUTER → neither, since nulls would be dropped —
+  `logical/operators/join_operator.py:203-212`), and finally into the Read op. So by the time a
+  read happens, the join/shuffle above it already sees the filtered row count. This layer is
+  **done**; the crate doesn't touch it.
+- **Layer 2 — *how* the filter runs once it reaches the Read.** Even after Layer 1 pushes the
+  filter *into* the Read op, execution today still **decodes every row, then filters** (PyArrow
+  filters post-decode per batch; the arrow-rs path filters in Python after decode). "Pushed into
+  the read" does **not** mean "skips the decode." Making the decode itself cheap — skip pages
+  via stats, decode only the predicate column first, then decode the wide columns only for
+  surviving rows (late materialization) — is Layer 2, and **no reader does it today.** This is
+  the crate's job and the whole subject of this section.
+
+Two practical notes on Layer 1, because they decide whether Layer 2 ever gets a filter to work
+with: (1) **only expression filters are pushed** — `ds.filter(expr="i0 > 1000")` gets pushed
+through the join and into the read, but `ds.filter(lambda row: ...)` is an opaque UDF and is
+pushed *nowhere*. (2) Only PyArrow-convertible parts of a predicate reach the datasource; a
+mixed `a > 5 AND my_udf(b)` pushes `a > 5` into the read and leaves `my_udf(b)` as a filter
+above it. So the two layers **compound**: Layer 1 delivers fewer rows to the read and a filter
+the read can see; Layer 2 makes producing those rows cheap.
+
 **Why this is the moment.** Page-level chunks and page-level pushdown are the *same*
 `RowSelection` + page-index mechanism. If the chunker starts handing the reader page ranges,
 the reader is already consuming a page-index-guided `RowSelection`; adding a filter-derived
