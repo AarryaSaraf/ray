@@ -162,9 +162,15 @@ def _node_sum_peak(run_dir):
     return float(total.max()) / MB
 
 
-def _node_sum_series_windowed(run_dir, t0, t1, n=600):
+def _node_sum_series_windowed(run_dir, t0, t1, n=600, baseline=False):
     """node-sum USS (MB) vs relative time, restricted to the measured read window
-    [t0, t1] (epoch seconds) so worker import / warm-up baseline is excluded."""
+    [t0, t1] (epoch seconds) so worker import / warm-up baseline is excluded.
+
+    With baseline=True, each worker's USS at the start of its in-window life is
+    subtracted first, so the curve is the EXTRA heap the read caused. That cancels
+    the idle pre-started workers Ray spins up on a many-core node (each just holds a
+    constant imported-lib heap) — without it the sum sits on a big flat plateau and
+    the decode signal is invisible. baseline=False is the raw absolute node-sum."""
     import numpy as np
     series = _load_uss(run_dir)
     if not series:
@@ -173,9 +179,14 @@ def _node_sum_series_windowed(run_dir, t0, t1, n=600):
     total = np.zeros_like(grid)
     for ep, uss in series:
         idx = np.searchsorted(ep, grid, side="right") - 1
-        held = np.where(idx >= 0, uss[np.clip(idx, 0, len(uss) - 1)], 0.0)
+        held = np.where(idx >= 0, uss[np.clip(idx, 0, len(uss) - 1)], np.nan)
         alive = (grid >= ep.min()) & (grid <= ep.max())
-        total += np.where(alive, held, 0.0)
+        held = np.where(alive, held, np.nan)
+        valid = ~np.isnan(held)
+        if not valid.any():
+            continue
+        b = held[int(np.argmax(valid))] if baseline else 0.0
+        total += np.where(valid, held - b, 0.0)
     return grid - t0, total / MB
 
 
@@ -644,18 +655,27 @@ def table_s3(rows):
         print("  (no s3 results)")
         return
     base = next((r for r in rows if r["reader"] == "pyarrow"), None)
-    print(f"{'config':24s} {'wall_s':>8s} {'node-sum peak':>14s} "
+
+    def _incr(r):
+        # incremental peak (baseline-subtracted) is the number to compare; fall back
+        # to absolute for results produced before that column existed.
+        return r.get("node_sum_incr_mb", r.get("node_sum_peak_mb", 0))
+
+    print(f"{'config':24s} {'wall_s':>8s} {'abs peak':>10s} {'incr peak':>11s} "
           f"{'mem vs pa':>10s} {'wall vs pa':>11s} {'path':>9s}")
     for r in rows:
         path = f"{r.get('native', 0)}/{r.get('fallback', 0)}"
         memr = wallr = ""
         if base and r["reader"] == "arrow_rs":
-            memr = f"{base['node_sum_peak_mb'] / (r['node_sum_peak_mb'] or 1):.2f}x"
+            memr = f"{_incr(base) / (_incr(r) or 1):.2f}x"
             wallr = f"{r['wall_s'] / (base['wall_s'] or 1):.2f}x"
         print(f"{r.get('tag', r['reader']):24s} {r['wall_s']:8.2f} "
-              f"{r['node_sum_peak_mb']:11.0f}MB {memr:>10s} {wallr:>11s} {path:>9s}")
+              f"{r['node_sum_peak_mb']:7.0f}MB {_incr(r):8.0f}MB "
+              f"{memr:>10s} {wallr:>11s} {path:>9s}")
     if base:
-        print("  (mem vs pa = pyarrow/arrow_rs peak; >1.0 ⇒ arrow-rs uses LESS. "
+        print("  (incr peak = extra heap the read caused, each worker's warm baseline "
+              "removed — THE number to compare; abs peak = raw node-sum for the "
+              "platform dashboard. mem vs pa on incr: >1.0 ⇒ arrow-rs uses LESS. "
               "wall vs pa = arrow_rs/pyarrow; ~1.0 ⇒ speed parity, the bar.)")
 
 
@@ -683,35 +703,41 @@ def plot_s3():
         return
     colors = {"pyarrow": "#c0392b", "arrow_rs": "#2471a3"}
 
-    # --- memory over time: one panel per arrow_rs config, PyArrow overlaid ---
+    def _incr(r):
+        return r.get("node_sum_incr_mb", r.get("node_sum_peak_mb", 0))
+
+    # --- memory over time: one panel per arrow_rs config, PyArrow overlaid.
+    # baseline=True subtracts each worker's warm heap so idle pre-started workers
+    # (a big flat plateau on a many-core node) cancel and the decode signal shows.
     bt, by = _node_sum_series_windowed(
-        os.path.join(OUT, "s3__pyarrow"), base["t0"], base["t1"])
+        os.path.join(OUT, "s3__pyarrow"), base["t0"], base["t1"], baseline=True)
     n = len(configs)
     fig, axes = plt.subplots(1, n, figsize=(3.8 * n, 4.4), squeeze=False)
     for ax, cfg in zip(axes[0], configs):
         if bt is not None:
             ax.step(bt, by, where="post", color=colors["pyarrow"], lw=2.2,
-                    label=f"pyarrow {base['node_sum_peak_mb']:.0f}MB")
+                    label=f"pyarrow {_incr(base):.0f}MB")
         ct, cy = _node_sum_series_windowed(
-            os.path.join(OUT, f"s3__{cfg['tag']}"), cfg["t0"], cfg["t1"])
+            os.path.join(OUT, f"s3__{cfg['tag']}"), cfg["t0"], cfg["t1"],
+            baseline=True)
         if ct is not None:
             ax.step(ct, cy, where="post", color=colors["arrow_rs"], lw=2.2,
-                    label=f"arrow_rs {cfg['node_sum_peak_mb']:.0f}MB")
+                    label=f"arrow_rs {_incr(cfg):.0f}MB")
         w, b = cfg.get("fetch_window_mb"), cfg.get("budget_mb")
         wl = "no-cap" if not w else f"{w}MB"
         bl = f" bud{b}" if b else ""
         al = f" {cfg.get('alloc')}" if cfg.get("alloc") and cfg["alloc"] != "sys" else ""
-        pr, rr = base["node_sum_peak_mb"], cfg["node_sum_peak_mb"] or 1
+        pr, rr = _incr(base), _incr(cfg) or 1
         ax.set_title(f"win={wl}{bl}{al}\npa {pr:.0f}/rs {rr:.0f}MB ({pr / rr:.2f}x)\n"
                      f"wall {cfg['wall_s'] / (base['wall_s'] or 1):.2f}x",
                      fontsize=8)
         ax.set_xlabel("seconds")
         ax.grid(alpha=0.2)
         ax.legend(fontsize=7, loc="upper left")
-    axes[0][0].set_ylabel("node-sum USS (MB)")
+    axes[0][0].set_ylabel("node-sum USS above warm baseline (MB)")
     fig.suptitle(
         "S3 memory-over-time — PyArrow vs arrow-rs (fetch-window + allocator sweep)\n"
-        "memory-first: smaller window ⇒ lower, flatter peak; wall ~1.0x = speed parity (the bar)",
+        "extra heap above warm baseline; smaller window ⇒ lower, flatter peak; wall ~1.0x = speed parity (the bar)",
         fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.88])
     out = os.path.join(FIG, "s3_mem_time.png")

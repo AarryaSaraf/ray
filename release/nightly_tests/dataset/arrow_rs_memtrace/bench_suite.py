@@ -364,6 +364,49 @@ def _node_sum_peak_mb(trace_dir, t0, t1):
     return float(total.max()) / MB
 
 
+def _node_sum_incr_peak_mb(trace_dir, t0, t1):
+    """Like _node_sum_peak_mb, but each worker's USS at the START of the window (its
+    warm baseline) is subtracted before summing — the peak EXTRA private heap the
+    read itself caused, node-wide.
+
+    This, not the absolute sum, is the number to compare across readers/knobs. On a
+    many-core node Ray pre-starts one worker per core; all of them inherit our
+    runtime_env and run the sampler, but only the few that actually decode grow their
+    heap. The idle workers each hold ~tens of MB of imported libs — a large,
+    reader-INDEPENDENT constant that, summed absolutely, swamps the decode signal and
+    washes every ratio toward 1.0x. Subtracting each worker's own t0 baseline cancels
+    that constant; a worker that never grows contributes ~0. (Absolute node-sum, for
+    cross-checking the platform memory dashboard, stays in _node_sum_peak_mb.)
+    """
+    import csv
+
+    import numpy as np
+
+    series = []
+    for f in glob.glob(os.path.join(trace_dir, "uss_*.csv")):
+        rows = list(csv.reader(open(f)))[1:]
+        if not rows:
+            continue
+        series.append((np.array([float(r[0]) for r in rows]),
+                       np.array([float(r[1]) for r in rows])))
+    if not series:
+        return 0.0
+    grid = np.linspace(t0, t1, 500)
+    total = np.zeros_like(grid)
+    for ep, uss in series:
+        idx = np.searchsorted(ep, grid, side="right") - 1
+        held = np.where(idx >= 0, uss[np.clip(idx, 0, len(uss) - 1)], np.nan)
+        alive = (grid >= ep.min()) & (grid <= ep.max())
+        held = np.where(alive, held, np.nan)
+        valid = ~np.isnan(held)
+        if not valid.any():
+            continue
+        # baseline = this worker's first in-window sample (already post-import)
+        baseline = held[int(np.argmax(valid))]
+        total += np.where(valid, held - baseline, 0.0)
+    return float(total.max()) / MB
+
+
 def axis_scaling():
     """Is arrow-rs O(n) or O(n^2) on ONE big row group? If a per-batch reader
     rebuild (growing RowSelection skip) lurked, wall/row would GROW with row count.
@@ -716,14 +759,16 @@ def axis_s3():
                        progress_path=os.path.join(d, "progress.csv"))
         t1 = time.time(); ray.shutdown(); time.sleep(0.3)
         peak = _node_sum_peak_mb(d, t0, t1)
+        incr = _node_sum_incr_peak_mb(d, t0, t1)
         nat, fb = _count_paths(d)
         results.append({"reader": reader, "tag": tag, "fetch_window_mb": window,
                         "budget_mb": budget_mb, "malloc_arena_max": arena,
                         "ld_preload": preload, "alloc": alloc,
                         "wall_s": t1 - t0, "rows": rows, "t0": t0, "t1": t1,
-                        "node_sum_peak_mb": peak, "native": nat, "fallback": fb})
-        print(f"  s3 {tag}: wall={t1-t0:.3f}s peak={peak:.0f}MB rows={rows} "
-              f"native={nat} fallback={fb}")
+                        "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
+                        "native": nat, "fallback": fb})
+        print(f"  s3 {tag}: wall={t1-t0:.3f}s abs_peak={peak:.0f}MB "
+              f"incr_peak={incr:.0f}MB rows={rows} native={nat} fallback={fb}")
     json.dump(results, open(os.path.join(OUT, "results_s3.json"), "w"), indent=2)
     return results
 
