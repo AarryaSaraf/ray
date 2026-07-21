@@ -1,13 +1,17 @@
 # arrow-rs Parquet reader for Ray Data V2 — case, design, findings
 
 **Status:** prototype, wired into the DataSource V2 path, flag-gated. **Local and S3
-correctness** are validated on macOS (S3 via a moto server); the **S3 speed/memory win
-is not yet measured** — that needs Linux + real S3 (moto has no network latency, macOS
-USS is directional). Nothing committed upstream.
+correctness** are validated on macOS (S3 via a moto server). A first **Linux
+(Anyscale workspace) measurement phase ran and mostly invalidated its own metric**
+rather than the implementation (§3.5.1) — its salvage: a Ray-free probe and per-worker
+traces confirming arrow-rs ≤ PyArrow on the very layouts the metric flagged, and a
+hardened harness. The suite now measures ONE thing: **per-task absolute USS over time
+vs Ray's own per-task provisioning assumption** (§3.5.1); the full Linux + real-S3
+rerun on that metric is the next experiment. Nothing committed upstream.
 
 **Purpose of this doc:** hand this to a reviewer cold. It states *exactly* the case we
 target, *exactly* what we built, every design choice and its rejected alternative, the
-real (Ray-integrated) benchmark numbers, the optimizations we made this iteration, and —
+real (Ray-integrated) benchmark numbers, the optimizations and fixes by phase, and —
 most importantly — the open holes we want critiqued. It is self-contained: it assumes
 you know Ray Data and Parquet at a high level but nothing about this work.
 
@@ -46,9 +50,15 @@ you know Ray Data and Parquet at a high level but nothing about this work.
   phenomenon (concurrent GETs hide network latency); there is no latency to hide
   locally. K-split stays in the crate, gated to the lone-big-fragment case, reserved for
   the S3 phase.
-- **What's unproven:** S3, Linux/USS memory accounting, projection/predicate pushdown,
-  nested/dictionary/decimal schemas, and whether the K-split concurrency can be
-  redesigned to win locally too (§7).
+- **How we judge memory (the metric of record, §3.5.1):** one graph per config — every
+  read task's **absolute worker USS over time** against **E = 2 × target_max_block_size**,
+  Ray's own per-task provisioning assumption (`context.py:44`). No baseline subtraction,
+  no summary scalars; the question is whether tasks stay near the line Ray schedules by.
+  This replaced an incremental metric that produced a false regression on Linux and was
+  dissected in §3.5.1/§5.10.
+- **What's unproven:** the full Linux suite + real-S3 numbers on that metric (the
+  deciding run), projection/predicate pushdown, nested/dictionary/decimal schemas, and
+  whether the K-split concurrency can be redesigned to win locally too (§7).
 
 ---
 
@@ -168,6 +178,16 @@ pending output bytes)**. That's the entire memory model. And note *which* bytes:
 gets placed in the shared plasma object store. There is **no term anywhere in the
 admission predicate for the worker's process heap / RSS**. Ray schedules purely on
 CPU slots + the size of the *output blocks* it expects to land in the object store.
+
+Ray does, however, state what it *assumes* a task's footprint is. The comment justifying
+the 128 MiB default block size (`context.py:44`) does the provisioning arithmetic
+explicitly: *"With streaming execution and num_cpus many concurrent tasks, the memory
+footprint will be about 2 \* num_cpus \* target_max_block_size ≈ RAM \*
+object_store_fraction \* 0.3."* That is, Ray's design assumes each task occupies about
+**E = 2 × target_max_block_size** (256 MiB by default). This E is the reference line the
+benchmark draws on every per-task memory graph (§3.5.1): a reader whose tasks stay near E
+makes Ray's assumption true; a reader whose tasks tower over it is the hidden heap that
+OOMs nodes. It is Ray's number, not ours.
 
 ### 3.2 Why PyArrow OOMs the node
 
@@ -330,6 +350,56 @@ The instrument lives in `release/nightly_tests/dataset/arrow_rs_memtrace/` (samp
 `hookdir/worker_mem_sampler.py`, driver `mem_over_time.py`, plotter `plot_mem.py`);
 the figures in this section are under `python/ray/data/agents_assets/`.
 
+### 3.5.1 The Linux relapse, and the metric of record (per-task absolute USS vs E)
+
+Everything above got one thing right that we then un-learned and had to re-learn the
+hard way. The mac harness plotted **absolute** USS; when the suite moved to the Linux
+workspace, `bench_suite.py` switched to **windowed incremental node-sum USS** (peak minus
+each worker's first-in-window sample, summed over workers) to cancel the idle pre-started
+workers of a shared many-core node. That rebuilt the §3.5 import-ramp trap in a subtler
+form, and it bit: one layout run reported arrow-rs **6.8× worse** on a many-small-groups
+file (153 vs 22 MB) — a result every other measurement contradicted.
+
+The postmortem killed three hypotheses in a row, each by direct measurement rather than
+another theory: **(1)** per-row-group crate-call overhead — dead: a Ray-free probe
+(`micro_alloc_probe.py`) decoding the *same file* showed one-call-for-all-groups and
+one-call-per-group within 1 MB of each other; **(2)** allocator retention (glibc vs
+PyArrow's jemalloc) — dead: the same probe under `LD_PRELOAD` jemalloc moved nothing,
+and arrow-rs standalone peaked at **38 MB vs PyArrow's 89 MB** on that very file;
+**(3)** lazy extension import multiplying per worker — dead: import+init measured **zero**
+(baseline 27.7 MB = import-and-touch 27.7 MB). What remained: the metric itself. A read
+landing on a **cold** worker pays its ~100 MB import ramp *inside* the window; a **warm**
+worker's baseline *hides* warmup-retained heap — and retention scales with the reader's
+own working set, so baseline subtraction **systematically flatters whichever reader
+retains more** (PyArrow) and penalizes the other. Decisive on small fixtures (~90 MB
+signal vs ~100 MB bias), negligible on big ones. The anomalous run's traces were
+destroyed by its own rerun (`_run_dir` wipes per run); every reproducible source —
+mac (§5.5), Ray-free probe, fresh per-worker Linux traces (arrow-rs Δ89.1 vs PyArrow
+Δ98.7, one worker each) — shows parity-to-better. Full detail: §5.10.
+
+**The metric of record, fixed before the full Linux rerun and applied uniformly.**
+One graph per benchmark config (`task_mem.py` → `figs/task_mem/`): the executing
+worker's **absolute USS over time for every read task** (red = PyArrow tasks, blue =
+arrow-rs tasks, each aligned at its own start) against a dashed line at
+**E = 2 × target_max_block_size** — Ray's provisioning assumption, verbatim from
+`context.py:44` (§3.1), recorded per run from the live `DataContext`. Task windows come
+from the worker hook patching `FileReader.read`
+(`readers/file_reader.py:192` — the one per-task entrypoint **both** readers inherit);
+a Ray worker runs one task at a time, so clipping its USS samples to the window *is*
+that task's memory. The hook imports `ray.data` at worker startup so both readers carry
+an identical import floor *before* any task window opens, and warmup-read tasks are
+stamped and excluded. Absolute, because the kernel OOM killer and Ray's memory monitor
+act on absolute process memory — nothing in production subtracts a baseline; USS,
+because it excludes exactly the shared plasma pages Ray's gate *does* account (§3.1).
+**Retired as verdict metrics:** windowed incremental USS (node-sum and per-worker),
+peak bars, and summary scalars (peak ratio, CV) — single numbers invite selective
+reading; the time series is the claim. Node-sum absolute USS survives only as a
+node-level sanity overlay. Cross-check available on Linux: Ray's own per-task
+`TaskExecWorkerStats.max_uss_bytes` (`map_operator.py:854`) should match each line's
+max. (One trap for future instrumentation: `BlockExecStats.start_time_s` is
+`perf_counter`-based despite its docstring — `block.py:264` — so it cannot be aligned
+with epoch-stamped samples; that is why the hook logs epoch windows itself.)
+
 ### 3.6 One laptop — is this actually distributed? (single-node, multi-process)
 
 Yes, in the sense that drives this whole thesis. `ray.init(num_cpus=K)` starts a **local,
@@ -419,6 +489,13 @@ range 0, so parallelism is throttled.
 
 ## 5. The numbers (real Ray-integrated reader, macOS, warm cache, 4 CPUs)
 
+> **Reading this section after the metric change (§3.5.1):** §5.0–§5.9 are the
+> **macOS-era** results, kept as mechanism evidence — the shapes, ratios and
+> where-the-win-lives conclusions all reproduced on Linux, but the *metrics* here
+> (per-PID min→max RSS, windowed node-sum USS) predate the metric of record and their
+> absolute magnitudes are directional. §5.10 holds the Linux findings to date; the
+> full-suite Linux rerun on per-task-USS-vs-E is the pending deciding run.
+
 All measured through `read_parquet` with the flag flipped, via the harness in
 `release/nightly_tests/dataset/arrow_rs_read_benchmark.py`. `single` = incremental peak
 RSS of the single busiest Ray worker, self-baselined per-PID (min→max growth); `total` =
@@ -453,20 +530,21 @@ to bound). As the groups grow the gap opens — 1.6× → 1.6× → 1.6× → **
 group**. This is the mechanism proof: the win is a function of *row-group size*, not file
 size, and it appears exactly where PyArrow is forced to decode a large indivisible unit.
 
-**On that first panel (the 0.9× loss) — investigated, and it's an allocator-*release*
-difference, not a decode-size one.** Per-worker, arrow-rs's high-water in the many-tiny-groups
-regime is actually *lower* than PyArrow's (163 vs 171 MB). The gap is entirely at the tail:
-PyArrow workers **give ~30–40 MB back to the OS before exiting** (`[...171 148 140]`), while
-arrow-rs workers **hold their peak to exit** (`[...163 163]`). With ~80 tiny groups the workers
-churn and overlap near their held peaks, so the node-sum sits ~17% higher. This is the classic
-signature of the **glibc allocator retaining freed pages** (per-thread arenas holding freed
-chunks) where PyArrow's jemalloc-backed pool decays them. (Ruled out a measurement artifact
-first: the forward-fill and alive-gated node-sum peaks are identical, so the peak is real, not
-dead-worker double-counting.) Two Linux levers now target this — a `MALLOC_ARENA_MAX=2` worker
-env (no-code, zero-risk) and a `--features jemalloc` build (PyArrow's allocator; replaces the
-`mimalloc` flag, which **segfaulted Ray workers** across the Arrow-C-stream FFI boundary) — both
-to be A/B'd on the Linux run, see §7.8. Note this is the *no-pressure* regime
-(~500–600 MB total either way); the blemish is real but lives where memory is not the problem.
+**On that first panel (the 0.9× loss) — the observation stands; our first diagnosis of it
+did not.** Per-worker, arrow-rs's high-water in the many-tiny-groups regime is actually
+*lower* than PyArrow's (163 vs 171 MB); the node-sum gap lives in the tail — PyArrow workers
+gave ~30–40 MB back before exiting (`[...171 148 140]`) while arrow-rs workers held their
+peak to exit (`[...163 163]`), and ~80 churning workers overlap near their held peaks. We
+initially generalized this into an **allocator-retention theory** (glibc holding freed pages
+vs PyArrow's jemalloc decaying them) and wired two Linux levers to fix it. The Linux
+Ray-free probe then **disproved the allocator theory** (§5.10): on the many-small-groups
+file, per-group calls retain nothing beyond one-call decode, `LD_PRELOAD` jemalloc changes
+nothing, and arrow-rs standalone uses **2.3× less** than PyArrow (38 vs 89 MB). The mac
+tail-release behavior was real as observed but is not an arrow-rs memory problem, and the
+"loss" it produced lives entirely in the no-pressure regime (~500–600 MB either way) under
+a since-retired node-sum metric. The allocator levers stay wired in the harness
+(`MALLOC_ARENA_MAX`, `--features jemalloc` — see §7.8) but are demoted from "fix" to
+"available A/B knobs."
 
 **Sweep 3 — column dtype.** 2 M rows, one big row group, five schemas from int to
 heavy-string.
@@ -797,7 +875,7 @@ bounded speed cost with a clear optimization path, not a blocker.
 ### 5.9 S3: correctness un-gated and tested (speed/memory deferred)
 
 Local-only would be a niche PR — real Ray Data reads are overwhelmingly from object
-storage — so S3 is now a first-class, tested path. What landed this iteration:
+storage — so S3 is now a first-class, tested path. What landed in this phase:
 
 - **Config fidelity.** The reader recovers the *full* S3 connection config from the
   pyarrow `S3FileSystem` — `fs.__reduce__()[1][0]` round-trips `endpoint_override`,
@@ -847,9 +925,50 @@ memory knobs** — `fetch_window_mb` ∈ {4,16,64,0} and `MALLOC_ARENA_MAX` (unc
 capped) — against a PyArrow baseline, recording wall + node-sum USS. So S3 is **correct,
 memory-first by construction, and tested now; the number is measured on Linux**.
 
+### 5.10 Linux (Anyscale workspace) — what's established so far
+
+The first Linux phase produced one measurement-methodology postmortem (§3.5.1) and,
+from its salvage instruments, a set of findings that all point the same way. Caveat up
+front: the in-Ray numbers below were taken under the since-retired windowed-incremental
+metric — on **big** fixtures the decode signal (hundreds of MB to GB) swamps that
+metric's ~100 MB bias, so those stand as directional; on **small** fixtures only the
+bias-free instruments (Ray-free probe, per-worker absolute deltas) are quoted.
+
+**Big fixtures (bias-negligible, the thesis regime) — the mac shapes reproduce.**
+The budget sweep on the ~400 MB single group: PyArrow **1660 → arrow-rs 670 MB
+(0.40×)** in `iter_batches`, 0.21× in decode-drop; the selective-filter workload
+**0.26×**; `sum` near parity (0.86×). The memory-over-time shape is the finding again:
+PyArrow a tall right-triangle — a fast climb to the whole decoded group, then a cliff —
+arrow-rs a low flat line. On the fresh layout run, one_large_grp came in at **0.70×**
+with arrow-rs also ~15% faster; walls were parity-to-faster across every layout.
+
+**Small/many-group fixtures (where the retired metric lied) — parity-to-better,
+triple-confirmed.** The Ray-free probe on the many-small-groups file: PyArrow ~89 MB,
+arrow-rs ~38 MB (one call or per-group call alike; jemalloc `LD_PRELOAD` inert; extension
+import+init = 0 MB). Per-worker absolute traces of the same read in Ray: arrow-rs
+Δ89.1 MB vs PyArrow Δ98.7 MB, one worker each, matching the mac §5.5 parity row. The
+lone contrary datapoint (153 vs 22 MB) is unreproducible, its traces destroyed by its
+own rerun, and both its halves are individually impossible against the standalone
+numbers — classified a metric artifact (§3.5.1).
+
+**Also established on Linux:** one small-file subtlety confirmed in the base reader —
+files below the chunker's `target_chunk_size` go **whole-file** (chunk metadata `None` →
+`row_groups=None` → ONE crate call per task, `parquet_file_reader.py:300`), so the
+one-subfragment-per-row-group fan-out only applies to files big enough to chunk. And Ray's
+prestarted-worker pool on a many-core node is why naive node-sum absolute USS needs care:
+idle workers each hold an import floor; the per-task metric sidesteps this entirely.
+
+**Pending (the deciding run):** the full suite — layout, mixed, sweeps, workloads,
+concurrency, S3 — rerun on the metric of record, producing `figs/task_mem/` (per-task
+lines vs the E line) for every config. Also planned: an `oom` axis — a memory-ceilinged
+node where PyArrow's hidden decode heap OOM-kills the read and arrow-rs finishes — the
+end-to-end demonstration of §3.2's failure mode and its removal.
+
 ---
 
-## 6. Optimizations made this iteration
+## 6. Optimizations and fixes, by phase
+
+### Phase 1 (macOS integration)
 
 **6.1 Removed reader-side block accumulation (§4.3).** The headline fix. −25 lines,
 eliminated a full second block-sized buffer per worker, brought multi-fragment
@@ -890,6 +1009,28 @@ async path is a hard failure — all on a moto server). Lint clean (ruff 0.8.4 +
 22.10.0). Running the S3 tests needs `moto[server]` (`shutil.which("moto_server")` on
 PATH), else they skip.
 
+### Phase 2 (Linux workspace — measurement hardening)
+
+**6.5 Diagnosed and retired a biased memory metric (§3.5.1).** The windowed-incremental
+node-sum USS metric produced one impossible result; three implementation hypotheses
+(per-group call overhead, allocator retention, lazy-import multiplication) were each
+killed by direct measurement, leaving the metric itself as the cause: baseline
+subtraction hides warmup-retained heap in proportion to the reader's own working set,
+flattering PyArrow. All incremental/windowed metrics, peak bars, and summary scalars
+removed from the harness outputs.
+
+**6.6 Built the metric-of-record instrumentation.** The worker hook now patches
+`FileReader.read` to log epoch task windows (both readers, one shared patch point);
+each run records `meta.json` (reader, `expected_task_mb` from the live `DataContext`,
+warmup boundary); `task_mem.py` renders per-task absolute USS lines vs the E line for
+every config pair, bracketing sub-sampling-interval task windows so no task is dropped.
+Support instruments: `micro_alloc_probe.py` (Ray-free A/B of the crate vs PyArrow on one
+file, with allocator `LD_PRELOAD` and import-cost modes) and `inspect_run.py`
+(per-worker baseline/peak/delta breakdown + per-worker USS-over-time plots of any run
+dir). The hook's `ray.data` import at worker startup equalizes import floors across
+readers; node-sum absolute peak kept only as a sanity column, now alive-gated (an
+exited worker's last sample no longer forward-fills across the window).
+
 ---
 
 ## 7. Open holes — what we want critiqued
@@ -905,7 +1046,8 @@ Ranked by how much they'd change the decision:
    latency or cache pressure; macOS USS is directional), so the memory/speed comparison must
    run on **real S3 on Linux**. Harness ready and it **sweeps the memory knobs**
    (`fetch_window_mb` ∈ {4,16,64,0}, `MALLOC_ARENA_MAX` on/off) vs PyArrow: `bench_suite.py
-   s3`. This is the single most important remaining item and the natural next PR.
+   s3` — now judged on the metric of record (per-task USS vs E, §3.5.1) like every other
+   axis. This is the single most important remaining item and the natural next PR.
 
 2. **The single-thread wide-string decode gap (§5.7).** Isolated from Ray, at the
    1-thread count a Ray worker gets, arrow-rs decode is parity on moderate strings and
@@ -929,10 +1071,13 @@ Ranked by how much they'd change the decision:
    from "memory-advantaged but same work" into "advantaged on both." **Full design,
    Parquet-statistics background, and the tie-in to Ray's planned page-index chunker: §7.9.**
 
-4. **Linux/USS accounting.** All numbers are macOS RSS (includes shared pages). Linux has
-   per-task USS (`max_uss_bytes`) which is the authoritative memory number and isn't
-   surfaced in the operator summary yet. The macOS *deltas* are directional; the absolute
-   levels aren't.
+4. **Linux/USS accounting — instrument built, deciding run pending.** Per-task absolute
+   USS over time is now first-class (§3.5.1): task windows from the `FileReader.read`
+   hook, one line per task vs the E line, absolute (no baseline games). Still open:
+   (a) running the *full* suite on it (only spot-checks so far, §5.10); (b) validating
+   each line's max against Ray's own `TaskExecWorkerStats.max_uss_bytes` — agreement
+   makes the number indisputable; (c) upstream, `max_uss_bytes` is still advisory-only
+   (§3.5) — surfacing it in the operator summary is a small, independently useful PR.
 
 5. **Schema coverage — now measured, and one gate hole found + fixed (§5.5).** The
    `schema` axis reads 8 dtypes both ways and asserts per-column hash parity **and** which
@@ -955,31 +1100,18 @@ Ranked by how much they'd change the decision:
    narrow. If real workloads rarely hit "one giant row group, flat schema, local," the
    whole prototype is a niche win. Worth validating against actual customer file layouts.
 
-8. **Allocator page-release — diagnosed, now with two Linux levers to validate (§5.0
-   rowgroup panel 1).** With many tiny row groups arrow-rs is ~0.9× on node-sum peak, purely
-   because the default (system/glibc) allocator **holds freed pages** while PyArrow's
-   jemalloc-backed pool releases them mid-run — per-worker high-water is actually *lower*
-   for arrow-rs (163 vs 171 MB), so this is a release/decay behavior, not over-allocation.
-   On Linux, glibc's per-thread arenas make this worse under the multi-threaded decode
-   (tokio workers + K threads). Since PyArrow uses jemalloc with page decay, a *fair* fight
-   needs arrow-rs to release too. Two levers are now wired, both to be A/B'd on the Linux
-   run (neither is testable on macOS):
-   - **`MALLOC_ARENA_MAX=2` in the worker env** — the no-code, **zero-segfault-risk**
-     baseline. Caps ptmalloc arenas so freed chunks aren't stranded across many arenas. Set
-     by the harness via `runtime_env` (must be set before the worker starts). `axis_s3`
-     sweeps it uncapped-vs-capped to isolate its effect on node-sum peak.
-   - **`--features jemalloc`** — swaps the crate's global allocator to jemalloc (the *same*
-     allocator PyArrow uses), tuned for prompt release via
-     `_RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000`.
-     This **replaces** the earlier `mimalloc` attempt, which **segfaulted Ray workers** the
-     moment the native path ran (a `#[global_allocator]` in a Python-extension cdylib
-     interacting with the Arrow-C-stream FFI hand-off; the wheel imported fine *outside*
-     Ray, so it's the in-worker + FFI combination). jemalloc is far more battle-tested in
-     cdylib+FFI contexts than mimalloc; it **compiles clean** here (`cargo check --features
-     jemalloc`), but whether it clears the FFI segfault is the open question the Linux run
-     answers. If it segfaults too, `MALLOC_ARENA_MAX` is the fallback.
-   Low priority for the decision (it only bites in the no-memory-pressure regime), but it's
-   the cleanest remaining memory-parity win and the Linux run is where it's settled.
+8. **Allocator levers — demoted from "fix" to "available knobs" after the theory they
+   were built for was disproven (§5.0 panel 1, §5.10).** The mac many-tiny-groups 0.9×
+   was first diagnosed as glibc holding freed pages vs PyArrow's jemalloc decaying them.
+   The Linux Ray-free probe killed that: `LD_PRELOAD` jemalloc changed nothing, per-group
+   calls retain nothing, and arrow-rs standalone uses 2.3× *less* than PyArrow on the
+   exact file — the "loss" was the retired metric, not the allocator. Two levers remain
+   wired in the harness for A/B use if an allocator question ever resurfaces:
+   `MALLOC_ARENA_MAX=2` via worker `runtime_env` (no-code, zero-risk), and the crate's
+   `--features jemalloc` build (compiles clean; untested under Ray workers). Historical
+   warning that still stands: **do not use `--features mimalloc`** — a
+   `#[global_allocator]` in the Python-extension cdylib segfaulted Ray workers the moment
+   the native path ran across the Arrow-C-stream FFI boundary (fine outside Ray).
 
 ### 7.9 Statistics-driven predicate pushdown (the full design + page-index tie-in)
 
@@ -1102,6 +1234,88 @@ mixed `a > 5 AND my_udf(b)` pushes `a > 5` into the read and leaves `my_udf(b)` 
 above it. So the two layers **compound**: Layer 1 delivers fewer rows to the read and a filter
 the read can see; Layer 2 makes producing those rows cheap.
 
+**When the stats even exist (a capability ladder, degrade gracefully).** Two things are
+independent and both optional, so the reader must fall down a ladder:
+
+- **Column-chunk stats** (per row group, in the footer): min/max/null_count. *Usually present*
+  — most writers write them by default; can be disabled or truncated.
+- **The page index** (ColumnIndex per-page min/max + OffsetIndex per-page location): *often
+  absent*. **pyarrow does not write it by default** (needs `write_page_index=True`), while
+  parquet-mr/Spark writes the column index by default since Parquet 1.11 — so many real files,
+  especially pandas/pyarrow-written ones, have none.
+
+The ladder: **page index present** → skip pages (ColumnIndex) + skip page I/O (OffsetIndex);
+**else column-chunk stats present** → skip whole row groups only; **else** → no skipping. Late
+materialization (below) still works at *every* rung, including the bottom — it needs no stats.
+The crate already probes the top rung: `offset_index().is_some()` (`lib.rs:381`) is exactly the
+"do we have a page index?" check, today gating K-split.
+
+**Bloom filters for set-containment predicates.** Min/max only prunes *range* predicates
+(`>`, `<`, `BETWEEN`) and only on clustered data. For **equality / `IN`** on an *unclustered
+high-cardinality* column, min/max is useless (the value sits inside almost every page's range).
+A Parquet **bloom filter** answers "is `x` *definitely not* in this chunk?" regardless of sort
+order (no false negatives). Caveats: **column-chunk granularity** (skips row groups, not pages),
+**optional** (both pyarrow and Spark need explicit config — often absent), and probabilistic
+("maybe present" → still read it). arrow-rs reads them (`parquet::bloom_filter::Sbbf`, the same
+path DataFusion uses). So it's a third pruning input: bloom skips row groups for `=`/`IN`,
+min/max skips pages for ranges, late materialization handles the residue.
+
+**What Ray already knows about clustering (and it's already in hand).** Ray stores nothing of
+its own — but at *listing time* the chunker already reads every footer
+(`ParquetFileChunker.generate_chunk_metadatas` → `pq.read_metadata`), so the row-group min/max
+stats are **already loaded during planning** (don't add a second footer read). From those you
+can infer clustering (disjoint/monotonic per-row-group ranges ⇒ sorted on that column).
+Also available: Hive **partition columns** (known and already pruned — guaranteed clustering),
+`sorting_columns` in row-group metadata (authoritative but rarely written), and page-level
+min/max if the index exists. You never *need* clustering info for correctness — the stats check
+is cheap, so the safe design is **attempt-and-fall-through**: try the skip, and if nothing
+prunes you just decode normally. Knowing selectivity in advance only lets you *skip the
+strategy* when it wouldn't pay.
+
+**How late materialization actually plugs into Ray (the part that looks harder than it is).**
+It needs **no executor / operator / DAG changes** — because Ray's Layer-1 pushdown already
+delivers the predicate to the reader. In `arrow_rs_parquet_file_reader.py` the reader receives
+`filter_expr = scanner_kwargs.get("filter")` (line ~311) and today applies it *after* decode via
+`table.filter(filter_expr)` (line ~378). Late materialization only changes *how the reader
+executes a predicate it already has* — Python-post-decode → Rust two-phase decode. The work is
+almost entirely in the crate:
+
+1. **Pass the predicate into the crate**, not just the column list — a small serialized IR of
+   conjuncts `{column, op, literal(s)}` (the same `col OP literal` + `AND`/`OR`/`IN` subset
+   Ray's own pushdown already restricts to).
+2. **In Rust**, split the projection into a *predicate* `ProjectionMask` and an *output*
+   `ProjectionMask`; build an `ArrowPredicateFn` over the predicate mask whose closure runs
+   arrow compute kernels (`gt`/`eq`/`is_in`/…) → `BooleanArray`; wrap in `RowFilter`; hand to the
+   builder via `.with_row_filter(...)`. arrow-rs decodes predicate columns → builds a
+   `RowSelection` → decodes output columns under it (skipping whole pages when the OffsetIndex is
+   present). This reuses the exact `RowSelection` machinery the K-split path already builds.
+3. **Return already-filtered batches** and delete the Python `table.filter(...)`.
+4. **Gate it**: `_arrow_rs_supported` also checks the predicate is expressible in the IR; if not,
+   fall back to today's post-decode filter (still correct).
+
+```mermaid
+flowchart TD
+    T["today: decode ALL cols/rows → Python table.filter → drop"] -.replace.-> N
+    N["split cols: predicate vs output"] --> N2["decode predicate cols only"]
+    N2 --> N3["eval predicate → RowSelection"]
+    N3 --> N4["decode output cols ONLY for surviving rows"]
+```
+
+**Do it database-query-optimizer style — or borrow one.** The whole scheme *is* what a columnar
+query optimizer does (prune partitions → row groups → pages → late-materialize). There's a
+shortcut: **DataFusion** (a query engine on arrow-rs) already implements min/max + bloom-filter
+Parquet pruning, `RowFilter` late materialization, and expression evaluation. A heavier prototype
+could evaluate predicates through DataFusion physical exprs instead of hand-rolling kernels —
+trade-off is a large dependency vs. a bounded self-written evaluator. Flag as an option, not the
+default.
+
+**When late materialization pays (and when it hurts).** Do it when the filter is *selective*
+**and** there are extra, ideally wide, output columns to defer. Skip it when the filter keeps
+most rows (you decode the predicate column, then decode almost everything anyway, plus overhead),
+or when the only columns read are predicate columns (nothing to defer). Stats give a cheap
+selectivity *estimate* to make this call before committing — a use of stats that helps even when
+nothing can be skipped.
+
 **Why this is the moment.** Page-level chunks and page-level pushdown are the *same*
 `RowSelection` + page-index mechanism. If the chunker starts handing the reader page ranges,
 the reader is already consuming a page-index-guided `RowSelection`; adding a filter-derived
@@ -1164,11 +1378,17 @@ python mem_over_time.py && python plot_mem.py
 # runs just the sweep against an existing RAY_DATA_ARROW_RS_S3_BENCH_PATH.)
 # or one-variable sweeps (§5.0): bench_suite.py sweep_size,sweep_rowgroup,sweep_schema,
 #   sweep_files,sweep_batch,sweep_batch_dd,workloads
-python bench_suite.py            # runs all axes if no arg
-python summarize.py              # per-axis tables + leak/concurrency USS figures +
-                                 # per-axis memory graphs (figs/mem_*.png) +
-                                 # the §5.0 sweep gallery (figs/sweep_*_mem_time.png) +
-                                 # workloads chart (figs/workloads_mem.png)
+python bench_suite.py            # runs all axes if no arg; every axis logs per-task
+                                 # windows (tasks_*.csv) + USS (uss_*.csv) + meta.json
+python summarize.py              # per-axis tables + THE memory graphs: per-task USS
+                                 # vs Ray's E line, one per config (figs/task_mem/) +
+                                 # the §5.0 sweep gallery (figs/sweep_*_mem_time.png)
+python task_mem.py [substr]      # just the per-task graphs (optionally filtered)
+
+# Postmortem / drill-down instruments (§3.5.1, §5.10):
+python inspect_run.py runs/<dir> --plot   # per-worker base/peak/delta + USS-over-time
+python micro_alloc_probe.py data/<fixture> [budget_mb]   # Ray-free crate-vs-pyarrow A/B
+                                 # (modes incl. LD_PRELOAD allocator + import-cost)
 
 # Ray-FREE raw-decode bench (§5.7) — iterate on the crate without Ray overhead;
 # reports pyarrow at 1 thread (Ray-representative) AND full threads:
@@ -1191,7 +1411,14 @@ assert which path the support gate chose. The knob is inert unless the env var i
   byte-budget + order-preserving K-split-for-lone-big-RG; shared tokio runtime; jemalloc
   feature).
 - `tests/datasource/test_arrow_rs_parquet_reader.py` — parity + order + gate tests.
-- `release/nightly_tests/dataset/arrow_rs_read_benchmark.py` — RSS-over-time harness.
+- `release/nightly_tests/dataset/arrow_rs_read_benchmark.py` — RSS-over-time harness
+  (macOS-era, §5.1–5.4).
+- `release/nightly_tests/dataset/arrow_rs_memtrace/` — the suite (§5.0, §5.5+, §5.10):
+  `bench_suite.py` (axes; per-run meta.json + task/USS traces),
+  `hookdir/worker_mem_sampler.py` (USS sampler + `FileReader.read` task-window patch),
+  `task_mem.py` (THE memory graphs: per-task USS vs E), `inspect_run.py` (per-worker
+  drill-down), `micro_alloc_probe.py` (Ray-free crate A/B), `summarize.py`,
+  `standalone_decode_bench.py` (§5.7), `run_s3_benchmark.py` (§5.9).
 
 ---
 
@@ -1210,8 +1437,13 @@ multi-threading Ray disables per worker) — and it reverses whenever output is 
 The memory win is robust and needs no exotic tuning (byte-budget decode, K=1). S3 is now a
 first-class path — un-gated, config-faithful, correctness-tested on a moto server, and its
 fetch path is **windowed and byte-budgeted so S3 peak RSS is a knob (`window + budget`),
-flat in row-group size, not PyArrow's whole-row-group pre-buffer** (§5.9). The mechanism is
-memory-first by construction and order-preserving (tested); what's left is purely
-*measuring* the memory/speed on **Linux + real S3** (moto has no latency; macOS USS is
-directional) — the harness sweeps the fetch-window and allocator knobs, and that run is the
-next experiment. Bar: memory-parity-or-better at speed-parity.
+flat in row-group size, not PyArrow's whole-row-group pre-buffer** (§5.9). The first Linux
+phase hardened the *measurement* itself: an incremental-USS metric produced one false
+regression, was dissected (three implementation hypotheses killed by direct measurement),
+and was replaced by the metric of record — **every task's absolute USS over time against
+E = 2 × target_max_block_size, Ray's own provisioning assumption** (§3.5.1) — under which
+everything reproducible shows arrow-rs parity-to-better on small layouts and multiples
+better where row groups are big (§5.10). What's left: the full Linux suite + real S3 on
+that one metric, and the `oom` axis (PyArrow OOM-killed, arrow-rs finishes) as the
+end-to-end demonstration. Bar: memory-parity-or-better at speed-parity — restated on the
+new metric as *tasks that stay near the line Ray schedules by*.
