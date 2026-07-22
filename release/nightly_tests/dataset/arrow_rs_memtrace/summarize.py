@@ -686,6 +686,43 @@ def table_s3(rows):
         )
 
 
+def table_s3geom(rows):
+    """Per-geometry PyArrow vs arrow-rs (windowed) on REAL S3 — the option-B
+    sweep. Wall + absolute node-sum peak per geometry; the memory verdict of
+    record is the per-task graph (figs/task_mem/s3geom__*.png)."""
+    print(
+        "\n## S3 GEOMETRY SWEEP (real bucket): per-geometry PyArrow vs arrow-rs (windowed)"
+    )
+    if not rows:
+        print("  (no s3_geom results)")
+        return
+    by = {}
+    for r in rows:
+        by.setdefault(r["config"], {})[r["reader"]] = r
+    print(
+        f"{'geometry':16s} {'reader':9s} {'wall_s':>8s} {'abs peak':>10s} "
+        f"{'mem vs pa':>10s} {'path':>8s}"
+    )
+    for geom, d in by.items():
+        pa_r = d.get("pyarrow")
+        for reader in ("pyarrow", "arrow_rs"):
+            r = d.get(reader)
+            if not r:
+                continue
+            memr = ""
+            if pa_r and reader == "arrow_rs" and r.get("node_sum_peak_mb"):
+                memr = f"{pa_r['node_sum_peak_mb'] / (r['node_sum_peak_mb'] or 1):.2f}x"
+            path = f"{r.get('native', 0)}/{r.get('fallback', 0)}"
+            print(
+                f"{geom:16s} {reader:9s} {r['wall_s']:8.2f} "
+                f"{r['node_sum_peak_mb']:7.0f}MB {memr:>10s} {path:>8s}"
+            )
+    print(
+        "  (mem vs pa = pyarrow/arrow_rs node-sum peak; >1 ⇒ arrow-rs uses less. "
+        "Per-task memory graphs: figs/task_mem/s3geom__*.png)"
+    )
+
+
 def plot_s3():
     """Two overlaid S3 figures from runs/results_s3.json + the per-run traces:
     * s3_mem_time.png   — one panel per arrow-rs config, PyArrow baseline overlaid
@@ -825,6 +862,7 @@ def main():
         ("leak", table_leak),
         ("workloads", table_workloads),
         ("s3", table_s3),
+        ("s3geom", table_s3geom),
     ]:
         rows = _load(axis)
         if rows is not None:

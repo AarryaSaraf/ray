@@ -1276,11 +1276,15 @@ def axis_s3():
     PyArrow is the baseline. K stays 1 for the per-file layout (Ray's pool
     parallelizes files); the lone-big-row-group K-split is a separate fixture.
     """
-    s3_path = os.environ.get("RAY_DATA_ARROW_RS_S3_BENCH_PATH")
+    # Points at ONE pre-existing dataset (not a prefix): this is the knob-sweep
+    # axis. The self-generating geometry sweep (option B) is axis_s3_geom, which
+    # owns RAY_DATA_ARROW_RS_S3_BENCH_PATH — so the two never collide in a full run.
+    s3_path = os.environ.get("RAY_DATA_ARROW_RS_S3_DATASET")
     if not s3_path:
         print(
-            "  (skip s3: set RAY_DATA_ARROW_RS_S3_BENCH_PATH=s3://... on a "
-            "Linux+real-S3 box — S3 perf is not meaningful on macOS/moto)"
+            "  (skip s3: set RAY_DATA_ARROW_RS_S3_DATASET=s3://bucket/one_dataset to "
+            "sweep window/budget/allocator on a hand-made dataset; for the geometry "
+            "sweep use axis s3_geom instead)"
         )
         return []
 
@@ -1378,6 +1382,116 @@ def axis_s3():
     return results
 
 
+def axis_s3_geom():
+    """Option B: the KEY differentiating geometries on REAL S3, self-generating.
+
+    The local axes prove correctness and CPU-bound parity fast, but they cannot
+    show the one thing S3 adds — the windowed async fetch, where arrow-rs holds
+    only ``fetch_window_mb`` of compressed bytes in flight instead of the whole
+    object, so peak is a knob rather than a property of the file. This axis puts
+    just the geometries where that matters onto S3 and reads each with PyArrow vs
+    arrow-rs (windowed), producing the per-task memory figures (task_mem pairs the
+    ``s3geom__<geom>__{pyarrow,arrow_rs}`` run dirs automatically).
+
+    Set ``RAY_DATA_ARROW_RS_S3_BENCH_PATH=s3://bucket/prefix`` (a PREFIX, not a
+    file). Fixtures are generated once under it via the normal generator with
+    FIXTURE_ROOT temporarily repointed — the OTHER axes stay local. Idempotent:
+    a prefix that already holds the parquet is reused, so re-runs don't re-upload.
+    """
+    root = os.environ.get("RAY_DATA_ARROW_RS_S3_BENCH_PATH")
+    if not root or not root.startswith("s3://"):
+        print(
+            "  (skip s3_geom: set RAY_DATA_ARROW_RS_S3_BENCH_PATH=s3://bucket/prefix "
+            "on a Linux+real-S3 box — this is where the windowed-fetch memory win "
+            "actually shows, which local/moto cannot)"
+        )
+        return []
+
+    # The geometries that separate a streaming reader from a whole-group one: a
+    # lone big row group (the headline), a decode-heavy wide-string group, many
+    # files x 1 group, many tiny groups (the no-win control), and a nested column.
+    geometries = {
+        "large_1rg": {
+            "rows": 8_000_000,
+            "num_files": 1,
+            "row_group_size": 8_000_000,
+            "schema": "wide_str",
+        },
+        "large_str_1rg": {
+            "rows": 2_000_000,
+            "num_files": 1,
+            "row_group_size": 2_000_000,
+            "schema": "large_str",
+        },
+        "many_files_1rg": {
+            "rows": 8_000_000,
+            "num_files": 4,
+            "row_group_size": 2_000_000,
+            "schema": "int",
+        },
+        "small_many_rg": {
+            "rows": 4_000_000,
+            "num_files": 1,
+            "row_group_size": 100_000,
+            "schema": "int",
+        },
+        "list_1rg": {
+            "rows": 2_000_000,
+            "num_files": 1,
+            "row_group_size": 2_000_000,
+            "schema": "list",
+        },
+    }
+    saved_root = fx.FIXTURE_ROOT
+    fx.FIXTURE_ROOT = root  # only for this axis; restored in finally
+    results = []
+    try:
+        for name, spec in geometries.items():
+            path = fx.make_fixture(f"s3geom_{name}", spec)  # uploads once, then reused
+            for reader in ["pyarrow", "arrow_rs"]:
+                d = _run_dir(f"s3geom__{name}__{reader}")
+                _fresh_session(
+                    reader, d, budget_bytes=2 * MB, fetch_window_mb=16, num_cpus=4
+                )
+                _warm(reader, d)
+                _note_fixture(d, path)
+                prog = os.path.join(d, "progress.csv")
+                t0 = time.time()
+                rows = consume(ray.data.read_parquet(path), "iter_batches", prog)
+                t1 = time.time()
+                ray.shutdown()
+                time.sleep(0.3)
+                peak = _node_sum_peak_mb(d, t0, t1)
+                incr = _node_sum_incr_peak_mb(d, t0, t1)
+                nat, fb = _count_paths(d)
+                results.append(
+                    _R(
+                        d,
+                        {
+                            "config": name,
+                            "reader": reader,
+                            "wall_s": t1 - t0,
+                            "node_sum_peak_mb": peak,
+                            "node_sum_incr_mb": incr,
+                            "rows": rows,
+                            "t0": t0,
+                            "t1": t1,
+                            "native": nat,
+                            "fallback": fb,
+                            "fetch_window_mb": 16 if reader == "arrow_rs" else None,
+                        },
+                    )
+                )
+                print(
+                    f"  s3geom {name} {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
+                    f"incr={incr:.0f}MB rows={rows} native={nat} fallback={fb}"
+                )
+    finally:
+        fx.FIXTURE_ROOT = saved_root
+    json.dump(results, open(os.path.join(OUT, "results_s3geom.json"), "w"), indent=2)
+    return results
+
+
 AXES = {
     "layout": axis_layout,
     "schema": axis_schema,
@@ -1395,6 +1509,7 @@ AXES = {
     "sweep_batch_dd": sweep_batch_dd,
     "workloads": axis_workloads,
     "s3": axis_s3,
+    "s3_geom": axis_s3_geom,
 }
 
 
