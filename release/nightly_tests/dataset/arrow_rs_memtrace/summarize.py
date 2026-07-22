@@ -7,12 +7,32 @@ memory ratchet (leak) shows as a rising floor.
 import glob
 import json
 import os
+import sys
 import time
 
 import task_mem  # reused for _meta / _describe (the fixture-detail subtitle)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "runs")
+
+
+class _Tee:
+    """Duplicate everything printed to stdout into a file too, so the whole
+    human-readable digest (every table + the task_mem overshoot lines) is saved
+    per run as figs/<ts>/summary.txt — no more copy-pasting the terminal."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, s):
+        for st in self._streams:
+            st.write(s)
+
+    def flush(self):
+        for st in self._streams:
+            st.flush()
+
+
 # Set per-run in main() to figs/<timestamp>/; the module default is only a
 # fallback for importing individual plot fns in a REPL.
 FIG = os.path.join(HERE, "figs")
@@ -842,16 +862,7 @@ def plot_s3():
     print(f"  wrote {out}")
 
 
-def main():
-    global FIG
-    # A fresh figs/<timestamp>/ per run so figures never overwrite a prior run's;
-    # figs/latest points at it for quick opening.
-    run_id = time.strftime("%Y%m%d_%H%M%S")
-    FIG = os.path.join(HERE, "figs", run_id)
-    os.makedirs(FIG, exist_ok=True)
-    task_mem._point_latest(FIG)
-    print(f"===== figures -> {FIG}  (also figs/latest) =====")
-
+def _run():
     for axis, fn in [
         ("layout", table_layout),
         ("schema", table_schema),
@@ -931,6 +942,45 @@ def main():
             plot_sweep(name, title)
         except Exception as e:
             print(f"  (skip sweep_{name}: {type(e).__name__}: {e})")
+
+
+def main():
+    global FIG
+    # A fresh figs/<timestamp>/ per run so figures never overwrite a prior run's;
+    # figs/latest points at it for quick opening.
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    FIG = os.path.join(HERE, "figs", run_id)
+    os.makedirs(FIG, exist_ok=True)
+    task_mem._point_latest(FIG)
+
+    # Save the entire digest to figs/<ts>/summary.txt (all tables + the per-task
+    # overshoot lines), teed while still echoing to the terminal.
+    summary_path = os.path.join(FIG, "summary.txt")
+    real_stdout = sys.stdout
+    fh = open(summary_path, "w")
+    sys.stdout = _Tee(real_stdout, fh)
+    try:
+        print(f"===== figures -> {FIG}  (also figs/latest) =====")
+        _run()
+    except Exception as e:
+        # A plotting failure mid-digest (e.g. matplotlib absent locally) must not
+        # discard the tables already written — record it and still finalize.
+        print(f"\n(digest aborted mid-run: {type(e).__name__}: {e})")
+    finally:
+        sys.stdout = real_stdout
+        fh.close()
+
+    # Refresh runs/summary.csv (machine-readable, one row per read) from the same
+    # results_*.json, so it's regenerated on a plain `summarize.py` run too — not
+    # only at the end of a bench_suite run.
+    try:
+        import bench_suite
+
+        bench_suite.write_summary_csv()
+    except Exception as e:
+        print(f"(skip summary.csv refresh: {type(e).__name__}: {e})")
+    print(f"\n===== text digest -> {summary_path} =====")
+    print(f"===== machine csv -> {os.path.join(OUT, 'summary.csv')} =====")
 
 
 if __name__ == "__main__":
