@@ -337,6 +337,91 @@ def test_nested_column_native_parity(tmp_path, restore_ctx, colname, builder):
     assert pa_tbl.equals(rs_tbl)
 
 
+def _list_col_from_lengths(lengths, *, value_type=pa.int64(), null_rows=None, seed=0):
+    """Build a ``list<value_type>`` array where row ``i`` holds ``lengths[i]``
+    elements (deterministic but arbitrary values). ``null_rows`` is an optional
+    boolean mask marking rows that are NULL lists — distinct from empty lists;
+    those rows are forced to zero length because Parquet cannot store a null list
+    that spans elements."""
+    lengths = np.asarray(lengths, dtype=np.int64).copy()
+    if null_rows is not None:
+        null_rows = np.asarray(null_rows, dtype=bool)
+        lengths[null_rows] = 0
+    offsets = np.zeros(len(lengths) + 1, dtype=np.int32)
+    np.cumsum(lengths, out=offsets[1:])
+    total = int(offsets[-1])
+    rng = np.random.default_rng(seed)
+    if pa.types.is_string(value_type):
+        values = pa.array([f"e{v}" for v in rng.integers(0, 10**6, total)])
+    else:
+        values = pa.array(rng.integers(0, 10**9, total), type=value_type)
+    mask = None if null_rows is None else pa.array(null_rows)
+    return pa.ListArray.from_arrays(pa.array(offsets), values, mask=mask)
+
+
+@pytest.mark.parametrize(
+    "shape,lengths_fn",
+    [
+        ("empty", lambda n: np.zeros(n, dtype=np.int64)),
+        ("singleton", lambda n: np.ones(n, dtype=np.int64)),
+        ("small_fixed", lambda n: np.full(n, 4, dtype=np.int64)),
+        ("big_fixed", lambda n: np.full(n, 512, dtype=np.int64)),
+        ("ascending", lambda n: np.arange(n, dtype=np.int64)),
+        ("descending", lambda n: np.arange(n, dtype=np.int64)[::-1]),
+        ("random", lambda n: np.random.default_rng(0).integers(0, 128, n)),
+    ],
+)
+def test_list_length_shapes_native_parity(tmp_path, restore_ctx, shape, lengths_fn):
+    """``list<int64>`` columns across every length distribution — all-empty,
+    singleton, small/big fixed width, monotonically ascending and descending
+    ramps, and random sizes — decode NATIVELY and stay byte-identical to PyArrow.
+
+    The 2k-row fixed-length-3 parity test alone leaves the offset handling barely
+    exercised: it never sees wide lists, empty rows, or non-uniform offsets, which
+    is exactly where the crate's offset buffer and its footer bytes-per-row
+    estimate are most likely to slip."""
+    n = 1000
+    table = pa.table(
+        {
+            "id": pa.array(np.arange(n, dtype=np.int64)),
+            "vals": _list_col_from_lengths(lengths_fn(n)),
+        }
+    )
+    path = tmp_path / f"list_{shape}.parquet"
+    pq.write_table(table, str(path), write_page_index=True)
+
+    assert _gate_verdict(path) is True, f"list<{shape}> should decode natively"
+    pa_tbl = _read_sorted(path, False, restore_ctx)
+    rs_tbl = _read_sorted(path, True, restore_ctx)
+    assert pa_tbl.equals(rs_tbl)
+
+
+def test_list_null_rows_and_string_values_parity(tmp_path, restore_ctx):
+    """Null lists (list-level nulls, distinct from empty lists) and a
+    ``list<string>`` column with variable sizes both decode natively and match
+    PyArrow — covering non-int element types and the validity buffer alongside
+    the offsets."""
+    n = 500
+    lengths = np.random.default_rng(1).integers(0, 20, n)
+    null_rows = np.arange(n) % 7 == 0  # every 7th row is a NULL list
+    table = pa.table(
+        {
+            "id": pa.array(np.arange(n, dtype=np.int64)),
+            "ints": _list_col_from_lengths(lengths, null_rows=null_rows, seed=2),
+            "strs": _list_col_from_lengths(
+                lengths, value_type=pa.string(), null_rows=null_rows, seed=3
+            ),
+        }
+    )
+    path = tmp_path / "list_nulls.parquet"
+    pq.write_table(table, str(path), write_page_index=True)
+
+    assert _gate_verdict(path) is True
+    pa_tbl = _read_sorted(path, False, restore_ctx)
+    rs_tbl = _read_sorted(path, True, restore_ctx)
+    assert pa_tbl.equals(rs_tbl)
+
+
 def test_large_nested_byte_budget_batching(tmp_path, monkeypatch):
     """A LARGE nested read (variable-length lists + struct-of-string, decoded
     size many times the decode budget, one lone row group) must stream through
