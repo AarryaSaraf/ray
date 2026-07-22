@@ -39,8 +39,16 @@ MB = 1024 * 1024
 WARM = {"rows": 10_000, "num_files": 1, "row_group_size": 10_000, "schema": "int"}
 
 
-def _fresh_session(reader, trace_dir, budget_bytes=8 * MB, k=1, num_cpus=4,
-                   fetch_window_mb=16, malloc_arena_max=None, ld_preload=None):
+def _fresh_session(
+    reader,
+    trace_dir,
+    budget_bytes=8 * MB,
+    k=1,
+    num_cpus=4,
+    fetch_window_mb=16,
+    malloc_arena_max=None,
+    ld_preload=None,
+):
     ray.shutdown()
     # Let the allocator levers be flipped for the WHOLE suite from the environment,
     # so an axis that doesn't thread them through (e.g. layout) can still be A/B'd
@@ -94,28 +102,40 @@ def _fresh_session(reader, trace_dir, budget_bytes=8 * MB, k=1, num_cpus=4,
         "/tmp/ray/ray_current_cluster"
     )
     if cluster_running:
-        ray.init(address="auto", ignore_reinit_error=True, log_to_driver=False,
-                 runtime_env=runtime_env)
+        ray.init(
+            address="auto",
+            ignore_reinit_error=True,
+            log_to_driver=False,
+            runtime_env=runtime_env,
+        )
     else:
-        ray.init(num_cpus=num_cpus, include_dashboard=False,
-                 ignore_reinit_error=True, log_to_driver=False,
-                 runtime_env=runtime_env)
+        ray.init(
+            num_cpus=num_cpus,
+            include_dashboard=False,
+            ignore_reinit_error=True,
+            log_to_driver=False,
+            runtime_env=runtime_env,
+        )
     from ray.data.context import DataContext
+
     ctx = DataContext.get_current()
     ctx.use_datasource_v2 = True
-    ctx.use_arrow_rs_parquet_reader = (reader == "arrow_rs")
+    ctx.use_arrow_rs_parquet_reader = reader == "arrow_rs"
     ctx.execution_options.preserve_order = True  # so parity hashes are comparable
     # Record Ray's own per-task memory expectation next to the traces, so the
     # per-task graphs (task_mem.py) can draw it as the reference line. This is
     # NOT a number we chose: context.py:44 justifies the default block size with
     # "memory footprint will be about 2 * num_cpus * target_max_block_size",
     # i.e. 2 x target_max_block_size per task.
-    _write_meta(trace_dir, {
-        "reader": reader,
-        "target_block_mb": ctx.target_max_block_size / MB,
-        "budget_mb": budget_bytes / MB,
-        "fetch_window_mb": fetch_window_mb,
-    })
+    _write_meta(
+        trace_dir,
+        {
+            "reader": reader,
+            "target_block_mb": ctx.target_max_block_size / MB,
+            "budget_mb": budget_bytes / MB,
+            "fetch_window_mb": fetch_window_mb,
+        },
+    )
     return ctx
 
 
@@ -134,36 +154,104 @@ def _write_meta(trace_dir, updates):
 
 
 def _note_fixture(trace_dir, path):
-    """Record the fixture's row-group geometry next to the traces, so task_mem.py
-    can draw the per-task *expected-without-decode* line:
+    """Record what the fixture actually IS next to the traces — its shape (rows,
+    files, row groups), the largest row group's size (compressed + uncompressed),
+    its compression, and a short column/dtype summary — so every figure and the
+    summary CSV can say *what was read*, not just how fast.
+
+    The geometry is written to meta.json (read by task_mem.py / summarize.py for
+    figure subtitles) AND cached in ``_GEOM[trace_dir]`` so the axis can attach it
+    to its result row via :func:`_R` (→ summary.csv columns). It also feeds the
+    per-task *expected-without-decode* line:
 
         floor (measured at task entry) + compressed-bytes-in-flight + output block
 
     Everything a well-behaved task holds EXCEPT the decode working set — how far a
-    task's line rises above this is its decode working set, the part that differs
-    between readers. compressed-in-flight is `max_rg_comp_mb` for whole-group
-    readers (PyArrow, and arrow-rs local K=1); the S3 windowed path caps it at
-    `fetch_window_mb` (recorded by _fresh_session). Best-effort: local paths,
-    dirs, and s3:// URIs all work via pyarrow.dataset; failure just skips the line."""
+    task's line rises above this is its decode working set. compressed-in-flight is
+    ``max_rg_comp_mb`` for whole-group readers (PyArrow, and arrow-rs local K=1).
+    Best-effort: local paths, dirs, and s3:// URIs all work via pyarrow.dataset;
+    failure just skips the line and leaves the geometry empty."""
+    geom = {"fixture": str(path)}
     try:
         import pyarrow.dataset as pds
 
         dset = pds.dataset(path, format="parquet")
         max_comp = max_uncomp = 0
+        sum_uncomp = 0.0
+        n_rg = rows_total = num_files = 0
+        compression = None
         for frag in dset.get_fragments():
+            num_files += 1
             md = frag.metadata
+            rows_total += md.num_rows
             for i in range(md.num_row_groups):
                 rg = md.row_group(i)
-                comp = sum(rg.column(j).total_compressed_size
-                           for j in range(rg.num_columns))
+                comp = sum(
+                    rg.column(j).total_compressed_size for j in range(rg.num_columns)
+                )
                 uncomp = rg.total_byte_size
                 max_comp = max(max_comp, comp)
                 max_uncomp = max(max_uncomp, uncomp)
-        _write_meta(trace_dir, {"fixture": str(path),
-                                "max_rg_comp_mb": max_comp / MB,
-                                "max_rg_uncomp_mb": max_uncomp / MB})
+                sum_uncomp += uncomp
+                n_rg += 1
+                if compression is None and rg.num_columns:
+                    try:
+                        compression = rg.column(0).compression
+                    except Exception:
+                        pass
+        schema = dset.schema
+        shown = [
+            f"{schema.field(i).name}:{schema.field(i).type}"
+            for i in range(min(4, len(schema)))
+        ]
+        schema_desc = ", ".join(shown) + (
+            f", … ({len(schema)} cols)" if len(schema) > 4 else ""
+        )
+        geom.update(
+            {
+                "rows_total": rows_total,
+                "num_files": num_files,
+                "num_row_groups": n_rg,
+                "max_rg_comp_mb": max_comp / MB,
+                "max_rg_uncomp_mb": max_uncomp / MB,
+                "avg_rg_uncomp_mb": (sum_uncomp / n_rg / MB) if n_rg else 0.0,
+                "compression": compression,
+                "schema_desc": schema_desc,
+            }
+        )
+        _write_meta(trace_dir, geom)
     except Exception as e:
         print(f"  (fixture note skipped for {path}: {type(e).__name__}: {e})")
+    _GEOM[trace_dir] = geom
+    return geom
+
+
+# Fixture geometry recorded by the most recent _note_fixture(trace_dir, ...),
+# keyed by trace_dir, so _R can fold it into that config's result row.
+_GEOM = {}
+
+# Which geometry fields ride along into results (and thus into summary.csv).
+_GEOM_RESULT_KEYS = (
+    "rows_total",
+    "num_files",
+    "num_row_groups",
+    "max_rg_uncomp_mb",
+    "max_rg_comp_mb",
+    "compression",
+    "schema_desc",
+)
+
+
+def _R(trace_dir, result):
+    """Fold the fixture geometry recorded for ``trace_dir`` into a result row, so
+    summary.csv carries what was read alongside the timing. Existing result keys
+    win (never clobbered)."""
+    g = _GEOM.get(trace_dir, {})
+    merged = dict(result)
+    for k in _GEOM_RESULT_KEYS:
+        if k in g and k not in merged:
+            merged[k] = g[k]
+    return merged
 
 
 def consume(ds, mode, progress_path=None):
@@ -175,11 +263,14 @@ def consume(ds, mode, progress_path=None):
         fh.write("epoch,cum_rows\n")
     try:
         if mode == "decode_drop":
+
             def _touch(b):
                 return {"n": [b.num_rows]}
+
             total = 0
             for out in ds.map_batches(_touch, batch_format="pyarrow").iter_batches(
-                    batch_format="pyarrow"):
+                batch_format="pyarrow"
+            ):
                 total += int(sum(out["n"].to_pylist()))
                 if fh:
                     fh.write(f"{time.time()},{total}\n")
@@ -208,8 +299,9 @@ def consume_hash(ds):
         w = pa.ipc.new_stream(sink, rb.schema)
         w.write_batch(rb)
         w.close()
-        out[name] = hashlib.blake2b(sink.getvalue().to_pybytes(),
-                                    digest_size=16).hexdigest()
+        out[name] = hashlib.blake2b(
+            sink.getvalue().to_pybytes(), digest_size=16
+        ).hexdigest()
     return out
 
 
@@ -254,12 +346,36 @@ def _warm(reader, trace_dir):
 def axis_layout():
     S = "wide_str"
     layouts = {
-        "small_1grp":      {"rows": 200_000, "num_files": 1, "row_group_size": 200_000, "schema": S},
-        "small_many_grp":  {"rows": 200_000, "num_files": 1, "row_group_size": 20_000, "schema": S},
-        "one_large_grp":   {"rows": 2_000_000, "num_files": 1, "row_group_size": 2_000_000, "schema": S},
-        "many_large_grp":  {"rows": 2_000_000, "num_files": 1, "row_group_size": 250_000, "schema": S},
-        "mixed_grp":       {"rows": 2_000_000, "num_files": 1,
-                            "row_group_sizes": [500_000, 20_000, 500_000, 20_000], "schema": S},
+        "small_1grp": {
+            "rows": 200_000,
+            "num_files": 1,
+            "row_group_size": 200_000,
+            "schema": S,
+        },
+        "small_many_grp": {
+            "rows": 200_000,
+            "num_files": 1,
+            "row_group_size": 20_000,
+            "schema": S,
+        },
+        "one_large_grp": {
+            "rows": 2_000_000,
+            "num_files": 1,
+            "row_group_size": 2_000_000,
+            "schema": S,
+        },
+        "many_large_grp": {
+            "rows": 2_000_000,
+            "num_files": 1,
+            "row_group_size": 250_000,
+            "schema": S,
+        },
+        "mixed_grp": {
+            "rows": 2_000_000,
+            "num_files": 1,
+            "row_group_sizes": [500_000, 20_000, 500_000, 20_000],
+            "schema": S,
+        },
     }
     results = []
     for name, spec in layouts.items():
@@ -273,20 +389,39 @@ def axis_layout():
                 _note_fixture(d, path)
                 t0 = time.time()
                 rows = consume(ray.data.read_parquet(path), mode)
-                t1 = time.time(); wall = t1 - t0
-                ray.shutdown(); time.sleep(0.3)
+                t1 = time.time()
+                wall = t1 - t0
+                ray.shutdown()
+                time.sleep(0.3)
                 peak = _node_sum_peak_mb(d, t0, t1)
                 incr = _node_sum_incr_peak_mb(d, t0, t1)
                 nat, fb = _count_paths(d)
                 wk = _worker_breakdown(d, t0, t1)
-                results.append({"layout": name, "reader": reader, "mode": mode,
-                                "wall_s": wall, "rows": rows, "t0": t0, "t1": t1,
-                                "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
-                                "native": nat, "fallback": fb, "workers": wk})
-                print(f"  {label}: wall={wall:.3f}s abs={peak:.0f}MB incr={incr:.0f}MB "
-                      f"rows={rows} native={nat} fallback={fb} "
-                      f"workers={wk['n_grown']}/{wk['n_workers']} "
-                      f"max_task={wk['max_worker_incr_mb']:.0f}MB")
+                results.append(
+                    _R(
+                        d,
+                        {
+                            "layout": name,
+                            "reader": reader,
+                            "mode": mode,
+                            "wall_s": wall,
+                            "rows": rows,
+                            "t0": t0,
+                            "t1": t1,
+                            "node_sum_peak_mb": peak,
+                            "node_sum_incr_mb": incr,
+                            "native": nat,
+                            "fallback": fb,
+                            "workers": wk,
+                        },
+                    )
+                )
+                print(
+                    f"  {label}: wall={wall:.3f}s abs={peak:.0f}MB incr={incr:.0f}MB "
+                    f"rows={rows} native={nat} fallback={fb} "
+                    f"workers={wk['n_grown']}/{wk['n_workers']} "
+                    f"max_task={wk['max_worker_incr_mb']:.0f}MB"
+                )
     json.dump(results, open(os.path.join(OUT, "results_layout.json"), "w"), indent=2)
     return results
 
@@ -312,14 +447,28 @@ def axis_schema():
                 h = {"__error__": f"{type(e).__name__}: {e}"[:200]}
                 err = h["__error__"]
             wall = time.time() - t0
-            ray.shutdown(); time.sleep(0.3)
+            ray.shutdown()
+            time.sleep(0.3)
             nat, fb = _count_paths(d)
             hashes[(schema, reader)] = h
-            results.append({"schema": schema, "reader": reader, "wall_s": wall,
-                            "expected": fx.expected_path(schema),
-                            "native": nat, "fallback": fb, "error": err})
-            print(f"  {label}: wall={wall:.3f}s native={nat} fallback={fb} "
-                  f"(expected {fx.expected_path(schema)}) err={err}")
+            results.append(
+                _R(
+                    d,
+                    {
+                        "schema": schema,
+                        "reader": reader,
+                        "wall_s": wall,
+                        "expected": fx.expected_path(schema),
+                        "native": nat,
+                        "fallback": fb,
+                        "error": err,
+                    },
+                )
+            )
+            print(
+                f"  {label}: wall={wall:.3f}s native={nat} fallback={fb} "
+                f"(expected {fx.expected_path(schema)}) err={err}"
+            )
     # Parity: arrow_rs vs pyarrow per schema.
     for schema in fx.SCHEMA_BUILDERS:
         pa_h = hashes[(schema, "pyarrow")]
@@ -328,13 +477,20 @@ def axis_schema():
         for r in results:
             if r["schema"] == schema:
                 r["parity"] = match
-        print(f"  PARITY {schema}: {'OK' if match else 'MISMATCH ' + str([k for k in pa_h if pa_h.get(k)!=rs_h.get(k)])}")
+        print(
+            f"  PARITY {schema}: {'OK' if match else 'MISMATCH ' + str([k for k in pa_h if pa_h.get(k)!=rs_h.get(k)])}"
+        )
     json.dump(results, open(os.path.join(OUT, "results_schema.json"), "w"), indent=2)
     return results
 
 
 def axis_tuning():
-    spec = {"rows": 2_000_000, "num_files": 1, "row_group_size": 2_000_000, "schema": "wide_str"}
+    spec = {
+        "rows": 2_000_000,
+        "num_files": 1,
+        "row_group_size": 2_000_000,
+        "schema": "wide_str",
+    }
     path = fx.make_fixture("one_large_grp", spec)
     results = []
     # PyArrow baseline (no budget knob).
@@ -342,25 +498,38 @@ def axis_tuning():
     _fresh_session("pyarrow", d)
     _warm("pyarrow", d)
     _note_fixture(d, path)
-    t0 = time.time(); rows = consume(ray.data.read_parquet(path), "iter_batches")
-    wall = time.time() - t0; ray.shutdown(); time.sleep(0.3)
-    results.append({"reader": "pyarrow", "budget_mb": None, "wall_s": wall})
+    t0 = time.time()
+    consume(ray.data.read_parquet(path), "iter_batches")
+    wall = time.time() - t0
+    ray.shutdown()
+    time.sleep(0.3)
+    results.append(_R(d, {"reader": "pyarrow", "budget_mb": None, "wall_s": wall}))
     print(f"  tuning pyarrow: wall={wall:.3f}s")
     for budget_mb in [1, 2, 4, 8, 16, 32]:
         d = _run_dir(f"tuning__arrow_rs__{budget_mb}mb")
         _fresh_session("arrow_rs", d, budget_bytes=budget_mb * MB)
         _warm("arrow_rs", d)
         _note_fixture(d, path)
-        t0 = time.time(); rows = consume(ray.data.read_parquet(path), "iter_batches")
-        wall = time.time() - t0; ray.shutdown(); time.sleep(0.3)
-        results.append({"reader": "arrow_rs", "budget_mb": budget_mb, "wall_s": wall})
+        t0 = time.time()
+        consume(ray.data.read_parquet(path), "iter_batches")
+        wall = time.time() - t0
+        ray.shutdown()
+        time.sleep(0.3)
+        results.append(
+            _R(d, {"reader": "arrow_rs", "budget_mb": budget_mb, "wall_s": wall})
+        )
         print(f"  tuning arrow_rs {budget_mb}MB: wall={wall:.3f}s")
     json.dump(results, open(os.path.join(OUT, "results_tuning.json"), "w"), indent=2)
     return results
 
 
 def axis_leak():
-    spec = {"rows": 1_000_000, "num_files": 1, "row_group_size": 1_000_000, "schema": "wide_str"}
+    spec = {
+        "rows": 1_000_000,
+        "num_files": 1,
+        "row_group_size": 1_000_000,
+        "schema": "wide_str",
+    }
     path = fx.make_fixture("leak_1grp", spec)
     results = []
     for reader in ["pyarrow", "arrow_rs"]:
@@ -371,14 +540,17 @@ def axis_leak():
         windows = []
         for i in range(8):
             t0 = time.time()
-            rows = consume(ray.data.read_parquet(path), "iter_batches")
+            consume(ray.data.read_parquet(path), "iter_batches")
             t1 = time.time()
             windows.append({"i": i, "t_start": t0, "t_end": t1, "wall_s": t1 - t0})
             print(f"  leak {reader} iter {i}: wall={t1-t0:.3f}s")
-        json.dump({"reader": reader, "windows": windows},
-                  open(os.path.join(d, "windows.json"), "w"))
-        ray.shutdown(); time.sleep(0.3)
-        results.append({"reader": reader, "windows": windows})
+        json.dump(
+            {"reader": reader, "windows": windows},
+            open(os.path.join(d, "windows.json"), "w"),
+        )
+        ray.shutdown()
+        time.sleep(0.3)
+        results.append(_R(d, {"reader": reader, "windows": windows}))
     json.dump(results, open(os.path.join(OUT, "results_leak.json"), "w"), indent=2)
     return results
 
@@ -397,20 +569,39 @@ def axis_mixed():
         _fresh_session(reader, rd)
         _warm(reader, rd)
         _note_fixture(rd, path)
-        t0 = time.time(); rows = consume(ray.data.read_parquet(path), "iter_batches")
-        t1 = time.time(); wall = t1 - t0; ray.shutdown(); time.sleep(0.3)
+        t0 = time.time()
+        rows = consume(ray.data.read_parquet(path), "iter_batches")
+        t1 = time.time()
+        wall = t1 - t0
+        ray.shutdown()
+        time.sleep(0.3)
         nat, fb = _count_paths(rd)
         peak = _node_sum_peak_mb(rd, t0, t1)
         incr = _node_sum_incr_peak_mb(rd, t0, t1)
         wk = _worker_breakdown(rd, t0, t1)
-        results.append({"reader": reader, "wall_s": wall, "rows": rows,
-                        "t0": t0, "t1": t1, "node_sum_peak_mb": peak,
-                        "node_sum_incr_mb": incr, "native": nat, "fallback": fb,
-                        "workers": wk})
-        print(f"  mixed {reader}: wall={wall:.3f}s rows={rows} abs={peak:.0f}MB "
-              f"incr={incr:.0f}MB native={nat} fallback={fb} "
-              f"workers={wk['n_grown']}/{wk['n_workers']} "
-              f"max_task={wk['max_worker_incr_mb']:.0f}MB")
+        results.append(
+            _R(
+                rd,
+                {
+                    "reader": reader,
+                    "wall_s": wall,
+                    "rows": rows,
+                    "t0": t0,
+                    "t1": t1,
+                    "node_sum_peak_mb": peak,
+                    "node_sum_incr_mb": incr,
+                    "native": nat,
+                    "fallback": fb,
+                    "workers": wk,
+                },
+            )
+        )
+        print(
+            f"  mixed {reader}: wall={wall:.3f}s rows={rows} abs={peak:.0f}MB "
+            f"incr={incr:.0f}MB native={nat} fallback={fb} "
+            f"workers={wk['n_grown']}/{wk['n_workers']} "
+            f"max_task={wk['max_worker_incr_mb']:.0f}MB"
+        )
     json.dump(results, open(os.path.join(OUT, "results_mixed.json"), "w"), indent=2)
     return results
 
@@ -427,8 +618,12 @@ def _node_sum_peak_mb(trace_dir, t0, t1):
         rows = list(csv.reader(open(f)))[1:]
         if not rows:
             continue
-        series.append((np.array([float(r[0]) for r in rows]),
-                       np.array([float(r[1]) for r in rows])))
+        series.append(
+            (
+                np.array([float(r[0]) for r in rows]),
+                np.array([float(r[1]) for r in rows]),
+            )
+        )
     if not series:
         return 0.0
     grid = np.linspace(t0, t1, 500)
@@ -468,8 +663,12 @@ def _node_sum_incr_peak_mb(trace_dir, t0, t1):
         rows = list(csv.reader(open(f)))[1:]
         if not rows:
             continue
-        series.append((np.array([float(r[0]) for r in rows]),
-                       np.array([float(r[1]) for r in rows])))
+        series.append(
+            (
+                np.array([float(r[0]) for r in rows]),
+                np.array([float(r[1]) for r in rows]),
+            )
+        )
     if not series:
         return 0.0
     grid = np.linspace(t0, t1, 500)
@@ -523,9 +722,12 @@ def _worker_breakdown(trace_dir, t0, t1):
         if delta > 5.0:
             grown += 1
         max_incr = max(max_incr, delta)
-    return {"n_workers": n, "n_grown": grown,
-            "max_worker_incr_mb": round(max_incr, 1),
-            "max_worker_minmax_mb": round(max_minmax, 1)}
+    return {
+        "n_workers": n,
+        "n_grown": grown,
+        "max_worker_incr_mb": round(max_incr, 1),
+        "max_worker_minmax_mb": round(max_minmax, 1),
+    }
 
 
 def axis_scaling():
@@ -536,7 +738,12 @@ def axis_scaling():
     budget shrinks (more rebuilds); O(n) per-batch-overhead does the opposite."""
     results = []
     for rows in [1_000_000, 2_000_000, 4_000_000, 8_000_000]:
-        spec = {"rows": rows, "num_files": 1, "row_group_size": rows, "schema": "wide_str"}
+        spec = {
+            "rows": rows,
+            "num_files": 1,
+            "row_group_size": rows,
+            "schema": "wide_str",
+        }
         path = fx.make_fixture(f"scale_{rows}", spec)
         for reader in ["pyarrow", "arrow_rs"]:
             d = _run_dir(f"scale__{rows}__{reader}")
@@ -544,13 +751,25 @@ def axis_scaling():
             _warm(reader, d)
             _note_fixture(d, path)
             t0 = time.time()
-            r = consume(ray.data.read_parquet(path), "iter_batches")
+            consume(ray.data.read_parquet(path), "iter_batches")
             wall = time.time() - t0
-            ray.shutdown(); time.sleep(0.3)
-            results.append({"rows": rows, "reader": reader, "wall_s": wall,
-                            "us_per_row": wall / rows * 1e6})
-            print(f"  scaling {reader} {rows//1_000_000}M: wall={wall:.3f}s "
-                  f"({wall / rows * 1e6:.4f} us/row)")
+            ray.shutdown()
+            time.sleep(0.3)
+            results.append(
+                _R(
+                    d,
+                    {
+                        "rows": rows,
+                        "reader": reader,
+                        "wall_s": wall,
+                        "us_per_row": wall / rows * 1e6,
+                    },
+                )
+            )
+            print(
+                f"  scaling {reader} {rows//1_000_000}M: wall={wall:.3f}s "
+                f"({wall / rows * 1e6:.4f} us/row)"
+            )
     json.dump(results, open(os.path.join(OUT, "results_scaling.json"), "w"), indent=2)
     return results
 
@@ -566,10 +785,18 @@ def axis_concurrency():
     # row group (the overcommit case — each worker holds a large private decode set,
     # so K concurrent big decodes are where PyArrow balloons the node).
     fixtures = {
-        "medium_8x1M": {"rows": 8_000_000, "num_files": 8, "row_group_size": 1_000_000,
-                        "schema": "wide_str"},
-        "big_4x4M": {"rows": 16_000_000, "num_files": 4, "row_group_size": 4_000_000,
-                     "schema": "wide_str"},
+        "medium_8x1M": {
+            "rows": 8_000_000,
+            "num_files": 8,
+            "row_group_size": 1_000_000,
+            "schema": "wide_str",
+        },
+        "big_4x4M": {
+            "rows": 16_000_000,
+            "num_files": 4,
+            "row_group_size": 4_000_000,
+            "schema": "wide_str",
+        },
     }
     for fxname, spec in fixtures.items():
         path = fx.make_fixture(f"conc_{fxname}", spec)
@@ -582,17 +809,36 @@ def axis_concurrency():
                 t0 = time.time()
                 rows = consume(ray.data.read_parquet(path), "iter_batches")
                 t1 = time.time()
-                ray.shutdown(); time.sleep(0.3)
+                ray.shutdown()
+                time.sleep(0.3)
                 peak = _node_sum_peak_mb(d, t0, t1)
                 incr = _node_sum_incr_peak_mb(d, t0, t1)
                 nat, fb = _count_paths(d)
-                results.append({"fixture": fxname, "reader": reader, "num_cpus": ncpu,
-                                "wall_s": t1 - t0, "node_sum_peak_mb": peak,
-                                "node_sum_incr_mb": incr, "rows": rows, "t0": t0,
-                                "t1": t1, "native": nat, "fallback": fb})
-                print(f"  conc {fxname} {reader} cpu={ncpu}: wall={t1-t0:.3f}s "
-                      f"abs={peak:.0f}MB incr={incr:.0f}MB native={nat} fallback={fb}")
-    json.dump(results, open(os.path.join(OUT, "results_concurrency.json"), "w"), indent=2)
+                results.append(
+                    _R(
+                        d,
+                        {
+                            "fixture": fxname,
+                            "reader": reader,
+                            "num_cpus": ncpu,
+                            "wall_s": t1 - t0,
+                            "node_sum_peak_mb": peak,
+                            "node_sum_incr_mb": incr,
+                            "rows": rows,
+                            "t0": t0,
+                            "t1": t1,
+                            "native": nat,
+                            "fallback": fb,
+                        },
+                    )
+                )
+                print(
+                    f"  conc {fxname} {reader} cpu={ncpu}: wall={t1-t0:.3f}s "
+                    f"abs={peak:.0f}MB incr={incr:.0f}MB native={nat} fallback={fb}"
+                )
+    json.dump(
+        results, open(os.path.join(OUT, "results_concurrency.json"), "w"), indent=2
+    )
     return results
 
 
@@ -605,12 +851,36 @@ def axis_showcase():
     transient is fat enough to see."""
     S = "huge_str"
     configs = {
-        "small_many_rg": {"rows": 2_000_000, "num_files": 1, "row_group_size": 50_000, "schema": S},
-        "medium_1rg": {"rows": 2_000_000, "num_files": 1, "row_group_size": 2_000_000, "schema": S},
-        "large_1rg": {"rows": 8_000_000, "num_files": 1, "row_group_size": 8_000_000, "schema": S},
-        "mixed_rg": {"rows": 4_000_000, "num_files": 1,
-                     "row_group_sizes": [500_000, 20_000, 500_000, 20_000], "schema": S},
-        "many_files_1rg": {"rows": 8_000_000, "num_files": 4, "row_group_size": 2_000_000, "schema": S},
+        "small_many_rg": {
+            "rows": 2_000_000,
+            "num_files": 1,
+            "row_group_size": 50_000,
+            "schema": S,
+        },
+        "medium_1rg": {
+            "rows": 2_000_000,
+            "num_files": 1,
+            "row_group_size": 2_000_000,
+            "schema": S,
+        },
+        "large_1rg": {
+            "rows": 8_000_000,
+            "num_files": 1,
+            "row_group_size": 8_000_000,
+            "schema": S,
+        },
+        "mixed_rg": {
+            "rows": 4_000_000,
+            "num_files": 1,
+            "row_group_sizes": [500_000, 20_000, 500_000, 20_000],
+            "schema": S,
+        },
+        "many_files_1rg": {
+            "rows": 8_000_000,
+            "num_files": 4,
+            "row_group_size": 2_000_000,
+            "schema": S,
+        },
     }
     results = []
     for name, spec in configs.items():
@@ -624,16 +894,32 @@ def axis_showcase():
             t0 = time.time()
             rows = consume(ray.data.read_parquet(path), "iter_batches", prog)
             t1 = time.time()
-            ray.shutdown(); time.sleep(0.3)
+            ray.shutdown()
+            time.sleep(0.3)
             peak = _node_sum_peak_mb(d, t0, t1)
             incr = _node_sum_incr_peak_mb(d, t0, t1)
             nat, fb = _count_paths(d)
-            results.append({"config": name, "reader": reader, "wall_s": t1 - t0,
-                            "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
-                            "rows": rows, "t0": t0, "t1": t1,
-                            "native": nat, "fallback": fb})
-            print(f"  show {name} {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
-                  f"incr={incr:.0f}MB rows={rows} native={nat} fallback={fb}")
+            results.append(
+                _R(
+                    d,
+                    {
+                        "config": name,
+                        "reader": reader,
+                        "wall_s": t1 - t0,
+                        "node_sum_peak_mb": peak,
+                        "node_sum_incr_mb": incr,
+                        "rows": rows,
+                        "t0": t0,
+                        "t1": t1,
+                        "native": nat,
+                        "fallback": fb,
+                    },
+                )
+            )
+            print(
+                f"  show {name} {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
+                f"incr={incr:.0f}MB rows={rows} native={nat} fallback={fb}"
+            )
     json.dump(results, open(os.path.join(OUT, "results_showcase.json"), "w"), indent=2)
     return results
 
@@ -661,23 +947,43 @@ def _run_sweep(name, levels, mode="iter_batches", num_cpus=4):
             t0 = time.time()
             rows = consume(ray.data.read_parquet(path), mode, prog)
             t1 = time.time()
-            ray.shutdown(); time.sleep(0.3)
+            ray.shutdown()
+            time.sleep(0.3)
             peak = _node_sum_peak_mb(d, t0, t1)
             incr = _node_sum_incr_peak_mb(d, t0, t1)
             nat, fb = _count_paths(d)
             wk = _worker_breakdown(d, t0, t1)
-            results.append({"sweep": name, "level": lv["label"], "reader": reader,
-                            "wall_s": t1 - t0, "node_sum_peak_mb": peak,
-                            "node_sum_incr_mb": incr, "rows": rows,
-                            "t0": t0, "t1": t1, "budget_mb": budget // MB,
-                            "num_cpus": ncpu, "native": nat, "fallback": fb,
-                            "workers": wk})
-            print(f"  sweep[{name}] {lv['label']} {reader}: wall={t1-t0:.3f}s "
-                  f"abs={peak:.0f}MB incr={incr:.0f}MB rows={rows} "
-                  f"native={nat} fallback={fb} "
-                  f"workers={wk['n_grown']}/{wk['n_workers']} "
-                  f"max_task={wk['max_worker_incr_mb']:.0f}MB")
-    json.dump(results, open(os.path.join(OUT, f"results_sweep_{name}.json"), "w"), indent=2)
+            results.append(
+                _R(
+                    d,
+                    {
+                        "sweep": name,
+                        "level": lv["label"],
+                        "reader": reader,
+                        "wall_s": t1 - t0,
+                        "node_sum_peak_mb": peak,
+                        "node_sum_incr_mb": incr,
+                        "rows": rows,
+                        "t0": t0,
+                        "t1": t1,
+                        "budget_mb": budget // MB,
+                        "num_cpus": ncpu,
+                        "native": nat,
+                        "fallback": fb,
+                        "workers": wk,
+                    },
+                )
+            )
+            print(
+                f"  sweep[{name}] {lv['label']} {reader}: wall={t1-t0:.3f}s "
+                f"abs={peak:.0f}MB incr={incr:.0f}MB rows={rows} "
+                f"native={nat} fallback={fb} "
+                f"workers={wk['n_grown']}/{wk['n_workers']} "
+                f"max_task={wk['max_worker_incr_mb']:.0f}MB"
+            )
+    json.dump(
+        results, open(os.path.join(OUT, f"results_sweep_{name}.json"), "w"), indent=2
+    )
     return results
 
 
@@ -686,16 +992,56 @@ def sweep_size():
     to ~1.4 GB. Shows the memory gap widening with size while arrow-rs stays flat."""
     # _ints => id + 8 int64 cols = 72 bytes/row. rows chosen for ~14/50/144/504/1440 MB.
     levels = [
-        {"label": "14MB_200k", "fixture_name": "sw_size_200k",
-         "spec": {"rows": 200_000, "num_files": 1, "row_group_size": 200_000, "schema": "int"}},
-        {"label": "50MB_700k", "fixture_name": "sw_size_700k",
-         "spec": {"rows": 700_000, "num_files": 1, "row_group_size": 700_000, "schema": "int"}},
-        {"label": "144MB_2M", "fixture_name": "sw_size_2M",
-         "spec": {"rows": 2_000_000, "num_files": 1, "row_group_size": 2_000_000, "schema": "int"}},
-        {"label": "504MB_7M", "fixture_name": "sw_size_7M",
-         "spec": {"rows": 7_000_000, "num_files": 1, "row_group_size": 7_000_000, "schema": "int"}},
-        {"label": "1.4GB_20M", "fixture_name": "sw_size_20M",
-         "spec": {"rows": 20_000_000, "num_files": 1, "row_group_size": 20_000_000, "schema": "int"}},
+        {
+            "label": "14MB_200k",
+            "fixture_name": "sw_size_200k",
+            "spec": {
+                "rows": 200_000,
+                "num_files": 1,
+                "row_group_size": 200_000,
+                "schema": "int",
+            },
+        },
+        {
+            "label": "50MB_700k",
+            "fixture_name": "sw_size_700k",
+            "spec": {
+                "rows": 700_000,
+                "num_files": 1,
+                "row_group_size": 700_000,
+                "schema": "int",
+            },
+        },
+        {
+            "label": "144MB_2M",
+            "fixture_name": "sw_size_2M",
+            "spec": {
+                "rows": 2_000_000,
+                "num_files": 1,
+                "row_group_size": 2_000_000,
+                "schema": "int",
+            },
+        },
+        {
+            "label": "504MB_7M",
+            "fixture_name": "sw_size_7M",
+            "spec": {
+                "rows": 7_000_000,
+                "num_files": 1,
+                "row_group_size": 7_000_000,
+                "schema": "int",
+            },
+        },
+        {
+            "label": "1.4GB_20M",
+            "fixture_name": "sw_size_20M",
+            "spec": {
+                "rows": 20_000_000,
+                "num_files": 1,
+                "row_group_size": 20_000_000,
+                "schema": "int",
+            },
+        },
     ]
     return _run_sweep("size", levels)
 
@@ -704,10 +1050,19 @@ def sweep_batch():
     """Same file (huge_str, 4 M rows, one ~400 MB row group), 5 decode budgets.
     arrow-rs's peak tracks the budget (memory is a knob); PyArrow ignores it
     (materializes the whole group) — a flat control line across all 5 panels."""
-    spec = {"rows": 4_000_000, "num_files": 1, "row_group_size": 4_000_000, "schema": "huge_str"}
+    spec = {
+        "rows": 4_000_000,
+        "num_files": 1,
+        "row_group_size": 4_000_000,
+        "schema": "huge_str",
+    }
     levels = [
-        {"label": f"{b}MB", "fixture_name": "sw_batch_4M", "spec": spec,
-         "budget_bytes": b * MB}
+        {
+            "label": f"{b}MB",
+            "fixture_name": "sw_batch_4M",
+            "spec": spec,
+            "budget_bytes": b * MB,
+        }
         for b in [1, 4, 8, 16, 64]
     ]
     return _run_sweep("batch", levels)
@@ -721,9 +1076,11 @@ def sweep_rowgroup():
     S = "huge_str"
     R = 4_000_000
     levels = [
-        {"label": f"rg_{rg//1000}k" if rg < R else "rg_whole_file",
-         "fixture_name": f"sw_rg_{rg}",
-         "spec": {"rows": R, "num_files": 1, "row_group_size": rg, "schema": S}}
+        {
+            "label": f"rg_{rg//1000}k" if rg < R else "rg_whole_file",
+            "fixture_name": f"sw_rg_{rg}",
+            "spec": {"rows": R, "num_files": 1, "row_group_size": rg, "schema": S},
+        }
         for rg in [50_000, 200_000, 1_000_000, 2_000_000, R]
     ]
     return _run_sweep("rowgroup", levels)
@@ -736,9 +1093,17 @@ def sweep_files():
     single-node overcommit that is the actual OOM mechanism."""
     S = "huge_str"
     levels = [
-        {"label": f"{nf}_files", "fixture_name": f"sw_files_{nf}",
-         "spec": {"rows": nf * 2_000_000, "num_files": nf,
-                  "row_group_size": 2_000_000, "schema": S}, "num_cpus": 4}
+        {
+            "label": f"{nf}_files",
+            "fixture_name": f"sw_files_{nf}",
+            "spec": {
+                "rows": nf * 2_000_000,
+                "num_files": nf,
+                "row_group_size": 2_000_000,
+                "schema": S,
+            },
+            "num_cpus": 4,
+        }
         for nf in [1, 2, 4, 6, 8]
     ]
     return _run_sweep("files", levels)
@@ -749,9 +1114,16 @@ def sweep_schema():
     gap is biggest where cells are widest (wide strings) and smallest for fixed
     width numerics."""
     levels = [
-        {"label": sc, "fixture_name": f"sw_schema_{sc}",
-         "spec": {"rows": 2_000_000, "num_files": 1, "row_group_size": 2_000_000,
-                  "schema": sc}}
+        {
+            "label": sc,
+            "fixture_name": f"sw_schema_{sc}",
+            "spec": {
+                "rows": 2_000_000,
+                "num_files": 1,
+                "row_group_size": 2_000_000,
+                "schema": sc,
+            },
+        }
         for sc in ["int", "float", "wide_str", "large_str", "huge_str"]
     ]
     return _run_sweep("schema", levels)
@@ -761,10 +1133,19 @@ def sweep_batch_dd():
     """The decode budget sweep in decode_drop mode — output retention is removed,
     so arrow-rs's memory now TRACKS the budget (the knob that iter_batches masks),
     while PyArrow still holds the whole row group regardless."""
-    spec = {"rows": 4_000_000, "num_files": 1, "row_group_size": 4_000_000, "schema": "huge_str"}
+    spec = {
+        "rows": 4_000_000,
+        "num_files": 1,
+        "row_group_size": 4_000_000,
+        "schema": "huge_str",
+    }
     levels = [
-        {"label": f"{b}MB", "fixture_name": "sw_batch_4M", "spec": spec,
-         "budget_bytes": b * MB}
+        {
+            "label": f"{b}MB",
+            "fixture_name": "sw_batch_4M",
+            "spec": spec,
+            "budget_bytes": b * MB,
+        }
         for b in [1, 4, 8, 16, 64]
     ]
     return _run_sweep("batch_dd", levels, mode="decode_drop")
@@ -777,7 +1158,12 @@ def axis_workloads():
     on a realistic consumer (not the synthetic count-returning map_batches), and
     the filter honestly exercises the no-predicate-pushdown limitation (§4.7:
     arrow-rs decodes rows it then drops)."""
-    spec = {"rows": 4_000_000, "num_files": 1, "row_group_size": 4_000_000, "schema": "int"}
+    spec = {
+        "rows": 4_000_000,
+        "num_files": 1,
+        "row_group_size": 4_000_000,
+        "schema": "int",
+    }
     path = fx.make_fixture("wl_int_4M", spec)
     high = (1 << 30) - 2000  # selective: only a sliver of i0 exceeds this
     results = []
@@ -790,19 +1176,36 @@ def axis_workloads():
         t0 = time.time()
         total = ray.data.read_parquet(path).sum("i0")
         t1 = time.time()
-        ray.shutdown(); time.sleep(0.3)
+        ray.shutdown()
+        time.sleep(0.3)
         peak = _node_sum_peak_mb(d, t0, t1)
         incr = _node_sum_incr_peak_mb(d, t0, t1)
         nat, fb = _count_paths(d)
         wk = _worker_breakdown(d, t0, t1)
-        results.append({"workload": "sum(i0)", "reader": reader, "wall_s": t1 - t0,
-                        "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
-                        "out": str(total), "t0": t0, "t1": t1,
-                        "native": nat, "fallback": fb, "workers": wk})
-        print(f"  wl sum {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
-              f"incr={incr:.0f}MB native={nat} fallback={fb} "
-              f"workers={wk['n_grown']}/{wk['n_workers']} "
-              f"max_task={wk['max_worker_incr_mb']:.0f}MB")
+        results.append(
+            _R(
+                d,
+                {
+                    "workload": "sum(i0)",
+                    "reader": reader,
+                    "wall_s": t1 - t0,
+                    "node_sum_peak_mb": peak,
+                    "node_sum_incr_mb": incr,
+                    "out": str(total),
+                    "t0": t0,
+                    "t1": t1,
+                    "native": nat,
+                    "fallback": fb,
+                    "workers": wk,
+                },
+            )
+        )
+        print(
+            f"  wl sum {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
+            f"incr={incr:.0f}MB native={nat} fallback={fb} "
+            f"workers={wk['n_grown']}/{wk['n_workers']} "
+            f"max_task={wk['max_worker_incr_mb']:.0f}MB"
+        )
         # Selective read-time filter: decode all, keep a sliver. Non-empty
         # projection so the arrow-rs path runs (count() would empty-project → fallback).
         d = _run_dir(f"wl__filter__{reader}")
@@ -811,21 +1214,39 @@ def axis_workloads():
         _note_fixture(d, path)
         t0 = time.time()
         kept = consume(
-            ray.data.read_parquet(path).filter(expr=f"i0 > {high}"), "iter_batches")
+            ray.data.read_parquet(path).filter(expr=f"i0 > {high}"), "iter_batches"
+        )
         t1 = time.time()
-        ray.shutdown(); time.sleep(0.3)
+        ray.shutdown()
+        time.sleep(0.3)
         peak = _node_sum_peak_mb(d, t0, t1)
         incr = _node_sum_incr_peak_mb(d, t0, t1)
         nat, fb = _count_paths(d)
         wk = _worker_breakdown(d, t0, t1)
-        results.append({"workload": "filter(i0>hi)", "reader": reader, "wall_s": t1 - t0,
-                        "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
-                        "kept_rows": kept, "t0": t0, "t1": t1,
-                        "native": nat, "fallback": fb, "workers": wk})
-        print(f"  wl filter {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
-              f"incr={incr:.0f}MB kept={kept} native={nat} fallback={fb} "
-              f"workers={wk['n_grown']}/{wk['n_workers']} "
-              f"max_task={wk['max_worker_incr_mb']:.0f}MB")
+        results.append(
+            _R(
+                d,
+                {
+                    "workload": "filter(i0>hi)",
+                    "reader": reader,
+                    "wall_s": t1 - t0,
+                    "node_sum_peak_mb": peak,
+                    "node_sum_incr_mb": incr,
+                    "kept_rows": kept,
+                    "t0": t0,
+                    "t1": t1,
+                    "native": nat,
+                    "fallback": fb,
+                    "workers": wk,
+                },
+            )
+        )
+        print(
+            f"  wl filter {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
+            f"incr={incr:.0f}MB kept={kept} native={nat} fallback={fb} "
+            f"workers={wk['n_grown']}/{wk['n_workers']} "
+            f"max_task={wk['max_worker_incr_mb']:.0f}MB"
+        )
     json.dump(results, open(os.path.join(OUT, "results_workloads.json"), "w"), indent=2)
     return results
 
@@ -861,8 +1282,10 @@ def axis_s3():
     """
     s3_path = os.environ.get("RAY_DATA_ARROW_RS_S3_BENCH_PATH")
     if not s3_path:
-        print("  (skip s3: set RAY_DATA_ARROW_RS_S3_BENCH_PATH=s3://... on a "
-              "Linux+real-S3 box — S3 perf is not meaningful on macOS/moto)")
+        print(
+            "  (skip s3: set RAY_DATA_ARROW_RS_S3_BENCH_PATH=s3://... on a "
+            "Linux+real-S3 box — S3 perf is not meaningful on macOS/moto)"
+        )
         return []
 
     # (reader, fetch_window_mb, budget_mb, malloc_arena_max, ld_preload) configs.
@@ -874,12 +1297,12 @@ def axis_s3():
         ("arrow_rs", 4, 2, None, None),
         ("arrow_rs", 16, 2, None, None),
         ("arrow_rs", 64, 2, None, None),
-        ("arrow_rs", 0, 2, None, None),   # no window cap (control: shows win's size)
+        ("arrow_rs", 0, 2, None, None),  # no window cap (control: shows win's size)
         # --- budget sweep @ fixed 16 MiB window (the floor knob) ---
         ("arrow_rs", 16, 8, None, None),
         ("arrow_rs", 16, 32, None, None),
         # --- allocator sweep @ window 16 / budget 2 (all env-only, no recompile) ---
-        ("arrow_rs", 16, 2, 2, None),     # glibc + MALLOC_ARENA_MAX=2
+        ("arrow_rs", 16, 2, 2, None),  # glibc + MALLOC_ARENA_MAX=2
     ]
     # LD_PRELOAD allocator A/B (#9): only added when the .so path is provided, so a
     # box without the lib installed just skips it. Find paths with e.g.
@@ -887,48 +1310,96 @@ def axis_s3():
     mi = os.environ.get("RAY_DATA_ARROW_RS_MIMALLOC_SO")
     je = os.environ.get("RAY_DATA_ARROW_RS_JEMALLOC_SO")
     if mi:
-        configs.append(("arrow_rs", 16, 2, None, mi))    # LD_PRELOAD mimalloc
+        configs.append(("arrow_rs", 16, 2, None, mi))  # LD_PRELOAD mimalloc
     if je:
-        configs.append(("arrow_rs", 16, 2, None, je))    # LD_PRELOAD jemalloc
+        configs.append(("arrow_rs", 16, 2, None, je))  # LD_PRELOAD jemalloc
     results = []
     for reader, window, budget_mb, arena, preload in configs:
-        alloc = ("mi" if preload and "mimalloc" in preload
-                 else "je" if preload and "jemalloc" in preload
-                 else f"arena{arena}" if arena else "sys")
-        tag = (reader if reader == "pyarrow"
-               else f"arrow_rs_w{window}_b{budget_mb}_{alloc}")
+        alloc = (
+            "mi"
+            if preload and "mimalloc" in preload
+            else "je"
+            if preload and "jemalloc" in preload
+            else f"arena{arena}"
+            if arena
+            else "sys"
+        )
+        tag = (
+            reader
+            if reader == "pyarrow"
+            else f"arrow_rs_w{window}_b{budget_mb}_{alloc}"
+        )
         d = _run_dir(f"s3__{tag}")
-        _fresh_session(reader, d, budget_bytes=(budget_mb or 2) * MB,
-                       fetch_window_mb=(window or 0), malloc_arena_max=arena,
-                       ld_preload=preload)
+        _fresh_session(
+            reader,
+            d,
+            budget_bytes=(budget_mb or 2) * MB,
+            fetch_window_mb=(window or 0),
+            malloc_arena_max=arena,
+            ld_preload=preload,
+        )
         _warm(reader, d)  # warms worker imports on a tiny local fixture
         _note_fixture(d, s3_path)
         t0 = time.time()
-        rows = consume(ray.data.read_parquet(s3_path), "iter_batches",
-                       progress_path=os.path.join(d, "progress.csv"))
-        t1 = time.time(); ray.shutdown(); time.sleep(0.3)
+        rows = consume(
+            ray.data.read_parquet(s3_path),
+            "iter_batches",
+            progress_path=os.path.join(d, "progress.csv"),
+        )
+        t1 = time.time()
+        ray.shutdown()
+        time.sleep(0.3)
         peak = _node_sum_peak_mb(d, t0, t1)
         incr = _node_sum_incr_peak_mb(d, t0, t1)
         nat, fb = _count_paths(d)
-        results.append({"reader": reader, "tag": tag, "fetch_window_mb": window,
-                        "budget_mb": budget_mb, "malloc_arena_max": arena,
-                        "ld_preload": preload, "alloc": alloc,
-                        "wall_s": t1 - t0, "rows": rows, "t0": t0, "t1": t1,
-                        "node_sum_peak_mb": peak, "node_sum_incr_mb": incr,
-                        "native": nat, "fallback": fb})
-        print(f"  s3 {tag}: wall={t1-t0:.3f}s abs_peak={peak:.0f}MB "
-              f"incr_peak={incr:.0f}MB rows={rows} native={nat} fallback={fb}")
+        results.append(
+            _R(
+                d,
+                {
+                    "reader": reader,
+                    "tag": tag,
+                    "fetch_window_mb": window,
+                    "budget_mb": budget_mb,
+                    "malloc_arena_max": arena,
+                    "ld_preload": preload,
+                    "alloc": alloc,
+                    "wall_s": t1 - t0,
+                    "rows": rows,
+                    "t0": t0,
+                    "t1": t1,
+                    "node_sum_peak_mb": peak,
+                    "node_sum_incr_mb": incr,
+                    "native": nat,
+                    "fallback": fb,
+                },
+            )
+        )
+        print(
+            f"  s3 {tag}: wall={t1-t0:.3f}s abs_peak={peak:.0f}MB "
+            f"incr_peak={incr:.0f}MB rows={rows} native={nat} fallback={fb}"
+        )
     json.dump(results, open(os.path.join(OUT, "results_s3.json"), "w"), indent=2)
     return results
 
 
-AXES = {"layout": axis_layout, "schema": axis_schema, "tuning": axis_tuning,
-        "leak": axis_leak, "mixed": axis_mixed, "scaling": axis_scaling,
-        "concurrency": axis_concurrency, "showcase": axis_showcase,
-        "sweep_size": sweep_size, "sweep_batch": sweep_batch,
-        "sweep_rowgroup": sweep_rowgroup, "sweep_files": sweep_files,
-        "sweep_schema": sweep_schema, "sweep_batch_dd": sweep_batch_dd,
-        "workloads": axis_workloads, "s3": axis_s3}
+AXES = {
+    "layout": axis_layout,
+    "schema": axis_schema,
+    "tuning": axis_tuning,
+    "leak": axis_leak,
+    "mixed": axis_mixed,
+    "scaling": axis_scaling,
+    "concurrency": axis_concurrency,
+    "showcase": axis_showcase,
+    "sweep_size": sweep_size,
+    "sweep_batch": sweep_batch,
+    "sweep_rowgroup": sweep_rowgroup,
+    "sweep_files": sweep_files,
+    "sweep_schema": sweep_schema,
+    "sweep_batch_dd": sweep_batch_dd,
+    "workloads": axis_workloads,
+    "s3": axis_s3,
+}
 
 
 def write_summary_csv():
@@ -963,11 +1434,24 @@ def write_summary_csv():
         v = r.get(k)
         return round(v, 3) if isinstance(v, (int, float)) else ""
 
-    fields = ["axis", "config", "reader", "wall_s", "abs_peak_mb",
-              "rows", "native", "fallback"]
+    fields = [
+        "axis",
+        "config",
+        "reader",
+        "wall_s",
+        "abs_peak_mb",
+        "rows",
+        "files",
+        "row_groups",
+        "rg_uncomp_mb",
+        "rg_comp_mb",
+        "native",
+        "fallback",
+        "contents",
+    ]
     out_rows = []
     for f in sorted(glob.glob(os.path.join(OUT, "results_*.json"))):
-        axis = os.path.basename(f)[len("results_"):-len(".json")]
+        axis = os.path.basename(f)[len("results_") : -len(".json")]
         try:
             data = json.load(open(f))
         except Exception:
@@ -977,13 +1461,24 @@ def write_summary_csv():
         for r in data:
             if not isinstance(r, dict) or "reader" not in r:
                 continue
-            out_rows.append({
-                "axis": axis, "config": _config(axis, r),
-                "reader": r.get("reader", ""), "wall_s": _num(r, "wall_s"),
-                "abs_peak_mb": _num(r, "node_sum_peak_mb"),
-                "rows": r.get("rows", ""), "native": r.get("native", ""),
-                "fallback": r.get("fallback", ""),
-            })
+            out_rows.append(
+                {
+                    "axis": axis,
+                    "config": _config(axis, r),
+                    "reader": r.get("reader", ""),
+                    "wall_s": _num(r, "wall_s"),
+                    "abs_peak_mb": _num(r, "node_sum_peak_mb"),
+                    # rows read: axis-native count if present, else the fixture total.
+                    "rows": r.get("rows") or r.get("rows_total", ""),
+                    "files": r.get("num_files", ""),
+                    "row_groups": r.get("num_row_groups", ""),
+                    "rg_uncomp_mb": _num(r, "max_rg_uncomp_mb"),
+                    "rg_comp_mb": _num(r, "max_rg_comp_mb"),
+                    "native": r.get("native", ""),
+                    "fallback": r.get("fallback", ""),
+                    "contents": r.get("schema_desc", ""),
+                }
+            )
     path = os.path.join(OUT, "summary.csv")
     with open(path, "w", newline="") as fh:
         w = _csv.DictWriter(fh, fieldnames=fields)
