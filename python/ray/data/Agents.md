@@ -56,9 +56,14 @@ you know Ray Data and Parquet at a high level but nothing about this work.
   no summary scalars; the question is whether tasks stay near the line Ray schedules by.
   This replaced an incremental metric that produced a false regression on Linux and was
   dissected in §3.5.1/§5.10.
-- **What's unproven:** the full Linux suite + real-S3 numbers on that metric (the
-  deciding run), projection/predicate pushdown, nested/dictionary/decimal schemas, and
-  whether the K-split concurrency can be redesigned to win locally too (§7).
+- **What's proven at node level (§5.10):** the full Linux suite + real-S3 run came back
+  uniform — arrow-rs's absolute node-sum peak USS is at-or-below PyArrow's in every
+  paired config (~45 cells), at wall parity-to-faster; headline cells: 0.50× at 4-CPU
+  concurrency, 0.43× at 1.4 GB, 0.37× on large_str, S3 0.81× at 0.99× wall.
+- **What's unproven:** the per-task-vs-E adjudication itself (the `figs/task_mem/`
+  graphs exist but are not yet read into this doc), the `oom` end-to-end demo,
+  projection/predicate pushdown, nested/dictionary/decimal schemas, and whether the
+  K-split concurrency can be redesigned to win locally too (§7).
 
 ---
 
@@ -958,11 +963,57 @@ one-subfragment-per-row-group fan-out only applies to files big enough to chunk.
 prestarted-worker pool on a many-core node is why naive node-sum absolute USS needs care:
 idle workers each hold an import floor; the per-task metric sidesteps this entirely.
 
-**Pending (the deciding run):** the full suite — layout, mixed, sweeps, workloads,
-concurrency, S3 — rerun on the metric of record, producing `figs/task_mem/` (per-task
-lines vs the E line) for every config. Also planned: an `oom` axis — a memory-ceilinged
-node where PyArrow's hidden decode heap OOM-kills the read and arrow-rs finishes — the
-end-to-end demonstration of §3.2's failure mode and its removal.
+**The full-suite rerun (2026-07-21, single fat node, private 4-CPU sessions, real S3).**
+Every axis, on the new instrumentation; memory below is **absolute node-sum peak USS**
+(no subtraction — the retired metric's bias cannot produce these numbers). The result is
+uniform: **arrow-rs's peak is at-or-below PyArrow's in every paired config in the suite**
+(~45 cells; the only exception is the S3 `w0` config, which deliberately disables the
+fetch window to prove it is the lever). Ratios are arrow-rs ÷ PyArrow:
+
+| axis | memory (rs/pa) | wall (rs/pa) |
+|---|---|---|
+| layout (5 shapes) | 0.81–0.93× | 0.90–0.99× (small_many_grp 1.16×) |
+| mixed 6-file (incl. struct fallback) | **0.65×** (636 vs 975 MB) | **0.55×** |
+| concurrency @4cpu | **0.53× / 0.50×** (1727 vs 3237; 2474 vs 4997 MB) | 0.86× / 0.82× |
+| sweep_size 14 MB → 1.4 GB | 0.98× → **0.43×** (1613 vs 3733 MB) | 0.83–0.98× |
+| sweep_rowgroup tiny → whole-file | 0.87× → **0.51×** | 0.77–1.03× |
+| sweep_schema (large_str peak) | **0.37×** (1037 vs 2828 MB) | 0.63× (float 1.12×) |
+| sweep_files 1→8 | 0.64–0.84× | 0.87–0.96× |
+| sweep_batch retained / decode-drop | ~0.50× / **~0.24×** | ~0.85× / ~0.48× |
+| workloads sum / filter | 0.91× / **0.34×** | 0.82× / 0.54× |
+| s3 real bucket, w16 | 0.81–0.89× (best 2267 vs 2814 MB) | 0.99× |
+
+Readings that matter beyond the ratios:
+
+- **The concurrency direction, not just the level:** going 2→4 CPUs, PyArrow's node peak
+  *rises* (3142→3237, 4827→4997 MB) while arrow-rs's *falls* (1919→1727, 2953→2474 MB —
+  more workers finish sooner, each holding less). Per-task overshoot × concurrency
+  compounding is precisely §3.2's OOM mechanism, observed at node level.
+- **The mac many-tiny-groups loss (§5.0 sweep-2 panel 1, 0.9×) does not exist on Linux:**
+  rg_50k is a 0.87× *win* at wall parity (1.03×) — consistent with the probe's finding
+  that per-worker high-water was always lower and the mac node-sum gap was an
+  allocator-release timing effect on macOS.
+- **Memory scaling in file size:** 14 MB → 1.4 GB moves PyArrow 252→3733 MB (~15×) but
+  arrow-rs 248→1613 MB (~6.5×); the ratio widens monotonically (0.98→0.43×). Same shape
+  as the mac sweep, now at authoritative USS.
+- **The budget knob is a wall lever, not a local memory lever (mac null reproduced):**
+  arrow-rs retained peak is flat ~890–990 MB across budgets 1→64 MB; the tuning wall
+  sweep shows 1 MB=1.22×, 2 MB (default) =1.05×, ≥4 MB=0.91–0.94×.
+- **S3: the fetch window is the memory lever, confirmed by ablation.** w4 saves memory
+  but costs wall (1.32×); w64 gives back the memory (2860 MB); **w0 (no window) is worse
+  than PyArrow** (3284 vs 2814 MB); w16 = speed parity (0.99×) at 0.81–0.89×.
+  Default `fetch_window_mb=16` validated. `MALLOC_ARENA_MAX=2` was inert (2424≈2494 MB),
+  consistent with the dead allocator hypotheses.
+- **Speed cells ≥1.1× slower, all small/fast fixtures:** layout small_many_grp 1.16×
+  (0.43→0.50 s), schema float 1.15× and sweep_schema float 1.12× (the one *consistent*
+  slow cell — plain-float decode, ~parity band), schema wide_str 1.27× — contradicted by
+  sweep_schema wide_str 0.88× and tuning b2 1.05× on bigger fixtures, so treated as noise
+  pending a repeat.
+
+**Pending:** eyeballing `figs/task_mem/` (per-task lines vs the E line — the metric of
+record; generated by this run but not yet adjudicated here), and the planned `oom` axis —
+a memory-ceilinged node where PyArrow's hidden decode heap OOM-kills the read and
+arrow-rs finishes — the end-to-end demonstration of §3.2's failure mode and its removal.
 
 ---
 
