@@ -502,6 +502,100 @@ def test_large_nested_byte_budget_batching(tmp_path, monkeypatch):
     assert got.equals(table)
 
 
+def test_scanner_leak_signature_and_arrow_rs_avoids_it(tmp_path, monkeypatch):
+    """Reproduce the PyArrow accumulation behind ray#49158 / apache/arrow#39808 and
+    show the arrow-rs reader sidesteps it.
+
+    The reported "leak" is ``pyarrow.dataset`` ``to_batches`` (the Scanner)
+    accumulating ~the whole file in the Arrow allocator *regardless of batch_size*,
+    whereas ``pq.ParquetFile.iter_batches`` (what the V2 reader uses) holds only ~a
+    row group. We measure exactly as the issue did: ``pa.total_allocated_bytes()``
+    tracked as a running max across the batch iteration.
+
+    The arrow-rs reader decodes in Rust and hands batches across a zero-copy FFI
+    boundary, so decoded data never enters the Arrow allocator at all — its
+    Arrow-side peak is ~0, categorically below the row-group floor iter_batches
+    pays. (This asserts Arrow-allocator accumulation only, which is deterministic;
+    the Rust working set is invisible here and is validated by RSS/USS in the
+    bench suite. It is a regression guard: the pyarrow tiers must stay ordered and
+    arrow-rs must not start buffering decoded data on the Arrow side.)
+    """
+    import pyarrow.dataset as pds
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers import (
+        arrow_rs_parquet_file_reader as reader_mod,
+    )
+
+    # 800k rows of fat strings split into many small row groups, so "whole file"
+    # (to_batches) and "one row group" (iter_batches) are clearly different scales.
+    n = 800_000
+    rng = np.random.default_rng(0)
+    cols = {"id": pa.array(np.arange(n, dtype=np.int64))}
+    for i in range(4):
+        cols[f"s{i}"] = pa.array(
+            [f"val-{rng.integers(0, 10**6)}-{'x' * 8}" for _ in range(n)]
+        )
+    table = pa.table(cols)
+    file_mb = table.nbytes / 1024 / 1024
+    path = tmp_path / "leaky.parquet"
+    pq.write_table(
+        table,
+        str(path),
+        row_group_size=50_000,
+        write_page_index=True,
+        compression="snappy",
+    )
+    n_rg = pq.ParquetFile(str(path)).num_row_groups
+    assert n_rg >= 8  # need many groups for file-scale vs row-group-scale to differ
+    del table, cols
+    import gc
+
+    gc.collect()
+
+    def _peak_mb(make_iter):
+        """Max Arrow-allocator bytes held at once across the iteration (MB) — the
+        issue's own metric. Baseline-subtracted so unrelated allocations don't
+        count; each batch is dropped so only what the reader *retains* is seen."""
+        base = pa.total_allocated_bytes()
+        mx = 0
+        for batch in make_iter():
+            mx = max(mx, pa.total_allocated_bytes() - base)
+            del batch
+        return mx / 1024 / 1024
+
+    def _fragment():
+        return next(pds.dataset(str(path), format="parquet").get_fragments())
+
+    # (1) Scanner/to_batches accumulates ~the whole file, and does NOT shrink with
+    #     batch_size — the leak signature.
+    to_small = _peak_mb(lambda: _fragment().to_batches(batch_size=256))
+    to_big = _peak_mb(lambda: _fragment().to_batches(batch_size=2048))
+    assert to_small > 0.4 * file_mb, (to_small, file_mb)
+    assert abs(to_small - to_big) < 0.3 * to_small, (to_small, to_big)
+
+    # (2) ParquetFile.iter_batches (the V2 read path) holds only ~a row group —
+    #     materially below to_batches. Better, but still a whole-row-group floor.
+    it_small = _peak_mb(lambda: pq.ParquetFile(str(path)).iter_batches(batch_size=256))
+    assert it_small < 0.6 * to_small, (it_small, to_small)
+
+    # (3) arrow-rs: decoded data is Rust-owned and crosses via zero-copy FFI, so ~0
+    #     lands in the Arrow allocator — below even the row-group floor.
+    monkeypatch.setattr(reader_mod, "_ARROW_RS_DECODE_BUDGET_BYTES", 1024 * 1024)
+    reader = reader_mod.ArrowRsParquetFileReader(
+        filesystem=LocalFileSystem(), target_block_size=128 * 1024 * 1024
+    )
+    dataset = pds.dataset(str(path), format="parquet", filesystem=LocalFileSystem())
+    frag = next(dataset.get_fragments())
+    scanner_kwargs = {
+        "columns": None,
+        "filter": None,
+        "batch_size": reader._resolve_batch_size(dataset),
+    }
+    rs_peak = _peak_mb(lambda: reader._iter_fragment_tables(frag, scanner_kwargs))
+    assert rs_peak < 0.5 * it_small, (rs_peak, it_small)
+
+
 def test_falls_back_for_map_and_nested_extension(tmp_path, restore_ctx):
     """Map columns, and extension types hiding INSIDE nesting, stay gated: the
     recursive type check must reject them anywhere in the type tree."""
