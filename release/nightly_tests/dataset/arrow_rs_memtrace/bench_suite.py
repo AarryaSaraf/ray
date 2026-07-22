@@ -122,11 +122,10 @@ def _fresh_session(
     ctx.use_datasource_v2 = True
     ctx.use_arrow_rs_parquet_reader = reader == "arrow_rs"
     ctx.execution_options.preserve_order = True  # so parity hashes are comparable
-    # Record Ray's own per-task memory expectation next to the traces, so the
-    # per-task graphs (task_mem.py) can draw it as the reference line. This is
-    # NOT a number we chose: context.py:44 justifies the default block size with
-    # "memory footprint will be about 2 * num_cpus * target_max_block_size",
-    # i.e. 2 x target_max_block_size per task.
+    # Record the run's config knobs next to the traces (target block size, decode
+    # budget, S3 fetch window). These are descriptive metadata for the figures and
+    # summary CSV — the per-task graph's only reference line is the MEASURED
+    # warm-worker floor (task_mem.py), not an estimate built from these.
     _write_meta(
         trace_dir,
         {
@@ -161,14 +160,11 @@ def _note_fixture(trace_dir, path):
 
     The geometry is written to meta.json (read by task_mem.py / summarize.py for
     figure subtitles) AND cached in ``_GEOM[trace_dir]`` so the axis can attach it
-    to its result row via :func:`_R` (→ summary.csv columns). It also feeds the
-    per-task *expected-without-decode* line:
-
-        floor (measured at task entry) + compressed-bytes-in-flight + output block
-
-    Everything a well-behaved task holds EXCEPT the decode working set — how far a
-    task's line rises above this is its decode working set. compressed-in-flight is
-    ``max_rg_comp_mb`` for whole-group readers (PyArrow, and arrow-rs local K=1).
+    to its result row via :func:`_R` (→ summary.csv columns). ``max_rg_comp_mb``
+    (the largest row group's on-disk size) appears in the figure subtitle so the
+    reader can see how much a whole-group reader must materialize — but it is NOT
+    used to synthesize a reference line; the per-task graph's only reference is the
+    measured warm-worker floor (task_mem.py).
     Best-effort: local paths, dirs, and s3:// URIs all work via pyarrow.dataset;
     failure just skips the line and leaves the geometry empty."""
     geom = {"fixture": str(path)}

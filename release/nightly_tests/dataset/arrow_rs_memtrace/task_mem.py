@@ -1,29 +1,33 @@
 """THE memory graph of record: per-task absolute USS over time, one figure per
-benchmark config, both readers overlaid, against each reader's measured
-*expected-without-decode* line.
+benchmark config, both readers overlaid, against the ideal-streaming-reader line.
 
-What each figure shows (graphs only — no scalars, no baseline subtraction):
+What each figure shows:
 
   * one line per READ TASK: the executing worker's ABSOLUTE USS, sampled at
     5 ms, clipped to that task's [t_start, t_end] window and aligned so every
-    task starts at x=0. Red = pyarrow tasks, blue = arrow_rs tasks.
-  * one dashed line per reader: everything a well-behaved task is expected to
-    hold EXCEPT the decode working set —
+    task starts at x=0. Red = pyarrow tasks, blue = arrow_rs tasks. These are
+    measured.
+  * one dashed reference line: the ideal streaming reader —
 
-        expected = floor + compressed-in-flight + output block
+        ideal = floor + one output block (target_max_block_size)
 
-    floor      = the worker's USS entering the task (measured: median of the
-                 task lines' starting levels — imports + warm retained heap).
-    in-flight  = the compressed bytes the reader must buffer: the fixture's
-                 largest row group's compressed size (recorded in meta.json by
-                 bench_suite._note_fixture) for whole-group readers (PyArrow,
-                 arrow-rs local K=1); capped at fetch_window_mb for the
-                 arrow-rs windowed S3 path.
-    block      = target_max_block_size (the output block being assembled in
-                 heap before it is yielded to plasma).
+    floor = the MEASURED USS a worker already holds ENTERING the task (imports +
+            warm retained heap), median of both readers' task-start levels.
+    block = target_max_block_size, the one output block Ray coalesces in the
+            worker before sealing it to plasma.
 
-    How far a task's line towers ABOVE its dashed line is that reader's decode
-    working set — the unaccounted, layout-dependent heap that causes the OOMs.
+    Why this and not something else. The reference must be DECODER-INDEPENDENT —
+    what a *perfect* streaming reader would peak at, not what a given reader
+    happens to do. A perfect reader reads compressed bytes off disk (OS page
+    cache, file-backed → not USS), decodes them in small bounded batches (a few
+    MB → second-order), and streams output out; its one irreducible PRIVATE cost
+    is the output block being assembled before handoff to plasma. That block
+    size is a Ray property, identical for both readers, and — the whole point —
+    FLAT in row-group size. It deliberately excludes the whole compressed row
+    group (that is PyArrow's limitation, not a requirement) and the decoded
+    group. So how far each reader towers ABOVE this line is the private memory it
+    holds BEYOND an ideal streaming reader: for PyArrow ~the whole row group; for
+    arrow-rs whatever it over-buffers (block coalescing + allocator retention).
 
 Why absolute USS: the kernel OOM killer and Ray's memory monitor act on
 absolute private memory; USS excludes shared pages (plasma), the part Ray's
@@ -54,8 +58,8 @@ FIG = DEFAULT_FIG
 MB = 1024 * 1024
 
 COLORS = {"pyarrow": "#c0392b", "arrow_rs": "#2471a3"}
-EXPECTED_COLOR = "#333333"  # the single reference line, reader-neutral
-DEFAULT_BLOCK_MB = 128.0  # target_max_block_size default, used if meta lacks it
+EXPECTED_COLOR = "#333333"  # the single reference line (ideal streaming reader)
+DEFAULT_BLOCK_MB = 128.0  # target_max_block_size fallback if meta lacks it
 
 
 def _point_latest(run_dir):
@@ -164,36 +168,6 @@ def _task_series(run_dir):
     return out
 
 
-def _expected_line(metas, floor_mb):
-    """The SINGLE reference line, shared by both readers:
-
-        expected w/o decode = floor + whole-row-group-compressed + output block
-
-    One line, not one per reader: floor (imports + warm heap) is equalized across
-    readers by the worker hook, and the in-flight compressed bytes + output block
-    are properties of the fixture, not the reader. So the meaningful comparison is
-    how far EACH reader's task lines rise above this one common bar — that gap is
-    the decode working set. (The arrow-rs windowed S3 path holds even less than the
-    whole row group in flight, so its lines can sit BELOW the bar — a visible win,
-    not a reason for a second line.) Returns (e, floor, in_flight, block) or None
-    if no meta carries the row-group size (old runs predating _note_fixture)."""
-    comp = next(
-        (m.get("max_rg_comp_mb") for m in metas if m.get("max_rg_comp_mb") is not None),
-        None,
-    )
-    if comp is None or floor_mb is None:
-        return None
-    block = next(
-        (
-            m.get("target_block_mb")
-            for m in metas
-            if m.get("target_block_mb") is not None
-        ),
-        DEFAULT_BLOCK_MB,
-    )
-    return floor_mb + comp + block, floor_mb, comp, block
-
-
 def _plot_pair(config, dirs_by_reader):
     import matplotlib
 
@@ -224,31 +198,37 @@ def _plot_pair(config, dirs_by_reader):
             )
             entry_levels.append(ys[0])
 
-    # ONE reference line (see _expected_line): floor measured across BOTH readers.
+    # ONE reference line: the ideal streaming reader — measured warm floor plus
+    # ONE output block. Decoder-independent (target_max_block_size is a Ray
+    # property, identical for both readers) and FLAT in row-group size. See the
+    # module docstring for why this, not the floor and not floor+compressed.
     floor = statistics.median(entry_levels) if entry_levels else None
-    exp = _expected_line(metas, floor)
-    if exp is not None:
-        e, fl, infl, blk = exp
+    if floor is not None:
+        block = next(
+            (m["target_block_mb"] for m in metas if m.get("target_block_mb")),
+            DEFAULT_BLOCK_MB,
+        )
+        ideal = floor + block
         ax.axhline(
-            e,
+            ideal,
             color=EXPECTED_COLOR,
             ls="--",
             lw=1.8,
             label=(
-                f"expected w/o decode = {e:.0f} MB "
-                f"(floor {fl:.0f} + in-flight {infl:.0f} + block {blk:.0f})"
+                f"ideal streaming reader = {ideal:.0f} MB "
+                f"(floor {floor:.0f} + 1 block {block:.0f})"
             ),
         )
         for reader, tasks in tasks_by_reader.items():
             peaks = [max(ys) for _, _, ys in tasks]
             if peaks:
-                over[reader] = max(p - e for p in peaks)
+                over[reader] = max(p - ideal for p in peaks)
 
     ax.set_xlabel("seconds since task start")
     ax.set_ylabel("worker USS during task (MB, absolute)")
     subtitle = next((_describe(m) for m in metas if _describe(m)), "")
     ax.set_title(
-        f"per-task memory over time vs expected-without-decode — {config}"
+        f"per-task memory over time vs ideal streaming reader — {config}"
         + (f"\n{subtitle}" if subtitle else ""),
         fontsize=10,
     )
@@ -261,7 +241,7 @@ def _plot_pair(config, dirs_by_reader):
     plt.close(fig)
     tag = "  ".join(f"{r}:{n} tasks" for r, n in counts.items())
     if over:
-        tag += "   decode overshoot above the bar: " + "  ".join(
+        tag += "   peak USS above ideal: " + "  ".join(
             f"{r}:{o:+.0f}MB" for r, o in over.items()
         )
     print(f"wrote {out}   ({tag})")

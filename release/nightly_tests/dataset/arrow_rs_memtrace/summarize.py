@@ -840,7 +840,7 @@ def main():
     # line, one figure per config, both readers overlaid (task_mem.py). Built
     # from the tasks_*.csv + uss_*.csv already on disk (no re-run needed).
     print(
-        f"\n## MEMORY GRAPHS (per-task USS vs expected-without-decode -> {FIG}/task_mem/)"
+        f"\n## MEMORY GRAPHS (per-task USS vs ideal streaming reader -> {FIG}/task_mem/)"
     )
     try:
         task_mem.FIG = os.path.join(FIG, "task_mem")  # same per-run dir
