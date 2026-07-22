@@ -337,6 +337,86 @@ def test_nested_column_native_parity(tmp_path, restore_ctx, colname, builder):
     assert pa_tbl.equals(rs_tbl)
 
 
+def test_large_nested_byte_budget_batching(tmp_path, monkeypatch):
+    """A LARGE nested read (variable-length lists + struct-of-string, decoded
+    size many times the decode budget, one lone row group) must stream through
+    the byte-budget path as many small batches — not one giant table — while
+    staying byte-identical and in row order.
+
+    The small parity tests (2k rows) fit in a single budget batch, so they never
+    prove the batching math holds for nested types, where the footer's
+    bytes-per-row estimate is coarser than for flat columns. The budget is
+    shrunk to 1 MiB via monkeypatch (it's a module global read at call time), so
+    this must run the reader in-process rather than through Ray workers.
+    """
+    import pyarrow.dataset as pds
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers import (
+        arrow_rs_parquet_file_reader as reader_mod,
+    )
+
+    n = 200_000
+    rng = np.random.default_rng(0)
+    # Variable-length list<int64> (avg ~6 elems, some empty) + struct{int, str}.
+    lens = rng.integers(0, 12, n)
+    offsets = np.zeros(n + 1, dtype=np.int32)
+    np.cumsum(lens, out=offsets[1:])
+    values = pa.array(rng.integers(0, 10**9, offsets[-1]), type=pa.int64())
+    table = pa.table(
+        {
+            "id": pa.array(np.arange(n, dtype=np.int64)),
+            "vals": pa.ListArray.from_arrays(pa.array(offsets), values),
+            "st": pa.StructArray.from_arrays(
+                [
+                    pa.array(np.arange(n, dtype=np.int64)),
+                    pa.array([f"payload-string-{i:012d}" for i in range(n)]),
+                ],
+                names=["a", "b"],
+            ),
+        }
+    )
+    path = tmp_path / "large_nested.parquet"
+    # One row group covering all rows: the whole decode must be paced by the
+    # byte budget, with no row-group boundaries helping out.
+    pq.write_table(table, str(path), write_page_index=True, row_group_size=n)
+    assert pq.ParquetFile(str(path)).num_row_groups == 1
+
+    budget = 1024 * 1024
+    monkeypatch.setattr(reader_mod, "_ARROW_RS_DECODE_BUDGET_BYTES", budget)
+    assert table.nbytes > 10 * budget  # "large": decoded size >> budget
+
+    calls = {"n": 0}
+    orig = ray_data_arrow_rs.read_row_groups
+
+    def wrapped(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(ray_data_arrow_rs, "read_row_groups", wrapped)
+    reader = reader_mod.ArrowRsParquetFileReader(
+        filesystem=LocalFileSystem(), target_block_size=128 * 1024 * 1024
+    )
+    dataset = pds.dataset(str(path), format="parquet", filesystem=LocalFileSystem())
+    fragment = next(dataset.get_fragments())
+    scanner_kwargs = {
+        "columns": None,
+        "filter": None,
+        "batch_size": reader._resolve_batch_size(dataset),
+    }
+    batches = list(reader._iter_fragment_tables(fragment, scanner_kwargs))
+
+    assert calls["n"] > 0, "native read_row_groups was not called (fell back)"
+    # Streaming, not slurping: many batches, each near the budget (generous 8x
+    # slack because the crate sizes rows from the footer's bytes-per-row, which
+    # is approximate for variable-width nested data).
+    assert len(batches) >= 5, f"expected many budget batches, got {len(batches)}"
+    assert max(b.nbytes for b in batches) <= 8 * budget
+    got = pa.concat_tables(batches)
+    # In-order and byte-identical (no sort: order is part of the contract).
+    assert got.equals(table)
+
+
 def test_falls_back_for_map_and_nested_extension(tmp_path, restore_ctx):
     """Map columns, and extension types hiding INSIDE nesting, stay gated: the
     recursive type check must reject them anywhere in the type tree."""
