@@ -23,37 +23,11 @@ object_store = { version = "0.13", features = ["aws"] }
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
-anyhow = "1"
 
-# --------------------------------------------------------------------------- #
-# Allocator A/B (memory parity on Linux).
-#
-# The default build uses the system allocator (glibc ptmalloc on Linux). Under a
-# multi-threaded decode (tokio workers + K decode threads) ptmalloc spins up many
-# per-thread arenas that RETAIN freed chunks, so node-summed peak RSS looks worse
-# than PyArrow's even when our true working set is smaller (Agents.md §7.8, the
-# rg_50k finding). PyArrow bundles jemalloc with page decay, so it releases.
-#
-# Two levers, both validated on the Linux run (neither testable on macOS):
-#   * `--features jemalloc`  — swap the global allocator to jemalloc (the SAME
-#     allocator PyArrow uses → a fair fight), tuned for prompt page release via
-#     `_RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000`.
-#     Preferred over mimalloc, which segfaulted the workers when used as the
-#     cdylib global allocator across the Arrow C-stream FFI boundary (§7.8).
-#   * default build + `MALLOC_ARENA_MAX=2` in the worker env — caps ptmalloc
-#     arenas, the no-code, zero-segfault-risk baseline (set by the harness).
-# --------------------------------------------------------------------------- #
-[features]
-mimalloc = ["dep:mimalloc"]
-jemalloc = ["dep:tikv-jemallocator"]
-
-[dependencies.mimalloc]
-version = "0.1"
-optional = true
-
-[dependencies.tikv-jemallocator]
-version = "0.6"
-optional = true
+# No optional allocator features: an allocator-retention theory was tested and
+# disproven (Agents.md §3.5.1/§7.8) — the system allocator is correct here, and
+# mimalloc-as-global-allocator segfaulted Ray workers across the FFI boundary.
+# Allocator A/B experiments use LD_PRELOAD, which needs no crate support.
 
 [profile.release]
 opt-level = 3

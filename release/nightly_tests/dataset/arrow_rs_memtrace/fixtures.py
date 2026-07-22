@@ -179,9 +179,11 @@ SCHEMA_BUILDERS = {
     "canonical_tensor": _canonical_tensor,
 }
 
-# Schemas the native arrow-rs path is expected to handle (flat, non-extension).
-# Everything else should fall back to PyArrow.
-NATIVE_SCHEMAS = {"int", "float", "wide_str", "large_str", "huge_str"}
+# Schemas the native arrow-rs path is expected to handle: flat types plus
+# struct/list nesting (ungated 2026-07-21). Extension types (both tensor
+# flavors) still fall back to PyArrow.
+NATIVE_SCHEMAS = {"int", "float", "wide_str", "large_str", "huge_str",
+                  "struct", "list"}
 
 
 def _write_mixed_row_groups(table, path, sizes, filesystem=None):
@@ -232,10 +234,12 @@ def make_fixture(name, spec):
     return uri
 
 
-def make_mixed_fixture(name="mixed6_struct", per=400_000):
-    """The heterogeneous 6-file dataset (5 native schemas + 1 struct fallback) in one
-    dir, location-aware like make_fixture. Used by axis_mixed; kept here so it goes to
-    S3 with the rest of the suite instead of writing straight to the local ./data."""
+def make_mixed_fixture(name="mixed7_tensor", per=400_000):
+    """The heterogeneous 7-file dataset in one dir: 6 native schemas (struct is
+    native since the 2026-07-21 ungate) + 1 ray_tensor file, which is still
+    extension-gated — so the axis keeps proving that a mixed dataset routes
+    native and fallback files correctly in ONE read. Location-aware like
+    make_fixture; kept here so it goes to S3 with the rest of the suite."""
     fs, path, uri = _fixture_uri(name)
     if _has_parquet(fs, path):
         return uri
@@ -243,7 +247,8 @@ def make_mixed_fixture(name="mixed6_struct", per=400_000):
         os.makedirs(path, exist_ok=True)
     rng = np.random.default_rng(0)
     specs = [("int", _ints), ("float", _floats), ("wide_str", _wide_str),
-             ("large_str", _large_str), ("huge_str", _huge_str), ("struct", _struct)]
+             ("large_str", _large_str), ("huge_str", _huge_str), ("struct", _struct),
+             ("ray_tensor", _ray_tensor)]
     for i, (nm, build) in enumerate(specs):
         tbl = pa.table(build(rng, per))
         pq.write_table(tbl, f"{path}/part-{i:04d}_{nm}.parquet", row_group_size=per,

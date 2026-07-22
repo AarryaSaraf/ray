@@ -190,44 +190,102 @@ def test_native_path_actually_runs(tmp_path):
     assert got.sort_by("id").equals(table.sort_by("id"))
 
 
-def test_falls_back_for_nested_column(tmp_path, restore_ctx):
-    """A nested column is unsupported by the native path; the read must fall
-    back to PyArrow and stay correct."""
-    path = tmp_path / "nested.parquet"
-    table = pa.table(
-        {
-            "id": pa.array(np.arange(1000, dtype=np.int64)),
-            "vals": pa.array([[i, i + 1] for i in range(1000)]),
-        }
+def test_filter_pushdown_prunes_row_groups(tmp_path, restore_ctx):
+    """A pushed-down predicate must prune row groups via footer statistics
+    BEFORE the crate fetches/decodes them (mirroring the PyArrow path's
+    ``fragment.subset``). On a sorted ``id`` over 4 row groups, ``id >= 3000``
+    must reach the crate as ``row_groups=[3]``; a predicate no row group can
+    satisfy must not call the crate at all. Results stay byte-correct."""
+    import pyarrow.dataset as pds
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
     )
-    pq.write_table(table, str(path), write_page_index=True)
 
-    pa_tbl = _read_sorted(path, False, restore_ctx)
-    rs_tbl = _read_sorted(path, True, restore_ctx)
-    assert pa_tbl.equals(rs_tbl)
-
-
-def test_falls_back_for_struct_column(tmp_path, restore_ctx):
-    """A struct column (the workload called out for the mixed-schema benchmark,
-    Agents.md §5.5) is nested → the native gate rejects it and the read falls
-    back to PyArrow, staying byte-identical. Complements the S3 struct test."""
-    path = tmp_path / "struct.parquet"
-    n = 2000
+    path = tmp_path / "sorted.parquet"
+    n = 4000
     table = pa.table(
         {
             "id": pa.array(np.arange(n, dtype=np.int64)),
-            "st": pa.StructArray.from_arrays(
-                [pa.array(np.arange(n)), pa.array(np.arange(n) * 0.5)],
-                names=["a", "b"],
-            ),
+            "x": pa.array(np.arange(n) * 0.5),
         }
     )
-    pq.write_table(table, str(path), write_page_index=True)
+    pq.write_table(table, str(path), write_page_index=True, row_group_size=1000)
 
-    pa_tbl = _read_sorted(path, False, restore_ctx)
-    rs_tbl = _read_sorted(path, True, restore_ctx)
+    seen = []
+    orig = ray_data_arrow_rs.read_row_groups
+
+    def wrapped(path_, row_groups, *a, **k):
+        seen.append(row_groups)
+        return orig(path_, row_groups, *a, **k)
+
+    reader = ArrowRsParquetFileReader(
+        filesystem=LocalFileSystem(), target_block_size=128 * 1024 * 1024
+    )
+    dataset = pds.dataset(str(path), format="parquet", filesystem=LocalFileSystem())
+    fragment = next(dataset.get_fragments())
+    batch_size = reader._resolve_batch_size(dataset)
+
+    ray_data_arrow_rs.read_row_groups = wrapped
+    try:
+        got = pa.concat_tables(
+            list(
+                reader._iter_fragment_tables(
+                    fragment,
+                    {
+                        "columns": None,
+                        "filter": pds.field("id") >= 3000,
+                        "batch_size": batch_size,
+                    },
+                )
+            )
+        )
+        pruned_all = list(
+            reader._iter_fragment_tables(
+                fragment,
+                {
+                    "columns": None,
+                    "filter": pds.field("id") >= 10**9,
+                    "batch_size": batch_size,
+                },
+            )
+        )
+    finally:
+        ray_data_arrow_rs.read_row_groups = orig
+
+    assert seen == [[3]], f"stats pruning didn't reach the crate: {seen}"
+    assert got.sort_by("id").equals(table.slice(3000))
+    assert pruned_all == [] and len(seen) == 1, "fully-pruned fragment hit the crate"
+
+
+def test_filter_pushdown_e2e_parity(tmp_path, restore_ctx):
+    """``ds.filter(expr=...)`` goes through the PredicatePushdown rule into the
+    read; both readers must agree (and match ground truth) on a sorted
+    multi-row-group file where pruning actually kicks in."""
+    path = tmp_path / "sorted_e2e.parquet"
+    n = 4000
+    table = pa.table(
+        {
+            "id": pa.array(np.arange(n, dtype=np.int64)),
+            "x": pa.array(np.arange(n) * 0.5),
+        }
+    )
+    pq.write_table(table, str(path), write_page_index=True, row_group_size=1000)
+
+    def _read(use_arrow_rs):
+        restore_ctx.use_arrow_rs_parquet_reader = use_arrow_rs
+        ds = ray.data.read_parquet(str(path)).filter(expr="id >= 3500")
+        return pa.Table.from_pandas(ds.to_pandas()).sort_by("id")
+
+    pa_tbl = _read(False)
+    rs_tbl = _read(True)
+    assert pa_tbl.num_rows == rs_tbl.num_rows == 500
     assert pa_tbl.equals(rs_tbl)
-    # And the gate must classify it as unsupported (routed to fallback).
+
+
+def _gate_verdict(path, read_columns=None):
+    """The support gate's verdict for a file, via a real fragment."""
     import pyarrow.dataset as pds
     from pyarrow.fs import LocalFileSystem
 
@@ -241,7 +299,80 @@ def test_falls_back_for_struct_column(tmp_path, restore_ctx):
             str(path), format="parquet", filesystem=LocalFileSystem()
         ).get_fragments()
     )
-    assert reader._arrow_rs_supported(frag, None) is False
+    return reader._arrow_rs_supported(frag, read_columns)
+
+
+@pytest.mark.parametrize(
+    "colname,builder",
+    [
+        ("vals", lambda n: pa.array([[i, i + 1, None] for i in range(n)])),
+        (
+            "st",
+            lambda n: pa.StructArray.from_arrays(
+                [pa.array(np.arange(n)), pa.array(np.arange(n) * 0.5)],
+                names=["a", "b"],
+            ),
+        ),
+        (
+            "st_nested",
+            lambda n: pa.array(
+                [{"a": [i, i + 1], "b": {"c": f"row-{i}"}} for i in range(n)]
+            ),
+        ),
+    ],
+)
+def test_nested_column_native_parity(tmp_path, restore_ctx, colname, builder):
+    """List, struct, and deeper struct/list nesting decode NATIVELY (the gate
+    admits them) and stay byte-identical to PyArrow."""
+    path = tmp_path / f"{colname}.parquet"
+    n = 2000
+    table = pa.table(
+        {"id": pa.array(np.arange(n, dtype=np.int64)), colname: builder(n)}
+    )
+    pq.write_table(table, str(path), write_page_index=True)
+
+    assert _gate_verdict(path) is True, f"{colname} should be native now"
+    pa_tbl = _read_sorted(path, False, restore_ctx)
+    rs_tbl = _read_sorted(path, True, restore_ctx)
+    assert pa_tbl.equals(rs_tbl)
+
+
+def test_falls_back_for_map_and_nested_extension(tmp_path, restore_ctx):
+    """Map columns, and extension types hiding INSIDE nesting, stay gated: the
+    recursive type check must reject them anywhere in the type tree."""
+    n = 500
+    # Map column → fallback (still correct end-to-end).
+    map_path = tmp_path / "map.parquet"
+    map_table = pa.table(
+        {
+            "id": pa.array(np.arange(n, dtype=np.int64)),
+            "m": pa.array(
+                [[(f"k{i}", i)] for i in range(n)],
+                type=pa.map_(pa.string(), pa.int64()),
+            ),
+        }
+    )
+    pq.write_table(map_table, str(map_path), write_page_index=True)
+    assert _gate_verdict(map_path) is False
+    pa_tbl = _read_sorted(map_path, False, restore_ctx)
+    rs_tbl = _read_sorted(map_path, True, restore_ctx)
+    assert pa_tbl.equals(rs_tbl)
+
+    # Extension type nested inside a struct → the recursive check must catch it
+    # (a top-level-only check would let it slip through to the crate).
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        _arrow_rs_type_supported,
+    )
+
+    tensor = pa.fixed_shape_tensor(pa.float32(), [2])
+    assert _arrow_rs_type_supported(pa.struct([("t", tensor)])) is False
+    assert _arrow_rs_type_supported(pa.list_(tensor)) is False
+    assert (
+        _arrow_rs_type_supported(
+            pa.struct([("a", pa.int64()), ("b", pa.list_(pa.string()))])
+        )
+        is True
+    )
 
 
 def test_falls_back_for_canonical_extension(tmp_path, restore_ctx):
@@ -286,8 +417,8 @@ def test_falls_back_for_canonical_extension(tmp_path, restore_ctx):
 
 
 def test_arrow_rs_supported_gate(tmp_path):
-    """Unit-check the fallback gate: local flat = supported; nested / non-local
-    = unsupported."""
+    """Unit-check the fallback gate: local flat AND struct/list = supported;
+    nested projection / empty projection / non-local = unsupported."""
     import pyarrow.dataset as pds
     from pyarrow.fs import LocalFileSystem
 
@@ -319,8 +450,10 @@ def test_arrow_rs_supported_gate(tmp_path):
     assert reader._arrow_rs_supported(flat_frag, ["id", "x"]) is True
     # Empty projection → fall back.
     assert reader._arrow_rs_supported(flat_frag, []) is False
-    # Nested column → fall back.
-    assert reader._arrow_rs_supported(nested_frag, None) is False
+    # List column → native (ungated 2026-07-21).
+    assert reader._arrow_rs_supported(nested_frag, None) is True
+    # Nested-column projection (dotted name) → fall back.
+    assert reader._arrow_rs_supported(nested_frag, ["v.item"]) is False
 
     # Unknown filesystem (neither local nor S3) → fall back.
     reader_no_fs = ArrowRsParquetFileReader(filesystem=None)
@@ -493,9 +626,9 @@ def test_arrow_rs_s3_kspilt_windowed_order(s3_fs, s3_path, k):
     assert got["id"].to_pylist() == list(range(n))
 
 
-def test_arrow_rs_s3_struct_falls_back(s3_fs, s3_path, restore_ctx):
-    """A struct column over S3 must route to PyArrow fallback and stay correct —
-    the gate applies on S3 exactly as it does locally."""
+def test_arrow_rs_s3_struct_parity(s3_fs, s3_path, restore_ctx):
+    """A struct column over S3 decodes natively (the gate admits struct now,
+    on S3 exactly as it does locally) and stays byte-identical to PyArrow."""
     table = pa.table(
         {
             "id": pa.array(np.arange(2000, dtype=np.int64)),

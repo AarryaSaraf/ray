@@ -1,28 +1,36 @@
-"""THE memory graph of record: per-task absolute USS over time vs Ray's own
-per-task expectation, one figure per benchmark config, both readers overlaid.
+"""THE memory graph of record: per-task absolute USS over time, one figure per
+benchmark config, both readers overlaid, against each reader's measured
+*expected-without-decode* line.
 
-What each figure shows (and the whole metric — no scalars, no baselines):
+What each figure shows (graphs only — no scalars, no baseline subtraction):
 
   * one line per READ TASK: the executing worker's ABSOLUTE USS, sampled at
     5 ms, clipped to that task's [t_start, t_end] window and aligned so every
     task starts at x=0. Red = pyarrow tasks, blue = arrow_rs tasks.
-  * a dashed black line at Ray's expectation E = 2 x target_max_block_size —
-    Ray's OWN provisioning assumption (context.py:44: "memory footprint will
-    be about 2 * num_cpus * target_max_block_size"), recorded per run in
-    meta.json by bench_suite, not chosen by us.
+  * one dashed line per reader: everything a well-behaved task is expected to
+    hold EXCEPT the decode working set —
 
-Why absolute USS is what the task "actually has": the kernel OOM killer and
-Ray's memory monitor act on absolute process memory, so imports, warmup
-retention and the decode working set all count — for both readers equally.
-USS excludes shared pages (the plasma object store), which is the one part of
-task memory Ray's admission gate DOES account. Task windows come from the
-worker hook's FileReader.read patch (one row per read task, both readers);
-Ray workers run one task at a time, so a window's samples belong to exactly
-that task. Warmup-read tasks are excluded via meta.json's warm_end stamp.
+        expected = floor + compressed-in-flight + output block
 
-Reading the figure: lines that stay at/below the dashed E are tasks behaving
-as Ray schedules for; lines that tower over it are the hidden decode heap
-that causes the OOMs we're trying to remove.
+    floor      = the worker's USS entering the task (measured: median of the
+                 task lines' starting levels — imports + warm retained heap).
+    in-flight  = the compressed bytes the reader must buffer: the fixture's
+                 largest row group's compressed size (recorded in meta.json by
+                 bench_suite._note_fixture) for whole-group readers (PyArrow,
+                 arrow-rs local K=1); capped at fetch_window_mb for the
+                 arrow-rs windowed S3 path.
+    block      = target_max_block_size (the output block being assembled in
+                 heap before it is yielded to plasma).
+
+    How far a task's line towers ABOVE its dashed line is that reader's decode
+    working set — the unaccounted, layout-dependent heap that causes the OOMs.
+
+Why absolute USS: the kernel OOM killer and Ray's memory monitor act on
+absolute private memory; USS excludes shared pages (plasma), the part Ray's
+object-store accounting already covers. Task windows come from the worker
+hook's FileReader.read patch; Ray workers run one task at a time, so a
+window's samples belong to exactly that task. Warmup-read tasks are excluded
+via meta.json's warm_end stamp.
 
 Usage:
   python task_mem.py            # every runs/<dir> pair that has tasks_*.csv
@@ -33,6 +41,7 @@ import csv
 import glob
 import json
 import os
+import statistics
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -41,7 +50,7 @@ FIG = os.path.join(HERE, "figs", "task_mem")
 MB = 1024 * 1024
 
 COLORS = {"pyarrow": "#c0392b", "arrow_rs": "#2471a3"}
-DEFAULT_EXPECTED_MB = 256.0  # 2 x 128 MiB default target_max_block_size
+DEFAULT_BLOCK_MB = 128.0  # target_max_block_size default, used if meta lacks it
 
 
 def _meta(run_dir):
@@ -107,6 +116,25 @@ def _task_series(run_dir):
     return out
 
 
+def _expected_mb(meta, floor_mb):
+    """floor + compressed-in-flight + output block, or None if the run's meta
+    predates _note_fixture (old runs: no line rather than a made-up one)."""
+    comp = meta.get("max_rg_comp_mb")
+    if comp is None or floor_mb is None:
+        return None
+    block = meta.get("target_block_mb", DEFAULT_BLOCK_MB)
+    in_flight = comp
+    # The windowed S3 path caps compressed bytes in flight at the fetch window;
+    # local (and PyArrow anywhere) buffers the whole row group's compressed bytes.
+    if (
+        meta.get("reader") == "arrow_rs"
+        and str(meta.get("fixture", "")).startswith("s3://")
+        and meta.get("fetch_window_mb")
+    ):
+        in_flight = min(comp, float(meta["fetch_window_mb"]))
+    return floor_mb + in_flight + block, floor_mb, in_flight, block
+
+
 def _plot_pair(config, dirs_by_reader):
     import matplotlib
 
@@ -115,35 +143,38 @@ def _plot_pair(config, dirs_by_reader):
 
     fig, ax = plt.subplots(figsize=(10, 5.2))
     counts = {}
-    expected = {}
+    over = {}
     for reader, run_dir in dirs_by_reader.items():
-        expected[reader] = _meta(run_dir).get("expected_task_mb", DEFAULT_EXPECTED_MB)
+        meta = _meta(run_dir)
         tasks = _task_series(run_dir)
         counts[reader] = len(tasks)
         alpha = max(0.15, min(0.85, 6.0 / max(1, len(tasks))))
         for i, (_t0, xs, ys) in enumerate(sorted(tasks)):
             ax.plot(xs, ys, color=COLORS[reader], lw=1.3, alpha=alpha,
                     label=f"{reader} tasks (n={len(tasks)})" if i == 0 else None)
-    evals = set(expected.values())
-    if len(evals) <= 1:
-        e = next(iter(evals), DEFAULT_EXPECTED_MB)
-        ax.axhline(e, color="black", ls="--", lw=1.8,
-                   label=f"Ray expectation 2x target_max_block_size = {e:.0f} MB")
-    else:  # readers ran with different block-size configs — one line each
-        for reader, e in expected.items():
-            ax.axhline(e, color=COLORS[reader], ls="--", lw=1.8,
-                       label=f"Ray expectation ({reader}) = {e:.0f} MB")
+        floor = (statistics.median(ys[0] for _, _, ys in tasks) if tasks else None)
+        exp = _expected_mb(meta, floor)
+        if exp is not None:
+            e, fl, infl, blk = exp
+            ax.axhline(e, color=COLORS[reader], ls="--", lw=1.6,
+                       label=(f"{reader} expected w/o decode = {e:.0f} MB "
+                              f"(floor {fl:.0f} + fetch {infl:.0f} + block {blk:.0f})"))
+            peaks = [max(ys) for _, _, ys in tasks]
+            over[reader] = max(p - e for p in peaks) if peaks else 0.0
     ax.set_xlabel("seconds since task start")
     ax.set_ylabel("worker USS during task (MB, absolute)")
-    ax.set_title(f"per-task memory over time vs Ray's expectation — {config}")
+    ax.set_title(f"per-task memory over time vs expected-without-decode — {config}")
     ax.grid(alpha=0.25)
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8)
     os.makedirs(FIG, exist_ok=True)
     out = os.path.join(FIG, f"{config}.png")
     fig.tight_layout()
     fig.savefig(out, dpi=120)
     plt.close(fig)
     tag = "  ".join(f"{r}:{n} tasks" for r, n in counts.items())
+    if over:
+        tag += "   worst overshoot: " + "  ".join(
+            f"{r}:{o:+.0f}MB" for r, o in over.items())
     print(f"wrote {out}   ({tag})")
 
 

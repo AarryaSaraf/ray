@@ -112,8 +112,9 @@ def _fresh_session(reader, trace_dir, budget_bytes=8 * MB, k=1, num_cpus=4,
     # i.e. 2 x target_max_block_size per task.
     _write_meta(trace_dir, {
         "reader": reader,
-        "expected_task_mb": 2 * ctx.target_max_block_size / MB,
+        "target_block_mb": ctx.target_max_block_size / MB,
         "budget_mb": budget_bytes / MB,
+        "fetch_window_mb": fetch_window_mb,
     })
     return ctx
 
@@ -130,6 +131,39 @@ def _write_meta(trace_dir, updates):
     meta.update(updates)
     with open(p, "w") as fh:
         json.dump(meta, fh)
+
+
+def _note_fixture(trace_dir, path):
+    """Record the fixture's row-group geometry next to the traces, so task_mem.py
+    can draw the per-task *expected-without-decode* line:
+
+        floor (measured at task entry) + compressed-bytes-in-flight + output block
+
+    Everything a well-behaved task holds EXCEPT the decode working set — how far a
+    task's line rises above this is its decode working set, the part that differs
+    between readers. compressed-in-flight is `max_rg_comp_mb` for whole-group
+    readers (PyArrow, and arrow-rs local K=1); the S3 windowed path caps it at
+    `fetch_window_mb` (recorded by _fresh_session). Best-effort: local paths,
+    dirs, and s3:// URIs all work via pyarrow.dataset; failure just skips the line."""
+    try:
+        import pyarrow.dataset as pds
+
+        dset = pds.dataset(path, format="parquet")
+        max_comp = max_uncomp = 0
+        for frag in dset.get_fragments():
+            md = frag.metadata
+            for i in range(md.num_row_groups):
+                rg = md.row_group(i)
+                comp = sum(rg.column(j).total_compressed_size
+                           for j in range(rg.num_columns))
+                uncomp = rg.total_byte_size
+                max_comp = max(max_comp, comp)
+                max_uncomp = max(max_uncomp, uncomp)
+        _write_meta(trace_dir, {"fixture": str(path),
+                                "max_rg_comp_mb": max_comp / MB,
+                                "max_rg_uncomp_mb": max_uncomp / MB})
+    except Exception as e:
+        print(f"  (fixture note skipped for {path}: {type(e).__name__}: {e})")
 
 
 def consume(ds, mode, progress_path=None):
@@ -236,6 +270,7 @@ def axis_layout():
                 d = _run_dir(label)
                 _fresh_session(reader, d)
                 _warm(reader, d)
+                _note_fixture(d, path)
                 t0 = time.time()
                 rows = consume(ray.data.read_parquet(path), mode)
                 t1 = time.time(); wall = t1 - t0
@@ -268,6 +303,7 @@ def axis_schema():
             d = _run_dir(label)
             _fresh_session(reader, d)
             _warm(reader, d)
+            _note_fixture(d, path)
             t0 = time.time()
             err = None
             try:
@@ -305,6 +341,7 @@ def axis_tuning():
     d = _run_dir("tuning__pyarrow")
     _fresh_session("pyarrow", d)
     _warm("pyarrow", d)
+    _note_fixture(d, path)
     t0 = time.time(); rows = consume(ray.data.read_parquet(path), "iter_batches")
     wall = time.time() - t0; ray.shutdown(); time.sleep(0.3)
     results.append({"reader": "pyarrow", "budget_mb": None, "wall_s": wall})
@@ -313,6 +350,7 @@ def axis_tuning():
         d = _run_dir(f"tuning__arrow_rs__{budget_mb}mb")
         _fresh_session("arrow_rs", d, budget_bytes=budget_mb * MB)
         _warm("arrow_rs", d)
+        _note_fixture(d, path)
         t0 = time.time(); rows = consume(ray.data.read_parquet(path), "iter_batches")
         wall = time.time() - t0; ray.shutdown(); time.sleep(0.3)
         results.append({"reader": "arrow_rs", "budget_mb": budget_mb, "wall_s": wall})
@@ -329,6 +367,7 @@ def axis_leak():
         d = _run_dir(f"leak__{reader}")
         _fresh_session(reader, d)
         _warm(reader, d)
+        _note_fixture(d, path)
         windows = []
         for i in range(8):
             t0 = time.time()
@@ -345,18 +384,19 @@ def axis_leak():
 
 
 def axis_mixed():
-    # 6 files, each a different schema with a different bytes/row, in one dataset
+    # 7 files, each a different schema with a different bytes/row, in one dataset
     # dir read as a single dataset. Tests (a) whether arrow-rs's per-group byte
     # budget adapts file-to-file against PyArrow's fixed sizing, and (b) that a
-    # mixed dataset with a NON-native schema (struct) routes cleanly: arrow-rs
-    # takes the 5 flat files natively and falls back to PyArrow for the struct
-    # file, in one read, without breaking. Struct is the "one with structs" case.
-    path = fx.make_mixed_fixture("mixed6_struct", per=400_000)
+    # mixed dataset with a NON-native schema routes cleanly: arrow-rs takes the
+    # 6 flat/struct files natively (struct ungated 2026-07-21) and falls back to
+    # PyArrow for the ray_tensor file, in one read, without breaking.
+    path = fx.make_mixed_fixture("mixed7_tensor", per=400_000)
     results = []
     for reader in ["pyarrow", "arrow_rs"]:
         rd = _run_dir(f"mixed__{reader}")
         _fresh_session(reader, rd)
         _warm(reader, rd)
+        _note_fixture(rd, path)
         t0 = time.time(); rows = consume(ray.data.read_parquet(path), "iter_batches")
         t1 = time.time(); wall = t1 - t0; ray.shutdown(); time.sleep(0.3)
         nat, fb = _count_paths(rd)
@@ -502,6 +542,7 @@ def axis_scaling():
             d = _run_dir(f"scale__{rows}__{reader}")
             _fresh_session(reader, d)
             _warm(reader, d)
+            _note_fixture(d, path)
             t0 = time.time()
             r = consume(ray.data.read_parquet(path), "iter_batches")
             wall = time.time() - t0
@@ -537,6 +578,7 @@ def axis_concurrency():
                 d = _run_dir(f"conc__{fxname}__{reader}__cpu{ncpu}")
                 _fresh_session(reader, d, num_cpus=ncpu)
                 _warm(reader, d)
+                _note_fixture(d, path)
                 t0 = time.time()
                 rows = consume(ray.data.read_parquet(path), "iter_batches")
                 t1 = time.time()
@@ -577,6 +619,7 @@ def axis_showcase():
             d = _run_dir(f"show__{name}__{reader}")
             _fresh_session(reader, d, num_cpus=4)
             _warm(reader, d)
+            _note_fixture(d, path)
             prog = os.path.join(d, "progress.csv")
             t0 = time.time()
             rows = consume(ray.data.read_parquet(path), "iter_batches", prog)
@@ -613,6 +656,7 @@ def _run_sweep(name, levels, mode="iter_batches", num_cpus=4):
             d = _run_dir(f"sweep_{name}__{lv['label']}__{reader}")
             _fresh_session(reader, d, budget_bytes=budget, num_cpus=ncpu)
             _warm(reader, d)
+            _note_fixture(d, path)
             prog = os.path.join(d, "progress.csv")
             t0 = time.time()
             rows = consume(ray.data.read_parquet(path), mode, prog)
@@ -742,6 +786,7 @@ def axis_workloads():
         d = _run_dir(f"wl__sum__{reader}")
         _fresh_session(reader, d)
         _warm(reader, d)
+        _note_fixture(d, path)
         t0 = time.time()
         total = ray.data.read_parquet(path).sum("i0")
         t1 = time.time()
@@ -763,6 +808,7 @@ def axis_workloads():
         d = _run_dir(f"wl__filter__{reader}")
         _fresh_session(reader, d)
         _warm(reader, d)
+        _note_fixture(d, path)
         t0 = time.time()
         kept = consume(
             ray.data.read_parquet(path).filter(expr=f"i0 > {high}"), "iter_batches")
@@ -856,6 +902,7 @@ def axis_s3():
                        fetch_window_mb=(window or 0), malloc_arena_max=arena,
                        ld_preload=preload)
         _warm(reader, d)  # warms worker imports on a tiny local fixture
+        _note_fixture(d, s3_path)
         t0 = time.time()
         rows = consume(ray.data.read_parquet(s3_path), "iter_batches",
                        progress_path=os.path.join(d, "progress.csv"))

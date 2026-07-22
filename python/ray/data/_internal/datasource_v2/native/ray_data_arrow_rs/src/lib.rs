@@ -77,16 +77,14 @@ use object_store::ObjectStore;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
-// Global allocator A/B (see Cargo.toml `[features]`). Only one may win; mimalloc
-// takes precedence if both are somehow enabled. jemalloc is the preferred lever
-// (matches PyArrow, no FFI segfault) — set decay via `_RJEM_MALLOC_CONF`.
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-#[cfg(all(feature = "jemalloc", not(feature = "mimalloc")))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// NOTE on allocators: earlier prototypes carried optional mimalloc/jemalloc
+// global-allocator features to chase a suspected allocator-retention gap vs
+// PyArrow. Measurement killed the theory (jemalloc LD_PRELOAD inert, per-worker
+// high-water lower than PyArrow's on the same fixtures), and mimalloc as a
+// cdylib global allocator segfaulted Ray workers across the Arrow C-stream FFI
+// boundary. Both features were removed to keep the dependency tree minimal;
+// the system allocator is correct here. A/B experiments can still use
+// LD_PRELOAD without recompiling.
 
 // --------------------------------------------------------------------------- //
 // Shared tokio runtime

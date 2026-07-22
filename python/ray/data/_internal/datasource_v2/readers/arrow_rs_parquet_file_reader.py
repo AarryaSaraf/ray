@@ -47,16 +47,20 @@ with the PyArrow path.
 
 Prototype limitations (documented, not hidden)
 ----------------------------------------------
-- The predicate is applied *post-decode* in Python via PyArrow, not pushed
-  into arrow-rs. Row groups are still selected upstream by the chunker; only
-  stat-based intra-chunk row-group skipping is skipped. This makes filtered-read
-  benchmark numbers conservative for arrow-rs.
+- Predicate handling matches the PyArrow path at row-group granularity:
+  pushed filters prune row groups via footer statistics (``fragment.subset``)
+  before the crate fetches or decodes anything. *Row-level* filtering is then
+  applied post-decode in Python via PyArrow — the crate has no in-decode
+  ``RowFilter`` yet, so rows inside a surviving row group are decoded before
+  being dropped.
 - :meth:`_arrow_rs_supported` restricts the native path to local **and S3**
-  files with flat, non-nested / non-dictionary / non-extension columns and no
-  ``int96`` coercion. Everything else transparently falls back to the PyArrow
-  reader, so correctness is never at risk — but benchmarks must confirm the
-  arrow-rs path actually ran (see the ``RAY_DATA_USE_ARROW_RS_PARQUET_READER``
-  verification).
+  files whose columns are flat types or struct/list nesting thereof (any
+  depth), with **no dictionary, extension, map, or union type anywhere in the
+  type tree** and no ``int96`` coercion. Nested-column *projection* (dotted
+  names) also falls back. Everything else transparently falls back to the
+  PyArrow reader, so correctness is never at risk — but benchmarks must
+  confirm the arrow-rs path actually ran (see the
+  ``RAY_DATA_USE_ARROW_RS_PARQUET_READER`` verification).
 """
 
 import logging
@@ -124,6 +128,38 @@ _ARROW_RS_DEFAULT_SPLIT_THRESHOLD_BYTES = 128 * MiB
 # row-group size, instead of PyArrow's whole-row-group pre-buffer. 0 = no window
 # cap (fetch the whole range at once). Swept on the Linux/S3 run (Agents.md §7.1).
 _ARROW_RS_FETCH_WINDOW_MB = env_integer("RAY_DATA_ARROW_RS_FETCH_WINDOW_MB", 16)
+
+
+def _arrow_rs_type_supported(t: pa.DataType) -> bool:
+    """True if the native path can decode this column type: flat types, plus
+    struct / list / large_list / fixed_size_list nesting of them to any depth.
+
+    Rejected anywhere in the type tree (falls back to PyArrow):
+
+    - dictionary — a forced dictionary read isn't mirrored by the crate;
+    - extension types — both custom subclasses (Ray's ``ArrowTensorType``) and
+      pyarrow *canonical* extensions (e.g. ``fixed_shape_tensor``), which are
+      not ``isinstance(pa.ExtensionType)`` on some pyarrow versions, hence the
+      ``extension_name`` check;
+    - map / union / any other exotic nesting — untested against the crate.
+    """
+    if (
+        pa.types.is_dictionary(t)
+        or isinstance(t, pa.ExtensionType)
+        or getattr(t, "extension_name", None) is not None
+    ):
+        return False
+    if pa.types.is_struct(t):
+        return all(_arrow_rs_type_supported(f.type) for f in t)
+    if (
+        pa.types.is_list(t)
+        or pa.types.is_large_list(t)
+        or pa.types.is_fixed_size_list(t)
+    ):
+        return _arrow_rs_type_supported(t.value_type)
+    if pa.types.is_nested(t):
+        return False  # map, union, list_view, ...
+    return True
 
 
 def _trace_reader_path(supported: bool) -> None:
@@ -240,8 +276,9 @@ class ArrowRsParquetFileReader(ParquetFileReader):
 
         Conservative on purpose — anything not covered here falls back to the
         PyArrow reader in :meth:`_iter_fragment_tables`, so correctness is never
-        at risk. Supports **local and S3** files with flat columns only; every
-        other filesystem (GCS, ABFS, HTTP, …) falls back to PyArrow.
+        at risk. Supports **local and S3** files with flat and struct/list
+        columns (see :func:`_arrow_rs_type_supported`); every other filesystem
+        (GCS, ABFS, HTTP, …) falls back to PyArrow.
         """
         from pyarrow.fs import LocalFileSystem, S3FileSystem
 
@@ -280,17 +317,7 @@ class ArrowRsParquetFileReader(ParquetFileReader):
                 # PyArrow's null-fill path.
                 return False
             field_type = physical_schema.field(idx).type
-            # Catch every extension type, not just custom subclasses:
-            # pyarrow *canonical* extensions (e.g. fixed_shape_tensor) are not
-            # `isinstance(pa.ExtensionType)` in some pyarrow versions, so check
-            # for an `extension_name` too — otherwise a tensor column would slip
-            # through to the native crate, which doesn't handle extensions.
-            if (
-                pa.types.is_nested(field_type)
-                or pa.types.is_dictionary(field_type)
-                or isinstance(field_type, pa.ExtensionType)
-                or getattr(field_type, "extension_name", None) is not None
-            ):
+            if not _arrow_rs_type_supported(field_type):
                 return False
             if unified_schema is None:
                 continue
@@ -343,11 +370,28 @@ class ArrowRsParquetFileReader(ParquetFileReader):
             yield from super()._iter_fragment_tables(fragment, scanner_kwargs)
             return
 
+        # Row-group-level predicate pushdown, same mechanism as the PyArrow
+        # path (parquet_file_reader.py): pyarrow's footer statistics prune row
+        # groups whose min/max can't satisfy the filter, so the crate never
+        # fetches or decodes them. Row-level filtering still happens
+        # post-decode below. Skip pruning when the filter touches a column
+        # absent from this fragment's physical schema (schema evolution with
+        # columns=None slips past the gate's read_columns check):
+        # fragment.subset evaluates against the physical schema and raises.
+        fragment_physical_columns = set(fragment.physical_schema.names)
+        filter_touches_missing_column = filter_columns is not None and any(
+            c not in fragment_physical_columns for c in filter_columns
+        )
+        subset = fragment
+        if filter_expr is not None and not filter_touches_missing_column:
+            subset = fragment.subset(filter=filter_expr)
         row_groups = (
-            [rg.id for rg in fragment.row_groups]
-            if fragment.row_groups is not None
+            [rg.id for rg in subset.row_groups]
+            if subset.row_groups is not None
             else None
         )
+        if row_groups is not None and len(row_groups) == 0:
+            return
 
         from pyarrow.fs import S3FileSystem
 
