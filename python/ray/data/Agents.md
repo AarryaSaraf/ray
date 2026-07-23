@@ -52,12 +52,17 @@ you know Ray Data and Parquet at a high level but nothing about this work.
   locally. K-split stays in the crate, gated to the lone-big-fragment case, reserved for
   the S3 phase.
 - **How we judge memory (the metric of record, §3.5.1):** one graph per config — every
-  read task's **absolute worker USS over time** against a per-reader
-  **expected-without-decode** line (measured floor + compressed-in-flight + one output
-  block). A task's rise above the line IS its decode working set. No baseline
-  subtraction, no summary scalars. This replaced both an incremental metric that
-  produced a false regression on Linux (§3.5.1) and an earlier constant
-  E = 2×block_size line (a design heuristic nothing enforces).
+  read task's **absolute worker USS over time** against a single, decoder-independent
+  **ideal streaming reader** line (measured warm floor + one output block,
+  `target_max_block_size`). A perfect reader reads compressed bytes off disk (file-backed,
+  not USS), decodes in small bounded batches, and streams output; its one irreducible
+  private cost is the output block assembled before handoff to plasma — a Ray property,
+  identical for both readers, and flat in row-group size. A task's rise above the line IS
+  the private memory it holds beyond that ideal (PyArrow ~the whole row group; arrow-rs its
+  over-buffering). No baseline subtraction, no summary scalars. This replaced an incremental
+  metric that produced a false regression on Linux (§3.5.1), an earlier E = 2×block_size
+  heuristic, and an over-budgeted floor+compressed-group line (which let arrow-rs appear
+  impossibly *below* "expected").
 - **Predicate pushdown:** pushed filters (`ds.filter(expr=...)` via Ray's
   `PredicatePushdown` rule) now prune row groups by footer statistics on the arrow-rs
   path exactly as the PyArrow path does (`fragment.subset`), before any fetch/decode;
@@ -66,12 +71,14 @@ you know Ray Data and Parquet at a high level but nothing about this work.
 - **What's proven at node level (§5.10):** the full Linux suite + real-S3 run came back
   uniform — arrow-rs's absolute node-sum peak USS is at-or-below PyArrow's in every
   paired config (~45 cells), at wall parity-to-faster; headline cells: 0.50× at 4-CPU
-  concurrency, 0.43× at 1.4 GB, 0.37× on large_str, S3 0.81× at 0.99× wall.
-- **What's unproven:** the per-task-vs-expected adjudication itself (the
-  `figs/task_mem/` graphs need a rerun with the new line and reading into this doc),
-  the `oom` end-to-end demo, nested/dictionary/decimal *edge* schemas beyond the
-  struct/list parity tests, and whether the K-split concurrency can be redesigned to
-  win locally too (§7).
+  concurrency, 0.43× at 1.4 GB, 0.37× on large_str. On the **S3 geometry sweep** the
+  target case — a lone big row group as one S3 object, the layout that OOMs today — is
+  **2.6–2.8× less memory at speed parity** (`large_1rg` 2.63×, `large_str_1rg` 2.83×), and
+  the per-task graphs now carry the ideal-streaming-reader line: PyArrow towers ~+2.4 GB
+  above it, arrow-rs ~+0.6 GB (§5.10).
+- **What's unproven:** the `oom` end-to-end demo, nested/dictionary/decimal *edge* schemas
+  beyond the struct/list parity tests, and whether the K-split concurrency can be
+  redesigned to win locally too (§7).
 
 ---
 
@@ -1036,11 +1043,58 @@ Readings that matter beyond the ratios:
   sweep_schema wide_str 0.88× and tuning b2 1.05× on bigger fixtures, so treated as noise
   pending a repeat.
 
-**Pending:** rerunning so `figs/task_mem/` carries the expected-without-decode lines
-(the metric of record — this run predates `_note_fixture`, so its graphs lack the
-per-reader lines) and reading them into this doc; and the planned `oom` axis — a
-memory-ceilinged node where PyArrow's hidden decode heap OOM-kills the read and
-arrow-rs finishes — the end-to-end demonstration of §3.2's failure mode and its removal.
+**The task_mem-with-ideal-line rerun + S3 geometry sweep (2026-07-22, Linux + real S3).**
+This run carries the metric of record — per-task absolute USS over time vs the **ideal
+streaming reader** line (`floor + one output block`, decoder-independent; §3.5.1). Both
+halves of the thesis now show on one run.
+
+*Per-task overshoot above the ideal line* (MB the reader holds beyond a perfect streaming
+reader; pyarrow / arrow-rs):
+
+| config | pyarrow | arrow-rs |
+|---|---|---|
+| S3 `large_1rg` (8 M, 1 rg) | **+2431** | **+645** |
+| S3 `large_str_1rg` (2 M) | +2381 | +549 |
+| S3 `many_files_1rg` (4 files) | +443 | +257 |
+| S3 `small_many_rg` (100k-rg) | −57 | −40 (both *below* ideal) |
+| local `scale__8M` / `sweep_size 1.4 GB` | +2477 / +3295 | +877 / +1200 |
+| `decode_drop` (blocks dropped — mechanism isolated) | +1196 | **+24 to +77** |
+| `leak` (8 repeats) | +166 | −119 (below ideal, no ratchet) |
+
+`decode_drop` is the cleanest single picture: with retained blocks removed, arrow-rs sits
+essentially *on* the ideal line (+24 MB) while PyArrow towers +1.2 GB — the whole-row-group
+decode heap, made visible.
+
+*S3 geometry sweep (option B — the differentiating geometries on real S3, where the windowed
+async fetch finally engages).* Memory = absolute node-sum peak USS; `mem` = pyarrow ÷ arrow-rs
+(>1 ⇒ arrow-rs uses less):
+
+| geometry | pyarrow | arrow-rs | mem | wall rs/pa |
+|---|---|---|---|---|
+| `large_1rg` (lone big rg, the OOM case) | 2882 MB | 1096 MB | **2.63×** | 1.08× |
+| `large_str_1rg` | 2833 MB | 1001 MB | **2.83×** | 0.88× |
+| `many_files_1rg` (4 objects) | 1815 MB | 1808 MB | 1.00× | 1.09× |
+| `small_many_rg` (many tiny rg) | 1450 MB | 1614 MB | 0.90× | 0.94× |
+| `list_1rg` | 741 MB | 656 MB | 1.13× | 0.91× |
+
+Reading it: the two `large_*_1rg` rows are the target — a lone big row group arriving as one
+S3 object, the layout that OOMs today — and arrow-rs is **2.6–2.8× less private memory at
+speed parity**, because the fetch window caps compressed-in-flight (~16 MB) while PyArrow
+pulls the whole object and decodes the whole group. `many_files_1rg` parity is expected (4
+separate objects ⇒ working set is already one-file-at-a-time for both; no lone object for the
+window to cap). The one regression, `small_many_rg` at 0.90×, is real but immaterial: the
+overshoot table shows **both readers below the ideal line** there (−57 / −40 MB), i.e. both
+peak under a single output block — the 10% "loss" lives entirely in sub-block noise, not an
+OOM regime. This run also reproduced the on-node overcommit win (concurrency 1.42–1.59× less
+at 4 CPUs, faster wall) and the filter workload (3.0× less memory, 1.56× faster).
+
+The honest speed framing: parity-to-modestly-faster everywhere, **not** the standalone 4–5×
+(that was the S3 K-split, dormant except on a lone big row group, and K=1 by default). The
+pitch is *removing the OOMs at no speed cost*, which the deciding run confirms.
+
+**Pending:** the planned `oom` axis — a memory-ceilinged node where PyArrow's hidden decode
+heap OOM-kills the read and arrow-rs finishes — the end-to-end demonstration of §3.2's failure
+mode and its removal.
 
 ---
 
@@ -1265,19 +1319,26 @@ file-wide bound is derived by aggregating row-group stats. So the honest model i
 if the page index was written) → then per-row late materialization. This maps one-to-one onto
 a page-indexed chunker.
 
-**What Ray does today (code-verified, and it confirms "predicates aren't pushed as far as
-possible").** The ceiling today is row-group skipping, and it isn't even everywhere:
+**What Ray does today (code-verified 2026-07-22).** The ceiling today is row-group skipping,
+and **both** readers now hit it — an earlier version of this section wrongly claimed the
+arrow-rs path pruned nothing; it does, at parity:
 
 - **PyArrow base path** does `fragment.subset(filter=filter_expr)`
-  (`readers/parquet_file_reader.py:401-402`), which uses column-chunk stats to **skip whole
+  (`readers/parquet_file_reader.py:401`), which uses column-chunk stats to **skip whole
   row groups** — but then `iter_batches` can't take a filter, so the row-level predicate is
-  applied **post-decode per batch** (`parquet_file_reader.py:473-474`). No page skipping.
-- **arrow-rs path** does *neither*: no `subset(filter=...)`, filter applied post-decode in
-  Python (`readers/arrow_rs_parquet_file_reader.py:376-383`). The crate has **zero** pushdown
-  — grepping `src/lib.rs` for `RowFilter`/`ArrowPredicate`/`column_index` returns nothing.
+  applied **post-decode per batch**. No page skipping.
+- **arrow-rs path does the same row-group skip**, mirroring the base path line-for-line:
+  `fragment.subset(filter=filter_expr)` (`readers/arrow_rs_parquet_file_reader.py:388`) →
+  surviving ids (`:390`) → crate `read_row_groups(_s3)(row_groups=…)` (`:428`) →
+  `lib.rs:419` (`selected`) → `:262` (`.with_row_groups(vec![rg])`), so Rust opens only the
+  survivors (on S3, never fetches the rest). The row-level filter is then applied post-decode
+  in Python (`:465`). The **crate itself** carries no pushdown logic — grepping `src/lib.rs`
+  for `RowFilter`/`ArrowPredicate` returns nothing; the pruning is pyarrow's, done in Python
+  before the FFI call, so no Rust reimplementation is needed to reach parity.
 
-So across the whole stack: **row-group skip = PyArrow only; page skip = nowhere; late
-materialization = nowhere.** Everything below a row group decodes-then-discards.
+So across the whole stack: **row-group skip = both readers (via pyarrow footer stats); page
+skip = nowhere; late materialization = nowhere.** Everything below a row group
+decodes-then-discards.
 
 **The cascade to build, and the exact arrow-rs primitive for each stage.**
 
@@ -1293,9 +1354,9 @@ flowchart TD
 
 | Stage | Granularity | arrow-rs primitive | Status in the crate |
 |---|---|---|---|
-| Skip row groups | column-chunk stats | build the surviving-RG `Vec<usize>` from `row_group(i).column(c).statistics()` | not done |
-| Skip pages | ColumnIndex | `RowSelection` from `column_index()` + `offset_index()` | index is *loaded* (`lib.rs:365`), not *used* to filter |
-| Late materialization | per-row | `RowFilter` + `ArrowPredicate` on the builder (`with_row_filter`) | not done |
+| Skip row groups | column-chunk stats | **done in Python** via `fragment.subset(filter=…)` → `row_groups=` (both readers, at parity); a Rust build buys nothing since pyarrow is always present | **done** |
+| Skip pages | ColumnIndex | `RowSelection` from `column_index()` + `offset_index()` | index is *loaded* (k>1 only), not *used* to filter |
+| Late materialization | per-row | `RowFilter` + `ArrowPredicate` on the builder (`with_row_filter`) | not done — deferred; belongs as a planner pushdown hint (see plan doc) |
 
 The leverage: the crate's K-split path **already builds `RowSelection` objects**
 (`build_range_reader`, `lib.rs:281`) and **already loads the page index**
