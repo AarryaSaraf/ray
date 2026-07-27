@@ -491,6 +491,283 @@ def plot_leak(rows):
     print(f"  wrote {out}")
 
 
+# node-sum USS-over-time colors per (reader, pre_buffer) for the multi-group leak.
+_LEAKMG_COLORS = {
+    ("pyarrow", "on"): "#922b21",
+    ("pyarrow", "off"): "#e74c3c",
+    ("pyarrow_iter", "on"): "#6c3483",
+    ("pyarrow_iter", "off"): "#bb8fce",
+    ("arrow_rs", "na"): "#2471a3",
+}
+_LEAKMG_MODES = ["one_chunk", "per_group"]
+
+
+def table_leak_multigrp(rows):
+    ng = next((r.get("num_row_groups") for r in rows if r.get("num_row_groups")), "?")
+    print(
+        f"\n## LEAK (multi-row-group — arrow#39808 geometry: {ng} groups, 1 file)\n"
+        "   one_chunk = all groups in 1 read task (scanner spans whole file); "
+        "per_group = 1 task per group.\n"
+        "   max_task_MB = the decoding worker's USS growth (the reader's working "
+        "set); peak/incr include the ~340 MB warm base."
+    )
+    print(
+        f"  {'chunk_mode':10s} {'reader':13s} {'pre_buf':7s} "
+        f"{'max_task_MB':>11s} {'incr_USS_MB':>11s} {'peak_USS_MB':>11s} "
+        f"{'grown_wk':>8s} {'wall_s':>7s}"
+    )
+    order = {m: i for i, m in enumerate(_LEAKMG_MODES)}
+    reader_order = {"pyarrow": 0, "pyarrow_iter": 1, "arrow_rs": 2}
+
+    def _key(r):
+        return (
+            order.get(r.get("chunk_mode"), 9),
+            reader_order.get(r.get("reader"), 9),
+            str(r.get("pre_buffer")),
+        )
+
+    for r in sorted(rows, key=_key):
+        print(
+            f"  {r.get('chunk_mode',''):10s} {r.get('reader',''):13s} "
+            f"{str(r.get('pre_buffer','')):7s} "
+            f"{(r.get('max_task_mb') or 0):11.1f} "
+            f"{(r.get('node_sum_incr_mb') or 0):11.1f} "
+            f"{(r.get('node_sum_peak_mb') or 0):11.1f} "
+            f"{str(r.get('grown_workers', r.get('n_read_tasks',''))):>8s} "
+            f"{(r.get('wall_s') or 0):7.2f}"
+        )
+    try:
+        plot_leak_multigrp(rows)
+    except Exception as e:
+        print(f"  (skip leak_multigrp plot: {type(e).__name__}: {e})")
+
+
+def plot_leak_multigrp(rows):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(FIG, exist_ok=True)
+    ng = next((r.get("num_row_groups") for r in rows if r.get("num_row_groups")), "?")
+    mode_desc = {
+        "one_chunk": f"all {ng} groups in 1 read task (scanner spans whole file)",
+        "per_group": f"1 group per read task ({ng} tasks)",
+    }
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.4), squeeze=False, sharey=True)
+    for ax, mode in zip(axes[0], _LEAKMG_MODES):
+        mrows = [r for r in rows if r.get("chunk_mode") == mode]
+        for r in mrows:
+            pb = r.get("pre_buffer", "na")
+            rd = os.path.join(OUT, f"leakmg__{mode}__{r['reader']}__pb_{pb}")
+            grid, total = _node_sum_series_windowed(
+                rd, r["t0"], r["t1"], baseline=False
+            )
+            if grid is None:
+                continue
+            lbl = r["reader"] + (f"  pre_buffer={pb}" if pb != "na" else "")
+            peak = r.get("node_sum_peak_mb")
+            if isinstance(peak, (int, float)):
+                lbl += f"  (peak {peak:.0f} MB)"
+            ax.plot(
+                grid,
+                total,
+                lw=2,
+                color=_LEAKMG_COLORS.get((r["reader"], pb), "#555555"),
+                label=lbl,
+            )
+        ax.set_title(f"{mode}  —  {mode_desc.get(mode, '')}")
+        ax.set_xlabel("seconds")
+        ax.set_ylabel("node-sum USS (MB)")
+        ax.grid(alpha=0.2)
+        ax.legend(fontsize=8)
+    desc = _desc_for(os.path.join(OUT, "leakmg__one_chunk__pyarrow__pb_on"))
+    fig.suptitle(
+        f"arrow#39808 leak geometry — {ng} small row groups.  LEFT: all groups in "
+        "ONE read task (scanner spans the whole file).  RIGHT: one group per task "
+        "(bounded).\n" + (desc or ""),
+        fontsize=10,
+    )
+    out = os.path.join(FIG, "leak_multigrp__uss.png")
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.savefig(out, dpi=120)
+    print(f"  wrote {out}")
+
+
+_LEAKRG_COLORS = {
+    "pyarrow_v1": "#c0392b",  # legacy whole-file scanner (the #49158 surge)
+    "pyarrow": "#e67e22",  # V2 scanner (per-row-group)
+    "pyarrow_iter": "#8e44ad",  # V2 iter_batches
+    "arrow_rs": "#2471a3",  # arrow-rs byte-budget streamer
+}
+_LEAKRG_GEOMS = ["many_tiny", "few_large"]
+_LEAKRG_READER_ORDER = {"pyarrow_v1": 0, "pyarrow": 1, "pyarrow_iter": 2, "arrow_rs": 3}
+_LEAKRG_GEOM_DESC = {
+    "many_tiny": "~200 tiny row groups (huge cells) — churn / allocator-retention case",
+    "few_large": "4 big (~200 MB) row groups — the decode-floor case (arrow-rs's win)",
+}
+
+
+def table_leak_rgsize(rows):
+    print(
+        "\n## LEAK by ROW-GROUP SIZE (ray#49158 shape: few rows, huge binary cells)\n"
+        "   pyarrow_v1 = legacy whole-file scanner (the surge); pyarrow/iter/arrow_rs "
+        "= V2 (per-group).\n"
+        "   many_tiny = ~200 tiny groups (churn); few_large = 4 big groups (decode "
+        "floor).\n"
+        "   max_task_MB = busiest worker's USS growth = the reader's working set."
+    )
+    print(
+        f"  {'geom':10s} {'reader':13s} {'#rg':>4s} {'max_task_MB':>11s} "
+        f"{'incr_USS_MB':>11s} {'peak_USS_MB':>11s} {'nat/fb':>7s} {'wall_s':>7s}"
+    )
+
+    def _key(r):
+        return (
+            _LEAKRG_GEOMS.index(r["geom"]) if r.get("geom") in _LEAKRG_GEOMS else 9,
+            _LEAKRG_READER_ORDER.get(r.get("reader"), 9),
+        )
+
+    for r in sorted(rows, key=_key):
+        print(
+            f"  {r.get('geom',''):10s} {r.get('reader',''):13s} "
+            f"{str(r.get('num_row_groups','?')):>4s} "
+            f"{(r.get('max_task_mb') or 0):11.1f} "
+            f"{(r.get('node_sum_incr_mb') or 0):11.1f} "
+            f"{(r.get('node_sum_peak_mb') or 0):11.1f} "
+            f"{str(r.get('native',0)) + '/' + str(r.get('fallback',0)):>7s} "
+            f"{(r.get('wall_s') or 0):7.2f}"
+        )
+    try:
+        plot_leak_rgsize(rows)
+    except Exception as e:
+        print(f"  (skip leak_rgsize plot: {type(e).__name__}: {e})")
+
+
+def plot_leak_rgsize(rows):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(FIG, exist_ok=True)
+    geoms = [g for g in _LEAKRG_GEOMS if any(r.get("geom") == g for r in rows)]
+    fig, axes = plt.subplots(
+        1, len(geoms), figsize=(7 * len(geoms), 5.4), squeeze=False, sharey=False
+    )
+    for ax, geom in zip(axes[0], geoms):
+        grows = [r for r in rows if r.get("geom") == geom]
+        ng = next(
+            (r.get("num_row_groups") for r in grows if r.get("num_row_groups")), "?"
+        )
+        for r in sorted(grows, key=lambda x: _LEAKRG_READER_ORDER.get(x["reader"], 9)):
+            rd = os.path.join(OUT, f"leakrg__{geom}__{r['reader']}")
+            grid, total = _node_sum_series_windowed(
+                rd, r["t0"], r["t1"], baseline=False
+            )
+            if grid is None:
+                continue
+            mt = r.get("max_task_mb")
+            lbl = r["reader"]
+            if isinstance(mt, (int, float)):
+                lbl += f"  (max task {mt:.0f} MB)"
+            ax.plot(
+                grid,
+                total,
+                lw=2,
+                color=_LEAKRG_COLORS.get(r["reader"], "#555555"),
+                label=lbl,
+            )
+        ax.set_title(
+            f"{geom} — {_LEAKRG_GEOM_DESC.get(geom, '')} ({ng} groups)", fontsize=9
+        )
+        ax.set_xlabel("seconds")
+        ax.set_ylabel("node-sum USS (MB)")
+        ax.grid(alpha=0.2)
+        ax.legend(fontsize=8)
+    fig.suptitle(
+        "ray#49158 by row-group size — V1 whole-file scanner SURGES; V2 per-group "
+        "stays bounded.\nLEFT: many tiny groups (watch arrow-rs allocator retention; "
+        "re-run with MALLOC_ARENA_MAX=2 on Linux).  RIGHT: few big groups "
+        "(arrow-rs's byte budget beats the whole-group decode).",
+        fontsize=9,
+    )
+    out = os.path.join(FIG, "leak_rgsize__uss.png")
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(out, dpi=120)
+    print(f"  wrote {out}")
+
+
+_RKNOB_READER_COLOR = {
+    "pyarrow": "#c0392b",
+    "pyarrow_iter": "#8e44ad",
+    "arrow_rs": "#2471a3",
+}
+_RKNOB_READER_ORDER = {"pyarrow": 0, "pyarrow_iter": 1, "arrow_rs": 2}
+
+
+def table_reader_settings(rows):
+    print(
+        "\n## READER SETTINGS (one_chunk leak geometry: 30 groups in 1 read task)\n"
+        "   how each reader knob moves the decoding worker's USS growth (max_task_MB)."
+    )
+    print(
+        f"  {'reader':13s} {'setting':22s} {'max_task_MB':>11s} "
+        f"{'peak_USS_MB':>11s} {'wall_s':>7s}"
+    )
+
+    def _key(r):
+        return (_RKNOB_READER_ORDER.get(r.get("reader"), 9), r.get("setting", ""))
+
+    for r in sorted(rows, key=_key):
+        print(
+            f"  {r.get('reader',''):13s} {r.get('setting',''):22s} "
+            f"{(r.get('max_task_mb') or 0):11.1f} "
+            f"{(r.get('node_sum_peak_mb') or 0):11.1f} {(r.get('wall_s') or 0):7.2f}"
+        )
+    try:
+        plot_reader_settings(rows)
+    except Exception as e:
+        print(f"  (skip reader_settings plot: {type(e).__name__}: {e})")
+
+
+def plot_reader_settings(rows):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(FIG, exist_ok=True)
+    ordered = sorted(
+        rows,
+        key=lambda r: (
+            _RKNOB_READER_ORDER.get(r.get("reader"), 9),
+            r.get("setting", ""),
+        ),
+    )
+    labels = [f"{r['reader']}: {r['setting']}" for r in ordered]
+    vals = [(r.get("max_task_mb") or 0) for r in ordered]
+    colors = [_RKNOB_READER_COLOR.get(r.get("reader"), "#555555") for r in ordered]
+    y = list(range(len(ordered)))[::-1]  # first config at top
+    fig, ax = plt.subplots(figsize=(10, 0.5 * len(ordered) + 2))
+    ax.barh(y, vals, color=colors)
+    for yi, v in zip(y, vals):
+        ax.text(v + max(vals) * 0.01, yi, f"{v:.0f}", va="center", fontsize=8)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xlabel("decoding worker's USS growth — max_task (MB)")
+    ng = next((r.get("num_row_groups") for r in rows if r.get("num_row_groups")), "?")
+    ax.set_title(
+        f"Reader-setting sweep — {ng} row groups in ONE read task.\n"
+        "One knob varied per bar off its default; lower = smaller decode working set."
+    )
+    ax.grid(alpha=0.2, axis="x")
+    out = os.path.join(FIG, "reader_settings__max_task.png")
+    fig.tight_layout()
+    fig.savefig(out, dpi=120)
+    print(f"  wrote {out}")
+
+
 def plot_scaling(rows):
     import matplotlib
 
@@ -871,6 +1148,9 @@ def _run():
         ("scaling", table_scaling),
         ("concurrency", table_concurrency),
         ("leak", table_leak),
+        ("leak_multigrp", table_leak_multigrp),
+        ("leak_rgsize", table_leak_rgsize),
+        ("reader_settings", table_reader_settings),
         ("workloads", table_workloads),
         ("s3", table_s3),
         ("s3geom", table_s3geom),

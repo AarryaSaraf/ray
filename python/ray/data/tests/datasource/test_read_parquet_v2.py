@@ -6,6 +6,8 @@ unsupported-option gating. They call ``ray.data.read_parquet`` which
 triggers Ray auto-init, so they live alongside the other datasource
 integration tests rather than under ``tests/unit/``.
 """
+import os
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -206,6 +208,80 @@ def test_read_parquet_v2_empty_dir_raises(tmp_path, restore_ctx):
     restore_ctx.use_datasource_v2 = True
     with pytest.raises(ValueError, match="no files found"):
         ray.data.read_parquet(str(tmp_path))
+
+
+def _v2_manifest(paths, sizes):
+    from ray.data._internal.datasource_v2.listing.file_manifest import FileManifest
+
+    return FileManifest.construct_manifest(paths, sizes, [None] * len(paths))
+
+
+@pytest.mark.parametrize("columns", [None, ["a", "c"]])
+def test_force_iter_batches_matches_scanner_path(tmp_path, monkeypatch, columns):
+    """``RAY_DATA_PARQUET_FORCE_ITER_BATCHES`` pins EVERY fragment to the
+    ``pq.ParquetFile.iter_batches`` row-level path (normally reserved for the
+    ARROW-5030 nested fallback). For flat data it must (a) actually route through
+    ``iter_batches`` and (b) return byte-identical results to the default
+    ``fragment.scanner().scan_batches()`` path.
+
+    Driven via ``reader.read(manifest)`` in-process (not ``ray.data.read_parquet``)
+    so the env flag is read in this same process — the branch under test lives in
+    ``ParquetFileReader._iter_fragment_tables``, which runs on the reader, and a
+    driver-side ``monkeypatch.setenv`` would not otherwise reach a Ray worker.
+    """
+    import pyarrow.parquet as pq_mod
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.parquet_file_reader import (
+        ParquetFileReader,
+    )
+
+    table = pa.table(
+        {
+            "a": pa.array(range(5000), type=pa.int64()),
+            "b": pa.array([f"s{i}" for i in range(5000)]),
+            "c": pa.array([float(i) for i in range(5000)], type=pa.float64()),
+        }
+    )
+    path = tmp_path / "flat.parquet"
+    # Several small row groups so multiple batches flow through either path.
+    pq.write_table(table, str(path), row_group_size=1000, write_page_index=True)
+
+    def _read():
+        reader = ParquetFileReader(
+            columns=columns,
+            filesystem=LocalFileSystem(),
+            target_block_size=128 * 1024 * 1024,
+        )
+        manifest = _v2_manifest([str(path)], [os.path.getsize(path)])
+        return pa.concat_tables(list(reader.read(manifest))).sort_by("a")
+
+    # Spy on iter_batches to prove which path each read took (the scanner path
+    # never calls it; the forced path calls it once per fragment).
+    calls = {"n": 0}
+    orig_iter = pq_mod.ParquetFile.iter_batches
+
+    def spy_iter(self, *args, **kwargs):
+        calls["n"] += 1
+        return orig_iter(self, *args, **kwargs)
+
+    monkeypatch.setattr(pq_mod.ParquetFile, "iter_batches", spy_iter)
+
+    # Default: the scanner path — iter_batches must NOT be used.
+    monkeypatch.delenv("RAY_DATA_PARQUET_FORCE_ITER_BATCHES", raising=False)
+    scanner_out = _read()
+    assert calls["n"] == 0, "default read unexpectedly used iter_batches"
+
+    # Forced: the iter_batches path must engage.
+    calls["n"] = 0
+    monkeypatch.setenv("RAY_DATA_PARQUET_FORCE_ITER_BATCHES", "1")
+    forced_out = _read()
+    assert calls["n"] > 0, "force flag did not route through iter_batches"
+
+    # Byte-identical between the two paths, and equal to the source projection.
+    expected = (table if columns is None else table.select(columns)).sort_by("a")
+    assert forced_out.equals(scanner_out)
+    assert forced_out.equals(expected)
 
 
 if __name__ == "__main__":

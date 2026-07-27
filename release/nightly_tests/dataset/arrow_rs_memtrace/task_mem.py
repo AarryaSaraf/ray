@@ -1,33 +1,19 @@
 """THE memory graph of record: per-task absolute USS over time, one figure per
-benchmark config, both readers overlaid, against the ideal-streaming-reader line.
+benchmark config, all readers overlaid, with a table comparing each reader's
+wall time and peak USS against the pyarrow V2-scanner baseline.
 
 What each figure shows:
 
   * one line per READ TASK: the executing worker's ABSOLUTE USS, sampled at
     5 ms, clipped to that task's [t_start, t_end] window and aligned so every
-    task starts at x=0. Red = pyarrow tasks, blue = arrow_rs tasks. These are
-    measured.
-  * one dashed reference line: the ideal streaming reader —
-
-        ideal = floor + one output block (target_max_block_size)
-
-    floor = the MEASURED USS a worker already holds ENTERING the task (imports +
-            warm retained heap), median of both readers' task-start levels.
-    block = target_max_block_size, the one output block Ray coalesces in the
-            worker before sealing it to plasma.
-
-    Why this and not something else. The reference must be DECODER-INDEPENDENT —
-    what a *perfect* streaming reader would peak at, not what a given reader
-    happens to do. A perfect reader reads compressed bytes off disk (OS page
-    cache, file-backed → not USS), decodes them in small bounded batches (a few
-    MB → second-order), and streams output out; its one irreducible PRIVATE cost
-    is the output block being assembled before handoff to plasma. That block
-    size is a Ray property, identical for both readers, and — the whole point —
-    FLAT in row-group size. It deliberately excludes the whole compressed row
-    group (that is PyArrow's limitation, not a requirement) and the decoded
-    group. So how far each reader towers ABOVE this line is the private memory it
-    holds BEYOND an ideal streaming reader: for PyArrow ~the whole row group; for
-    arrow-rs whatever it over-buffers (block coalescing + allocator retention).
+    task starts at x=0. Red = pyarrow (V2 scanner), orange = pyarrow
+    (iter_batches), blue = arrow_rs. These are measured.
+  * a table on top: absolute wall (s) and peak USS (MB) for each reader, plus
+    each one's %Δ (wall and peak USS) against the pyarrow V2-scanner reader —
+    i.e. against the read Ray actually performs by default. There is no
+    ideal/streaming reference line: with K parallel byte-budgeted range reads
+    per row group there's no single decoder-independent "ideal peak" a reader
+    could tower over, so the honest comparison is just reader-vs-what-Ray-does.
 
 Why absolute USS: the kernel OOM killer and Ray's memory monitor act on
 absolute private memory; USS excludes shared pages (plasma), the part Ray's
@@ -45,7 +31,6 @@ import csv
 import glob
 import json
 import os
-import statistics
 import sys
 import time
 
@@ -57,9 +42,16 @@ DEFAULT_FIG = os.path.join(HERE, "figs", "task_mem")
 FIG = DEFAULT_FIG
 MB = 1024 * 1024
 
-COLORS = {"pyarrow": "#c0392b", "arrow_rs": "#2471a3"}
-EXPECTED_COLOR = "#333333"  # the single reference line (ideal streaming reader)
-DEFAULT_BLOCK_MB = 128.0  # target_max_block_size fallback if meta lacks it
+COLORS = {"pyarrow": "#c0392b", "pyarrow_iter": "#e67e22", "arrow_rs": "#2471a3"}
+# Display order + human labels. pyarrow (the V2 scanner path) is the baseline that
+# %Δ in the timing table is measured against.
+READER_ORDER = ["pyarrow", "pyarrow_iter", "arrow_rs"]
+READER_LABEL = {
+    "pyarrow": "pyarrow (V2 scanner)",
+    "pyarrow_iter": "pyarrow (iter_batches)",
+    "arrow_rs": "arrow-rs",
+}
+BASELINE_READER = "pyarrow"
 
 
 def _point_latest(run_dir):
@@ -118,6 +110,9 @@ def _reader_of(run_dir):
     if m.get("reader") in COLORS:
         return m["reader"]
     name = os.path.basename(run_dir)
+    # Order matters: "__pyarrow_iter" also contains "__pyarrow", so test it first.
+    if "__pyarrow_iter" in name:
+        return "pyarrow_iter"
     if "__arrow_rs" in name:
         return "arrow_rs"
     if "__pyarrow" in name:
@@ -174,76 +169,135 @@ def _plot_pair(config, dirs_by_reader):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(10, 5.4))
+    # One image = a comparison table on top, the USS-over-time graph below.
+    fig, (ax_tbl, ax) = plt.subplots(
+        2, 1, figsize=(11, 6.8), gridspec_kw={"height_ratios": [1, 4]}
+    )
+    # Readers present, in canonical display order (baseline first).
+    readers = [r for r in READER_ORDER if r in dirs_by_reader]
+    readers += [r for r in dirs_by_reader if r not in readers]  # any unknown, appended
+
     counts = {}
-    over = {}
+    peak_by_reader = {}
+    wall_by_reader = {}
     metas = []
     tasks_by_reader = {}
-    entry_levels = []  # first in-window USS of every task, both readers pooled
-    for reader, run_dir in dirs_by_reader.items():
+    for reader in readers:
+        run_dir = dirs_by_reader[reader]
         meta = _meta(run_dir)
         metas.append(meta)
         tasks = _task_series(run_dir)
         tasks_by_reader[reader] = tasks
+        # Wall time for the table: the driver-measured end-to-end wall stamped by
+        # the axis (_R -> meta.json) is authoritative. Fall back to the read-task
+        # window span (max end - min start) for older runs that predate the stamp,
+        # so a table still renders (it undercounts driver/consume overhead).
+        wall = meta.get("wall_s")
+        if wall is None and tasks:
+            starts = [t0 for t0, _, _ in tasks]
+            ends = [t0 + (xs[-1] if xs else 0.0) for t0, xs, _ in tasks]
+            wall = max(ends) - min(starts)
+        wall_by_reader[reader] = wall
         counts[reader] = len(tasks)
+        peak_by_reader[reader] = max((max(ys) for _, _, ys in tasks), default=None)
         alpha = max(0.15, min(0.85, 6.0 / max(1, len(tasks))))
         for i, (_t0, xs, ys) in enumerate(sorted(tasks)):
             ax.plot(
                 xs,
                 ys,
-                color=COLORS[reader],
+                color=COLORS.get(reader, "#555555"),
                 lw=1.3,
                 alpha=alpha,
-                label=f"{reader} tasks (n={len(tasks)})" if i == 0 else None,
+                label=f"{READER_LABEL.get(reader, reader)} (n={len(tasks)})"
+                if i == 0
+                else None,
             )
-            entry_levels.append(ys[0])
-
-    # ONE reference line: the ideal streaming reader — measured warm floor plus
-    # ONE output block. Decoder-independent (target_max_block_size is a Ray
-    # property, identical for both readers) and FLAT in row-group size. See the
-    # module docstring for why this, not the floor and not floor+compressed.
-    floor = statistics.median(entry_levels) if entry_levels else None
-    if floor is not None:
-        block = next(
-            (m["target_block_mb"] for m in metas if m.get("target_block_mb")),
-            DEFAULT_BLOCK_MB,
-        )
-        ideal = floor + block
-        ax.axhline(
-            ideal,
-            color=EXPECTED_COLOR,
-            ls="--",
-            lw=1.8,
-            label=(
-                f"ideal streaming reader = {ideal:.0f} MB "
-                f"(floor {floor:.0f} + 1 block {block:.0f})"
-            ),
-        )
-        for reader, tasks in tasks_by_reader.items():
-            peaks = [max(ys) for _, _, ys in tasks]
-            if peaks:
-                over[reader] = max(p - ideal for p in peaks)
 
     ax.set_xlabel("seconds since task start")
     ax.set_ylabel("worker USS during task (MB, absolute)")
-    subtitle = next((_describe(m) for m in metas if _describe(m)), "")
-    ax.set_title(
-        f"per-task memory over time vs ideal streaming reader — {config}"
-        + (f"\n{subtitle}" if subtitle else ""),
-        fontsize=10,
-    )
     ax.grid(alpha=0.25)
     ax.legend(fontsize=8)
+
+    # --- comparison table (top axes): each reader's absolute wall + peak USS,
+    # and BOTH measured against the pyarrow V2-scanner baseline (the read Ray does
+    # by default). No ideal/streaming reference — with K parallel range reads per
+    # row group there's no single decoder-independent "ideal peak" to tower over;
+    # the honest question is just "how does each reader compare to what Ray does
+    # today", on speed and on private memory. ---
+    base_wall = wall_by_reader.get(BASELINE_READER)
+    base_peak = peak_by_reader.get(BASELINE_READER)
+
+    def _delta(val, base):
+        if val is None or not base:
+            return "?"
+        pct = (val - base) / base * 100.0
+        # memory: lower is better; time: lower is better — same phrasing works.
+        return f"{pct:+.1f}%  ({'less' if pct < 0 else 'more'})"
+
+    col_labels = [
+        "reader",
+        "wall (s)",
+        "Δ wall vs V2 scanner",
+        "peak USS (MB)",
+        "Δ USS vs V2 scanner",
+    ]
+    rows_text = []
+    cell_colors = []
+    for reader in readers:
+        w = wall_by_reader.get(reader)
+        pk = peak_by_reader.get(reader)
+        if reader == BASELINE_READER:
+            dwall = dpeak = "— (baseline)"
+        else:
+            dwall = _delta(w, base_wall)
+            dpeak = _delta(pk, base_peak)
+        rows_text.append(
+            [
+                READER_LABEL.get(reader, reader),
+                f"{w:.3f}" if w is not None else "?",
+                dwall,
+                f"{pk:.0f}" if pk is not None else "?",
+                dpeak,
+            ]
+        )
+        # tint the reader-name cell with its line color for at-a-glance matching
+        c = COLORS.get(reader, "#555555")
+        cell_colors.append([c + "33"] + ["#00000000"] * (len(col_labels) - 1))
+
+    ax_tbl.axis("off")
+    if rows_text:
+        tbl = ax_tbl.table(
+            cellText=rows_text,
+            colLabels=col_labels,
+            cellColours=cell_colors,
+            colLoc="center",
+            cellLoc="center",
+            loc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(9)
+        tbl.scale(1.0, 1.35)
+    subtitle = next((_describe(m) for m in metas if _describe(m)), "")
+    # Wrap a long "what was read" subtitle so it can't run past the image edge.
+    if subtitle and len(subtitle) > 84:
+        mid = subtitle.rfind(" · ", 0, len(subtitle) // 2 + 12)
+        if mid > 0:
+            subtitle = subtitle[:mid] + " ·\n" + subtitle[mid + 3 :]
+    ax_tbl.set_title(
+        f"reader comparison ({len(readers)}-way) — {config}"
+        + (f"\n{subtitle}" if subtitle else ""),
+        fontsize=11,
+        fontweight="bold",
+    )
+
     os.makedirs(FIG, exist_ok=True)
     out = os.path.join(FIG, f"{config}.png")
     fig.tight_layout()
-    fig.savefig(out, dpi=120)
+    # bbox_inches="tight" so the table/legend/title are captured even if they'd
+    # otherwise spill past the fixed figure canvas.
+    fig.savefig(out, dpi=120, bbox_inches="tight")
     plt.close(fig)
     tag = "  ".join(f"{r}:{n} tasks" for r, n in counts.items())
-    if over:
-        tag += "   peak USS above ideal: " + "  ".join(
-            f"{r}:{o:+.0f}MB" for r, o in over.items()
-        )
     print(f"wrote {out}   ({tag})")
 
 
@@ -259,13 +313,21 @@ def _discover():
     used = set()
     pairs = {}
     for name, d in byname.items():
-        if _reader_of(d) != "pyarrow" or "__pyarrow" not in name:
+        if _reader_of(d) != "pyarrow" or not name.endswith("__pyarrow"):
             continue
-        partner = name.replace("__pyarrow", "__arrow_rs")
-        if partner in byname:
-            config = name.replace("__pyarrow", "")
-            pairs[config] = {"pyarrow": d, "arrow_rs": byname[partner]}
-            used.update([name, partner])
+        stem = name[: -len("__pyarrow")]
+        # Gather every reader that read this exact config as a __<reader> sibling
+        # (pyarrow_iter and/or arrow_rs). Register only when there's something to
+        # compare against — a lone pyarrow dir is left for the Phase-2 family
+        # baseline logic, exactly as before.
+        entry = {"pyarrow": d}
+        for reader in ("pyarrow_iter", "arrow_rs"):
+            sib = f"{stem}__{reader}"
+            if sib in byname:
+                entry[reader] = byname[sib]
+        if len(entry) > 1:
+            pairs[stem] = entry
+            used.update(os.path.basename(v) for v in entry.values())
     for name, d in byname.items():
         if name in used or _reader_of(d) != "arrow_rs":
             continue

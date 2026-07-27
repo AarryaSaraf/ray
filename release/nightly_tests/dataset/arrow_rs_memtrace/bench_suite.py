@@ -9,6 +9,9 @@ is only directional on macOS because USS excludes shared pages). Those are:
   tuning   — #3  sweep decode_budget_bytes on one big single-row-group file
   leak     — #8  read the same file N times in ONE session; USS must return to
                   its floor each iteration (no ratchet)
+  leak_multigrp — the proper arrow#39808 geometry: MANY small row groups in ONE
+                  read task vs one-per-task, all 3 readers, pre_buffer on/off.
+                  Shows the scanner's per-task working set tier above iter/arrow-rs
   mixed    — #9  5 files, each a different native schema (narrow ints ... fat
                   strings) in one dataset — does the per-group byte budget adapt
 
@@ -38,6 +41,16 @@ MB = 1024 * 1024
 
 WARM = {"rows": 10_000, "num_files": 1, "row_group_size": 10_000, "schema": "int"}
 
+# The three readers every comparison axis sweeps, so the existing benchmark
+# produces the three-reader figure (table + 3-line USS graph) with no new axis:
+#   pyarrow       — Ray's normal V2 scanner path (fragment.scanner().scan_batches),
+#                   the baseline that %Δ is measured against.
+#   pyarrow_iter  — the SAME PyArrow pinned to pq.ParquetFile.iter_batches for every
+#                   fragment (RAY_DATA_PARQUET_FORCE_ITER_BATCHES), lower peak but
+#                   NOT Ray's default path.
+#   arrow_rs      — the Rust reader.
+READERS = ["pyarrow", "pyarrow_iter", "arrow_rs"]
+
 
 def _fresh_session(
     reader,
@@ -46,8 +59,11 @@ def _fresh_session(
     k=1,
     num_cpus=4,
     fetch_window_mb=16,
+    prefetch_windows=2,
     malloc_arena_max=None,
     ld_preload=None,
+    pre_buffer=None,
+    extra_env=None,
 ):
     ray.shutdown()
     # Let the allocator levers be flipped for the WHOLE suite from the environment,
@@ -61,12 +77,30 @@ def _fresh_session(
         "RAY_MEM_TRACE_DIR": trace_dir,
         "RAY_MEM_TRACE_INTERVAL_S": "0.005",
         "RAY_DATA_ARROW_RS_PATH_TRACE": trace_dir,
-        "RAY_DATA_USE_DATASOURCE_V2": "1",
+        # "pyarrow_v1" reproduces the pre-V2 read path (one whole-file scanner per
+        # file — the ray#49158 surge geometry); every other reader is V2.
+        "RAY_DATA_USE_DATASOURCE_V2": "0" if reader == "pyarrow_v1" else "1",
         "RAY_DATA_USE_ARROW_RS_PARQUET_READER": "1" if reader == "arrow_rs" else "0",
+        # Third reader: PyArrow forced down the pq.iter_batches row-level path for
+        # EVERY fragment (not just ARROW-5030 nested cases). "pyarrow" = the normal
+        # V2 scanner path (Ray's default); "pyarrow_iter" = the same PyArrow but
+        # pinned to iter_batches; "arrow_rs" = the Rust reader.
+        "RAY_DATA_PARQUET_FORCE_ITER_BATCHES": "1" if reader == "pyarrow_iter" else "0",
         "RAY_DATA_ARROW_RS_K": str(k),
         "RAY_DATA_ARROW_RS_DECODE_BUDGET_BYTES": str(budget_bytes),
         "RAY_DATA_ARROW_RS_FETCH_WINDOW_MB": str(fetch_window_mb),
+        "RAY_DATA_ARROW_RS_PREFETCH_WINDOWS": str(prefetch_windows),
     }
+    # pyarrow pre_buffer toggle (both scanner and iter paths honor it). Only
+    # injected when an axis explicitly sweeps it; left unset otherwise so every
+    # other axis keeps each reader's historical default (scanner=True, iter=False).
+    if pre_buffer is not None:
+        env_vars["RAY_DATA_PARQUET_PRE_BUFFER"] = "1" if pre_buffer else "0"
+    # Arbitrary reader-knob overrides (batch_readahead, buffer_size, iter
+    # use_threads, fragment_readahead, ...) injected into the worker env so an
+    # axis can sweep any reader setting without a new named parameter.
+    if extra_env:
+        env_vars.update({k: str(v) for k, v in extra_env.items()})
     # Cap glibc's per-thread arenas in the WORKER processes (must be set before the
     # worker starts, hence via runtime_env, not os.environ). This is the no-code,
     # zero-segfault-risk memory-parity lever for the default (system-allocator)
@@ -119,7 +153,10 @@ def _fresh_session(
     from ray.data.context import DataContext
 
     ctx = DataContext.get_current()
-    ctx.use_datasource_v2 = True
+    # "pyarrow_v1" runs the legacy V1 ParquetDatasource (whole-file scanner); all
+    # other readers are V2. Set on the driver ctx too (propagated to workers) so
+    # it agrees with the RAY_DATA_USE_DATASOURCE_V2 worker env above.
+    ctx.use_datasource_v2 = reader != "pyarrow_v1"
     ctx.use_arrow_rs_parquet_reader = reader == "arrow_rs"
     ctx.execution_options.preserve_order = True  # so parity hashes are comparable
     # Record the run's config knobs next to the traces (target block size, decode
@@ -133,6 +170,7 @@ def _fresh_session(
             "target_block_mb": ctx.target_max_block_size / MB,
             "budget_mb": budget_bytes / MB,
             "fetch_window_mb": fetch_window_mb,
+            "prefetch_windows": prefetch_windows,
         },
     )
     return ctx
@@ -247,6 +285,12 @@ def _R(trace_dir, result):
     for k in _GEOM_RESULT_KEYS:
         if k in g and k not in merged:
             merged[k] = g[k]
+    # Stamp the measured wall into this run's meta.json so task_mem's per-config
+    # timing table (absolute wall + %Δ vs the pyarrow V2-scanner baseline) is
+    # self-contained per run dir — one choke point covering every axis, since
+    # they all route their result row (carrying "wall_s") through _R.
+    if isinstance(merged.get("wall_s"), (int, float)):
+        _write_meta(trace_dir, {"wall_s": merged["wall_s"]})
     return merged
 
 
@@ -376,7 +420,7 @@ def axis_layout():
     results = []
     for name, spec in layouts.items():
         path = fx.make_fixture(name, spec)
-        for reader in ["pyarrow", "arrow_rs"]:
+        for reader in READERS:
             for mode in ["iter_batches"]:
                 label = f"layout__{name}__{mode}__{reader}"
                 d = _run_dir(label)
@@ -412,11 +456,13 @@ def axis_layout():
                         },
                     )
                 )
-                print(
-                    f"  {label}: wall={wall:.3f}s abs={peak:.0f}MB incr={incr:.0f}MB "
-                    f"rows={rows} native={nat} fallback={fb} "
-                    f"workers={wk['n_grown']}/{wk['n_workers']} "
-                    f"max_task={wk['max_worker_incr_mb']:.0f}MB"
+                _report(
+                    f"layout {name} {reader} ({mode})", wall, peak, incr, nat, fb,
+                    extra={
+                        "rows": rows,
+                        "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
+                        f"(max task {wk['max_worker_incr_mb']:.0f} MB)",
+                    },
                 )
     json.dump(results, open(os.path.join(OUT, "results_layout.json"), "w"), indent=2)
     return results
@@ -551,6 +597,315 @@ def axis_leak():
     return results
 
 
+def axis_leak_multigrp():
+    """Reproduce the apache/arrow#39808 / ray#49158 accumulation *inside Ray*, with
+    the geometry the issue is actually about: MANY small row groups feeding ONE
+    read task. ``axis_leak`` uses a single row group, where "whole file" == "one
+    row group" so the leak signature can't even appear (see the leak-signature
+    unit test's 16-group fixture); this axis fixes that.
+
+    Fixture: 6M rows of fat strings, ``row_group_size=200_000`` => 30 row groups,
+    one file (~900 MB decoded, ~30 MB per group).
+
+    Two "relevant settings" are pinned so the READER's working set is what USS
+    measures, not Ray's block packing (the confound in ``axis_leak``: a fixture
+    that fits inside one output block is held whole by every reader regardless of
+    how it decodes):
+      1. ``ctx.parquet_chunker_target_chunk_size`` — how row groups map to read
+         tasks (the knob the ParquetFileChunker resolves from; default falls back
+         to ``target_min_block_size`` = 1 MiB):
+           * ``one_chunk`` — target huge: all 30 groups land in ONE read task, so
+             the V2 scanner spans the whole file in a single ``scan_batches`` — the
+             #39808 leak geometry (also what a single fat row group or a raised
+             block-size target hits).
+           * ``per_group`` — target 0: one row group per read task — the bounded
+             geometry V2 normally produces (the "fixed" case).
+      2. ``ctx.target_max_block_size`` is dropped to 8 MiB and the consume is
+         ``decode_drop`` (touch each batch, keep only the row count) so output
+         blocks don't accumulate the whole file and mask the reader. What's left in
+         USS is the reader's own decode transient: the scanner's whole-scan
+         accumulation vs iter_batches' one-row-group floor vs arrow-rs' byte budget.
+
+    For the first two readers (``pyarrow`` scanner and ``pyarrow_iter``) we sweep
+    ``pre_buffer`` on/off: on holds the fragment's compressed column chunks
+    alongside the decoded output, off streams them. ``arrow_rs`` runs once (its
+    analog is the byte budget / fetch window, not pre_buffer). Peak + per-task
+    incremental USS shows how each reacts.
+    """
+    spec = {
+        "rows": 6_000_000,
+        "num_files": 1,
+        "row_group_size": 200_000,
+        "schema": "huge_str",
+    }
+    path = fx.make_fixture("leak_multigrp_30rg", spec)
+    small_block = 8 * MB  # shrink output blocks so the reader transient is visible
+    # (reader, pre_buffer): the first two readers sweep pre_buffer; arrow_rs once.
+    reader_configs = [
+        ("pyarrow", True),
+        ("pyarrow", False),
+        ("pyarrow_iter", True),
+        ("pyarrow_iter", False),
+        ("arrow_rs", None),
+    ]
+    # chunk_mode -> target_chunk_size handed to the chunker via ctx. HUGE bundles
+    # every row group into one read task; 0 forces one row group per task.
+    HUGE = 8 * 1024 * MB
+    chunk_modes = [("one_chunk", HUGE), ("per_group", 0)]
+    results = []
+    for chunk_mode, target in chunk_modes:
+        for reader, pre_buffer in reader_configs:
+            pb = "na" if pre_buffer is None else ("on" if pre_buffer else "off")
+            label = f"leakmg__{chunk_mode}__{reader}__pb_{pb}"
+            d = _run_dir(label)
+            ctx = _fresh_session(reader, d, pre_buffer=pre_buffer)
+            _warm(reader, d)
+            _note_fixture(d, path)
+            # Pin the row-group -> read-task grouping and shrink output blocks for
+            # the measured read only (after warm, which uses ordinary settings).
+            ctx.parquet_chunker_target_chunk_size = target
+            ctx.target_max_block_size = small_block
+            t0 = time.time()
+            rows = consume(ray.data.read_parquet(path), "decode_drop")
+            t1 = time.time()
+            ray.shutdown()
+            time.sleep(0.3)
+            peak = _node_sum_peak_mb(d, t0, t1)
+            incr = _node_sum_incr_peak_mb(d, t0, t1)
+            nat, fb = _count_paths(d)
+            wk = _worker_breakdown(d, t0, t1)
+            results.append(
+                _R(
+                    d,
+                    {
+                        "config": f"{chunk_mode}_pb-{pb}",
+                        "chunk_mode": chunk_mode,
+                        "reader": reader,
+                        "pre_buffer": pb,
+                        "wall_s": t1 - t0,
+                        "node_sum_peak_mb": peak,
+                        "node_sum_incr_mb": incr,
+                        "rows": rows,
+                        "t0": t0,
+                        "t1": t1,
+                        "native": nat,
+                        "fallback": fb,
+                        # read-task geometry is fixed by chunk_mode (one_chunk = 1
+                        # task spanning all groups; per_group = 1 task per group).
+                        # n_grown is grown WORKERS (1 here — preserve_order
+                        # serializes the tasks onto one worker at a time), not the
+                        # task count.
+                        "grown_workers": wk["n_grown"],
+                        "max_task_mb": wk["max_worker_incr_mb"],
+                        "workers": wk,
+                    },
+                )
+            )
+            _report(
+                f"leakmg {chunk_mode} {reader} pb={pb}", t1 - t0, peak, incr, nat, fb,
+                extra={
+                    "rows": rows,
+                    "grown": f"{wk['n_grown']}/{wk['n_workers']}",
+                    "max task": f"{wk['max_worker_incr_mb']:.0f} MB",
+                },
+            )
+    json.dump(
+        results, open(os.path.join(OUT, "results_leak_multigrp.json"), "w"), indent=2
+    )
+    return results
+
+
+def axis_reader_settings():
+    """How the READER's own settings move its memory, in the one-chunk leak
+    geometry (all 30 groups in one read task, so a whole-file-scale working set is
+    possible). Same fixture and isolation as ``axis_leak_multigrp`` (8 MiB output
+    blocks + ``decode_drop`` so what USS shows is the reader's decode transient,
+    not Ray's block packing). Each config varies ONE knob off its default:
+
+      pyarrow (scanner):
+        * batch_readahead {1,2,8(default),32} — decoded batches held ahead per
+          fragment. The prime suspect for the scanner's ~140 MB working set: it
+          should scale ~linearly here.
+        * pre_buffer {on(default),off} — compressed column chunks coalesced up
+          front. Expected ~no local effect (it is an S3 I/O knob).
+        * buffer_size {1,8(default),64 MiB} — per-stream compressed read buffer.
+      pyarrow_iter:
+        * pre_buffer {off(default),on}
+        * use_threads {off(default),on} — threaded decode is faster but holds
+          more of the row group at once.
+      arrow_rs:
+        * decode_budget {2,8(default),32 MiB} — its explicit working-set floor.
+    """
+    spec = {
+        "rows": 6_000_000,
+        "num_files": 1,
+        "row_group_size": 200_000,
+        "schema": "huge_str",
+    }
+    path = fx.make_fixture("leak_multigrp_30rg", spec)
+    small_block = 8 * MB
+    HUGE = 8 * 1024 * MB
+    # (reader, setting-label, extra worker env, arrow_rs budget MB or None)
+    configs = [
+        ("pyarrow", "scanner_default", {}, None),
+        ("pyarrow", "batch_readahead=1", {"RAY_DATA_ARROW_SCANNER_BATCH_READAHEAD": 1}, None),  # noqa: E501
+        ("pyarrow", "batch_readahead=2", {"RAY_DATA_ARROW_SCANNER_BATCH_READAHEAD": 2}, None),  # noqa: E501
+        ("pyarrow", "batch_readahead=32", {"RAY_DATA_ARROW_SCANNER_BATCH_READAHEAD": 32}, None),  # noqa: E501
+        ("pyarrow", "pre_buffer=off", {"RAY_DATA_PARQUET_PRE_BUFFER": 0}, None),
+        ("pyarrow", "buffer_size=1MB", {"RAY_DATA_PARQUET_FRAGMENT_BUFFER_SIZE": 1 * MB}, None),  # noqa: E501
+        ("pyarrow", "buffer_size=64MB", {"RAY_DATA_PARQUET_FRAGMENT_BUFFER_SIZE": 64 * MB}, None),  # noqa: E501
+        ("pyarrow_iter", "iter_default", {}, None),
+        ("pyarrow_iter", "iter_pre_buffer=on", {"RAY_DATA_PARQUET_PRE_BUFFER": 1}, None),
+        ("pyarrow_iter", "iter_use_threads=on", {"RAY_DATA_PARQUET_ITER_USE_THREADS": 1}, None),  # noqa: E501
+        ("arrow_rs", "budget=2MB", {}, 2),
+        ("arrow_rs", "budget=8MB", {}, 8),
+        ("arrow_rs", "budget=32MB", {}, 32),
+    ]
+    results = []
+    for reader, setting, extra_env, budget_mb in configs:
+        d = _run_dir(f"rknob__{reader}__{setting}")
+        kw = {"extra_env": extra_env}
+        if budget_mb is not None:
+            kw["budget_bytes"] = budget_mb * MB
+        ctx = _fresh_session(reader, d, **kw)
+        _warm(reader, d)
+        _note_fixture(d, path)
+        ctx.parquet_chunker_target_chunk_size = HUGE  # all groups -> one read task
+        ctx.target_max_block_size = small_block
+        t0 = time.time()
+        rows = consume(ray.data.read_parquet(path), "decode_drop")
+        t1 = time.time()
+        ray.shutdown()
+        time.sleep(0.3)
+        peak = _node_sum_peak_mb(d, t0, t1)
+        incr = _node_sum_incr_peak_mb(d, t0, t1)
+        nat, fb = _count_paths(d)
+        wk = _worker_breakdown(d, t0, t1)
+        results.append(
+            _R(
+                d,
+                {
+                    "config": setting,
+                    "reader": reader,
+                    "setting": setting,
+                    "wall_s": t1 - t0,
+                    "node_sum_peak_mb": peak,
+                    "node_sum_incr_mb": incr,
+                    "max_task_mb": wk["max_worker_incr_mb"],
+                    "rows": rows,
+                    "t0": t0,
+                    "t1": t1,
+                    "native": nat,
+                    "fallback": fb,
+                    "workers": wk,
+                },
+            )
+        )
+        _report(
+            f"rknob {reader} {setting}", t1 - t0, peak, incr, nat, fb,
+            extra={"rows": rows, "max task": f"{wk['max_worker_incr_mb']:.0f} MB"},
+        )
+    json.dump(
+        results, open(os.path.join(OUT, "results_reader_settings.json"), "w"), indent=2
+    )
+    return results
+
+
+def axis_leak_rgsize():
+    """The ray#49158 leak decomposed by row-group SIZE, V1 vs V2 vs iter vs arrow-rs.
+
+    Reproduces the two mechanisms found on 2026-07-27 (see Agents.md), using the
+    #49158 shape: FEW rows, HUGE binary cells (``blob`` schema, ~256 KiB/row). The
+    same data is written two ways so only the row-group geometry changes:
+
+      * ``many_tiny`` — ``row_group_size=16`` → ~200 tiny row groups. This is the
+        churn case. A V1 whole-file scanner spans all 200 groups and SURGES to the
+        whole-file working set; V2 fans one group per read task and stays bounded.
+        It is ALSO where arrow-rs can read *high* on RSS despite a smaller live
+        working set: 200 rapid decode/free cycles churn the crate's system
+        allocator, which retains freed pages, while PyArrow's jemalloc releases
+        them (a macOS-libmalloc artifact — on Linux glibc, re-run with
+        ``MALLOC_ARENA_MAX=2`` or an ``LD_PRELOAD`` jemalloc via the env levers
+        _fresh_session reads, and the gap should close).
+      * ``few_large`` — ``row_group_size`` = whole file / 4 → 4 big (~200 MB)
+        groups. This is the decode-FLOOR case: per-group fanning can't help because
+        one group IS huge, so the PyArrow scanner must materialize the whole group
+        while arrow-rs's byte budget streams it. arrow-rs's intended win.
+
+    Readers: ``pyarrow_v1`` (legacy whole-file scanner — the actual #49158 path),
+    ``pyarrow`` (V2 scanner), ``pyarrow_iter`` (V2 iter_batches), ``arrow_rs``.
+    Output blocks are shrunk to 8 MiB and the consume is ``decode_drop`` so USS
+    shows the reader's own transient, not Ray's retained output (same isolation as
+    ``axis_leak_multigrp``). ``max_task_mb`` — the busiest worker's windowed USS
+    growth — is the reader's working set; the node-sum trajectory over time
+    (graphed by summarize.plot_leak_rgsize) shows the V1 surge vs the V2 plateau.
+    """
+    # ~256 KiB cells × 3200 rows ≈ 800 MB per fixture; identical data, two layouts.
+    ROWS = 3200
+    many_tiny = fx.make_fixture(
+        "leakrg_blob_manytiny",
+        {"rows": ROWS, "num_files": 1, "row_group_size": 16, "schema": "blob"},
+    )
+    few_large = fx.make_fixture(
+        "leakrg_blob_fewlarge",
+        {"rows": ROWS, "num_files": 1, "row_group_size": ROWS // 4, "schema": "blob"},
+    )
+    geometries = [("many_tiny", many_tiny), ("few_large", few_large)]
+    readers = ["pyarrow_v1", "pyarrow", "pyarrow_iter", "arrow_rs"]
+    small_block = 8 * MB
+    results = []
+    for geom, path in geometries:
+        for reader in readers:
+            d = _run_dir(f"leakrg__{geom}__{reader}")
+            ctx = _fresh_session(reader, d)
+            _warm(reader, d)
+            _note_fixture(d, path)
+            # Shrink output blocks for the measured read (after warm) so retained
+            # output doesn't mask the reader's decode transient.
+            ctx.target_max_block_size = small_block
+            t0 = time.time()
+            rows = consume(ray.data.read_parquet(path), "decode_drop")
+            t1 = time.time()
+            ray.shutdown()
+            time.sleep(0.3)
+            peak = _node_sum_peak_mb(d, t0, t1)
+            incr = _node_sum_incr_peak_mb(d, t0, t1)
+            nat, fb = _count_paths(d)
+            wk = _worker_breakdown(d, t0, t1)
+            results.append(
+                _R(
+                    d,
+                    {
+                        "config": f"{geom}_{reader}",
+                        "geom": geom,
+                        "reader": reader,
+                        "wall_s": t1 - t0,
+                        "node_sum_peak_mb": peak,
+                        "node_sum_incr_mb": incr,
+                        "max_task_mb": wk["max_worker_incr_mb"],
+                        "rows": rows,
+                        "t0": t0,
+                        "t1": t1,
+                        "native": nat,
+                        "fallback": fb,
+                        "workers": wk,
+                    },
+                )
+            )
+            _report(
+                f"leakrg {geom} {reader}", t1 - t0, peak, incr, nat, fb,
+                extra={
+                    "rows": rows,
+                    "grown": f"{wk['n_grown']}/{wk['n_workers']}",
+                    "max task": f"{wk['max_worker_incr_mb']:.0f} MB",
+                },
+            )
+    json.dump(
+        results, open(os.path.join(OUT, "results_leak_rgsize.json"), "w"), indent=2
+    )
+    return results
+
+
 def axis_mixed():
     # 7 files, each a different schema with a different bytes/row, in one dataset
     # dir read as a single dataset. Tests (a) whether arrow-rs's per-group byte
@@ -560,7 +915,7 @@ def axis_mixed():
     # PyArrow for the ray_tensor file, in one read, without breaking.
     path = fx.make_mixed_fixture("mixed7_tensor", per=400_000)
     results = []
-    for reader in ["pyarrow", "arrow_rs"]:
+    for reader in READERS:
         rd = _run_dir(f"mixed__{reader}")
         _fresh_session(reader, rd)
         _warm(reader, rd)
@@ -592,11 +947,13 @@ def axis_mixed():
                 },
             )
         )
-        print(
-            f"  mixed {reader}: wall={wall:.3f}s rows={rows} abs={peak:.0f}MB "
-            f"incr={incr:.0f}MB native={nat} fallback={fb} "
-            f"workers={wk['n_grown']}/{wk['n_workers']} "
-            f"max_task={wk['max_worker_incr_mb']:.0f}MB"
+        _report(
+            f"mixed {reader}", wall, peak, incr, nat, fb,
+            extra={
+                "rows": rows,
+                "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
+                f"(max task {wk['max_worker_incr_mb']:.0f} MB)",
+            },
         )
     json.dump(results, open(os.path.join(OUT, "results_mixed.json"), "w"), indent=2)
     return results
@@ -726,6 +1083,32 @@ def _worker_breakdown(trace_dir, t0, t1):
     }
 
 
+def _report(label, wall, peak=None, incr=None, native=None, fallback=None, extra=None):
+    """One clean, uniform per-run block (mirrors mem3.py) so a sweep reads as a
+    stack of labelled blocks instead of cramped one-liners.
+
+    The ABSOLUTE node-sum peak is the metric of record here -- it's what the OOM
+    killer / Ray's memory monitor act on, and the only memory column summary.csv
+    keeps. ``incr`` (baseline-subtracted) is a secondary DIAGNOSTIC, not a ranking
+    number: subtracting each worker's warm baseline systematically flatters
+    whichever reader retains more warm heap (Agents.md §3.5), so the old one-liners
+    that led with ``incr=`` were quietly disagreeing with the CSV. The decode-path
+    line prints only when the arrow-rs trace wrote something (pyarrow leaves it
+    blank -- absence + native=0 is itself the "PyArrow ran" signal)."""
+    print(f"\n===== {label} =====")
+    print(f"wall           : {wall:6.3f}s")
+    if peak is not None:
+        print(f"node-sum peak  : {peak:7.0f} MB   (absolute -- OOM killer / summary.csv)")
+    if incr is not None:
+        print(f"node-sum incr  : {incr:7.0f} MB   (read-caused delta -- diagnostic only)")
+    if native or fallback:
+        n, fb = native or 0, fallback or 0
+        verdict = "ARROW-RS" if n and not fb else "MIXED/FALLBACK"
+        print(f"decode path    : native={n}  fallback={fb}  ({verdict})")
+    for k, v in (extra or {}).items():
+        print(f"{k:<15}: {v}")
+
+
 def axis_scaling():
     """Is arrow-rs O(n) or O(n^2) on ONE big row group? If a per-batch reader
     rebuild (growing RowSelection skip) lurked, wall/row would GROW with row count.
@@ -741,7 +1124,7 @@ def axis_scaling():
             "schema": "wide_str",
         }
         path = fx.make_fixture(f"scale_{rows}", spec)
-        for reader in ["pyarrow", "arrow_rs"]:
+        for reader in READERS:
             d = _run_dir(f"scale__{rows}__{reader}")
             _fresh_session(reader, d)
             _warm(reader, d)
@@ -796,7 +1179,7 @@ def axis_concurrency():
     }
     for fxname, spec in fixtures.items():
         path = fx.make_fixture(f"conc_{fxname}", spec)
-        for reader in ["pyarrow", "arrow_rs"]:
+        for reader in READERS:
             for ncpu in [2, 4]:
                 d = _run_dir(f"conc__{fxname}__{reader}__cpu{ncpu}")
                 _fresh_session(reader, d, num_cpus=ncpu)
@@ -828,9 +1211,9 @@ def axis_concurrency():
                         },
                     )
                 )
-                print(
-                    f"  conc {fxname} {reader} cpu={ncpu}: wall={t1-t0:.3f}s "
-                    f"abs={peak:.0f}MB incr={incr:.0f}MB native={nat} fallback={fb}"
+                _report(
+                    f"conc {fxname} {reader} cpu={ncpu}", t1 - t0, peak, incr, nat, fb,
+                    extra={"rows": rows},
                 )
     json.dump(
         results, open(os.path.join(OUT, "results_concurrency.json"), "w"), indent=2
@@ -881,7 +1264,7 @@ def axis_showcase():
     results = []
     for name, spec in configs.items():
         path = fx.make_fixture(f"show_{name}", spec)
-        for reader in ["pyarrow", "arrow_rs"]:
+        for reader in READERS:
             d = _run_dir(f"show__{name}__{reader}")
             _fresh_session(reader, d, num_cpus=4)
             _warm(reader, d)
@@ -912,9 +1295,9 @@ def axis_showcase():
                     },
                 )
             )
-            print(
-                f"  show {name} {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
-                f"incr={incr:.0f}MB rows={rows} native={nat} fallback={fb}"
+            _report(
+                f"showcase {name} {reader}", t1 - t0, peak, incr, nat, fb,
+                extra={"rows": rows},
             )
     json.dump(results, open(os.path.join(OUT, "results_showcase.json"), "w"), indent=2)
     return results
@@ -934,7 +1317,7 @@ def _run_sweep(name, levels, mode="iter_batches", num_cpus=4):
         budget = lv.get("budget_bytes", 8 * MB)
         ncpu = lv.get("num_cpus", num_cpus)
         path = fx.make_fixture(lv["fixture_name"], spec)
-        for reader in ["pyarrow", "arrow_rs"]:
+        for reader in READERS:
             d = _run_dir(f"sweep_{name}__{lv['label']}__{reader}")
             _fresh_session(reader, d, budget_bytes=budget, num_cpus=ncpu)
             _warm(reader, d)
@@ -970,12 +1353,13 @@ def _run_sweep(name, levels, mode="iter_batches", num_cpus=4):
                     },
                 )
             )
-            print(
-                f"  sweep[{name}] {lv['label']} {reader}: wall={t1-t0:.3f}s "
-                f"abs={peak:.0f}MB incr={incr:.0f}MB rows={rows} "
-                f"native={nat} fallback={fb} "
-                f"workers={wk['n_grown']}/{wk['n_workers']} "
-                f"max_task={wk['max_worker_incr_mb']:.0f}MB"
+            _report(
+                f"sweep[{name}] {lv['label']} {reader}", t1 - t0, peak, incr, nat, fb,
+                extra={
+                    "rows": rows,
+                    "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
+                    f"(max task {wk['max_worker_incr_mb']:.0f} MB)",
+                },
             )
     json.dump(
         results, open(os.path.join(OUT, f"results_sweep_{name}.json"), "w"), indent=2
@@ -1163,7 +1547,7 @@ def axis_workloads():
     path = fx.make_fixture("wl_int_4M", spec)
     high = (1 << 30) - 2000  # selective: only a sliver of i0 exceeds this
     results = []
-    for reader in ["pyarrow", "arrow_rs"]:
+    for reader in READERS:
         # Aggregation: sum one column. Full decode, output = one scalar.
         d = _run_dir(f"wl__sum__{reader}")
         _fresh_session(reader, d)
@@ -1196,11 +1580,12 @@ def axis_workloads():
                 },
             )
         )
-        print(
-            f"  wl sum {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
-            f"incr={incr:.0f}MB native={nat} fallback={fb} "
-            f"workers={wk['n_grown']}/{wk['n_workers']} "
-            f"max_task={wk['max_worker_incr_mb']:.0f}MB"
+        _report(
+            f"workload sum(i0) {reader}", t1 - t0, peak, incr, nat, fb,
+            extra={
+                "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
+                f"(max task {wk['max_worker_incr_mb']:.0f} MB)",
+            },
         )
         # Selective read-time filter: decode all, keep a sliver. Non-empty
         # projection so the arrow-rs path runs (count() would empty-project → fallback).
@@ -1237,13 +1622,86 @@ def axis_workloads():
                 },
             )
         )
-        print(
-            f"  wl filter {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
-            f"incr={incr:.0f}MB kept={kept} native={nat} fallback={fb} "
-            f"workers={wk['n_grown']}/{wk['n_workers']} "
-            f"max_task={wk['max_worker_incr_mb']:.0f}MB"
+        _report(
+            f"workload filter(i0>hi) {reader}", t1 - t0, peak, incr, nat, fb,
+            extra={
+                "kept rows": kept,
+                "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
+                f"(max task {wk['max_worker_incr_mb']:.0f} MB)",
+            },
         )
     json.dump(results, open(os.path.join(OUT, "results_workloads.json"), "w"), indent=2)
+    return results
+
+
+def axis_kfan():
+    """Does raising the intra-row-group split K help on a LONE big row group?
+
+    K splits the single row group into K contiguous row-RANGES, each handled by
+    its own concurrent worker that does its OWN byte-range fetch AND its own decode
+    for that slice -- so K parallelizes I/O and decode together, as a data-parallel
+    split (it is NOT pyarrow-style pipeline overlap; within a range decode is still
+    sequential). Locally there is no network latency to hide, so the I/O half is
+    moot; the only lever that can pay off is decode-parallelism across cores. The
+    cost is memory: each of the K ranges holds its own decode transient, so peak
+    grows toward ~K x the K=1 working set.
+
+    This axis makes that trade explicit on the arrow-rs thesis fixture (one 4M-row
+    row group > the block-size split threshold, so K actually engages): PyArrow as
+    the reference, then arrow-rs at K=1,2,4. If peak climbs with K while wall stays
+    flat, the K=1 memory win was partly "arrow-rs did less parallel work", and a
+    tuned-up (K=4) arrow-rs lands closer to PyArrow's node-sum peak."""
+    spec = {
+        "rows": 4_000_000,
+        "num_files": 1,
+        "row_group_size": 4_000_000,
+        "schema": "wide_str",
+    }
+    path = fx.make_fixture("kfan_4M_1rg", spec)
+    results = []
+    # PyArrow reference (K is a no-op for it), then arrow-rs across K.
+    runs = [("pyarrow", 1)] + [("arrow_rs", k) for k in (1, 2, 4)]
+    for reader, k in runs:
+        d = _run_dir(f"kfan__k{k}__{reader}")
+        _fresh_session(reader, d, k=k)
+        _warm(reader, d)
+        _note_fixture(d, path)
+        t0 = time.time()
+        rows = consume(ray.data.read_parquet(path), "iter_batches")
+        t1 = time.time()
+        ray.shutdown()
+        time.sleep(0.3)
+        peak = _node_sum_peak_mb(d, t0, t1)
+        incr = _node_sum_incr_peak_mb(d, t0, t1)
+        nat, fb = _count_paths(d)
+        wk = _worker_breakdown(d, t0, t1)
+        results.append(
+            _R(
+                d,
+                {
+                    "reader": reader,
+                    "k": k,
+                    "wall_s": t1 - t0,
+                    "node_sum_peak_mb": peak,
+                    "node_sum_incr_mb": incr,
+                    "rows": rows,
+                    "t0": t0,
+                    "t1": t1,
+                    "native": nat,
+                    "fallback": fb,
+                    "workers": wk,
+                },
+            )
+        )
+        _report(
+            f"kfan K={k} {reader}", t1 - t0, peak, incr, nat, fb,
+            extra={
+                "rows": rows,
+                "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
+                f"(max task {wk['max_worker_incr_mb']:.0f} MB)",
+            },
+        )
+    json.dump(results, open(os.path.join(OUT, "results_kfan.json"), "w"), indent=2)
     return results
 
 
@@ -1267,6 +1725,15 @@ def axis_s3():
         batching). Swept {2, 8, 32} MiB at a fixed 16 MiB window to confirm the
         standalone finding that budget is the *floor* knob (small mem effect) while
         the window is the lever. Default is 2 MiB (was 8; lowered per the local win).
+      * ``prefetch_windows`` — the latency lever. Consecutive fetch windows are
+        pipelined this many deep: depth 1 fetches window N+1 only after decoding N
+        (strictly serial); depth 2 issues N+1's GET while N decodes, hiding S3
+        first-byte latency behind decode; depth 4 adds slack for fetch-time jitter.
+        Swept {1, 2, 4} at window 16 / budget 2 / sys. Memory-bounded analog of
+        PyArrow's whole-fragment ``pre_buffer``: recovers the latency PyArrow hides
+        but at ``prefetch_windows * fetch_window`` compressed in flight (~2 windows),
+        not the whole row group. Expect wall to drop 1->2 then flatten, peak to rise
+        ~linearly in depth.
       * allocator — the retention lever (§7.8), all env-only / no recompile:
         ``MALLOC_ARENA_MAX=2`` (glibc arena cap) always runs; and if you export
         ``RAY_DATA_ARROW_RS_MIMALLOC_SO`` / ``RAY_DATA_ARROW_RS_JEMALLOC_SO`` to the
@@ -1288,21 +1755,29 @@ def axis_s3():
         )
         return []
 
-    # (reader, fetch_window_mb, budget_mb, malloc_arena_max, ld_preload) configs.
-    # window/budget/arena/preload are ignored by the pyarrow baseline. The window
-    # and budget sweeps cross at (window=16, budget=2) so that point is shared.
+    # (reader, fetch_window_mb, budget_mb, malloc_arena_max, ld_preload,
+    # prefetch_windows) configs. window/budget/arena/preload/prefetch are ignored by
+    # the pyarrow baseline. The window, budget, and prefetch sweeps all cross at
+    # (window=16, budget=2, prefetch=2, sys) so that point is shared across them.
     configs = [
-        ("pyarrow", None, None, None, None),
-        # --- window sweep @ fixed 2 MiB budget (the memory lever) ---
-        ("arrow_rs", 4, 2, None, None),
-        ("arrow_rs", 16, 2, None, None),
-        ("arrow_rs", 64, 2, None, None),
-        ("arrow_rs", 0, 2, None, None),  # no window cap (control: shows win's size)
-        # --- budget sweep @ fixed 16 MiB window (the floor knob) ---
-        ("arrow_rs", 16, 8, None, None),
-        ("arrow_rs", 16, 32, None, None),
-        # --- allocator sweep @ window 16 / budget 2 (all env-only, no recompile) ---
-        ("arrow_rs", 16, 2, 2, None),  # glibc + MALLOC_ARENA_MAX=2
+        ("pyarrow", None, None, None, None, None),
+        # --- window sweep @ fixed 2 MiB budget, prefetch 2 (the memory lever) ---
+        ("arrow_rs", 4, 2, None, None, 2),
+        ("arrow_rs", 16, 2, None, None, 2),
+        ("arrow_rs", 64, 2, None, None, 2),
+        ("arrow_rs", 0, 2, None, None, 2),  # no window cap (control: win's size)
+        # --- budget sweep @ fixed 16 MiB window, prefetch 2 (the floor knob) ---
+        ("arrow_rs", 16, 8, None, None, 2),
+        ("arrow_rs", 16, 32, None, None, 2),
+        # --- prefetch-depth sweep @ window 16 / budget 2 / sys (the latency lever):
+        # depth 1 = strictly-serial windows (fetch W_{n+1} only after decode W_n);
+        # depth 2 = one fetch hidden behind a decode; depth 4 = tail-jitter slack.
+        # Expect wall to drop 1->2 and flatten 2->4, mem to rise ~linearly in depth
+        # (each slot is one more window of compressed bytes in flight). ---
+        ("arrow_rs", 16, 2, None, None, 1),
+        ("arrow_rs", 16, 2, None, None, 4),
+        # --- allocator sweep @ window 16 / budget 2 / prefetch 2 (env-only) ---
+        ("arrow_rs", 16, 2, 2, None, 2),  # glibc + MALLOC_ARENA_MAX=2
     ]
     # LD_PRELOAD allocator A/B (#9): only added when the .so path is provided, so a
     # box without the lib installed just skips it. Find paths with e.g.
@@ -1310,11 +1785,11 @@ def axis_s3():
     mi = os.environ.get("RAY_DATA_ARROW_RS_MIMALLOC_SO")
     je = os.environ.get("RAY_DATA_ARROW_RS_JEMALLOC_SO")
     if mi:
-        configs.append(("arrow_rs", 16, 2, None, mi))  # LD_PRELOAD mimalloc
+        configs.append(("arrow_rs", 16, 2, None, mi, 2))  # LD_PRELOAD mimalloc
     if je:
-        configs.append(("arrow_rs", 16, 2, None, je))  # LD_PRELOAD jemalloc
+        configs.append(("arrow_rs", 16, 2, None, je, 2))  # LD_PRELOAD jemalloc
     results = []
-    for reader, window, budget_mb, arena, preload in configs:
+    for reader, window, budget_mb, arena, preload, pf in configs:
         alloc = (
             "mi"
             if preload and "mimalloc" in preload
@@ -1327,7 +1802,7 @@ def axis_s3():
         tag = (
             reader
             if reader == "pyarrow"
-            else f"arrow_rs_w{window}_b{budget_mb}_{alloc}"
+            else f"arrow_rs_w{window}_b{budget_mb}_pf{pf}_{alloc}"
         )
         d = _run_dir(f"s3__{tag}")
         _fresh_session(
@@ -1335,6 +1810,7 @@ def axis_s3():
             d,
             budget_bytes=(budget_mb or 2) * MB,
             fetch_window_mb=(window or 0),
+            prefetch_windows=(pf or 2),
             malloc_arena_max=arena,
             ld_preload=preload,
         )
@@ -1360,6 +1836,7 @@ def axis_s3():
                     "tag": tag,
                     "fetch_window_mb": window,
                     "budget_mb": budget_mb,
+                    "prefetch_windows": pf,
                     "malloc_arena_max": arena,
                     "ld_preload": preload,
                     "alloc": alloc,
@@ -1374,9 +1851,9 @@ def axis_s3():
                 },
             )
         )
-        print(
-            f"  s3 {tag}: wall={t1-t0:.3f}s abs_peak={peak:.0f}MB "
-            f"incr_peak={incr:.0f}MB rows={rows} native={nat} fallback={fb}"
+        _report(
+            f"s3 {tag}", t1 - t0, peak, incr, nat, fb,
+            extra={"rows": rows},
         )
     json.dump(results, open(os.path.join(OUT, "results_s3.json"), "w"), indent=2)
     return results
@@ -1448,7 +1925,7 @@ def axis_s3_geom():
     try:
         for name, spec in geometries.items():
             path = fx.make_fixture(f"s3geom_{name}", spec)  # uploads once, then reused
-            for reader in ["pyarrow", "arrow_rs"]:
+            for reader in READERS:
                 d = _run_dir(f"s3geom__{name}__{reader}")
                 _fresh_session(
                     reader, d, budget_bytes=2 * MB, fetch_window_mb=16, num_cpus=4
@@ -1482,9 +1959,9 @@ def axis_s3_geom():
                         },
                     )
                 )
-                print(
-                    f"  s3geom {name} {reader}: wall={t1-t0:.3f}s abs={peak:.0f}MB "
-                    f"incr={incr:.0f}MB rows={rows} native={nat} fallback={fb}"
+                _report(
+                    f"s3geom {name} {reader}", t1 - t0, peak, incr, nat, fb,
+                    extra={"rows": rows},
                 )
     finally:
         fx.FIXTURE_ROOT = saved_root
@@ -1497,6 +1974,9 @@ AXES = {
     "schema": axis_schema,
     "tuning": axis_tuning,
     "leak": axis_leak,
+    "leak_multigrp": axis_leak_multigrp,
+    "leak_rgsize": axis_leak_rgsize,
+    "reader_settings": axis_reader_settings,
     "mixed": axis_mixed,
     "scaling": axis_scaling,
     "concurrency": axis_concurrency,
@@ -1508,6 +1988,7 @@ AXES = {
     "sweep_schema": sweep_schema,
     "sweep_batch_dd": sweep_batch_dd,
     "workloads": axis_workloads,
+    "kfan": axis_kfan,
     "s3": axis_s3,
     "s3_geom": axis_s3_geom,
 }
@@ -1535,6 +2016,8 @@ def write_summary_csv():
         if axis == "scaling" and r.get("rows"):
             base = f"{r['rows'] // 1_000_000}M"
         extra = []
+        if r.get("k") is not None:
+            extra.append(f"k{r['k']}")
         if r.get("budget_mb") is not None:
             extra.append(f"b{r['budget_mb']}")
         if r.get("num_cpus") is not None:

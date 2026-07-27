@@ -20,14 +20,28 @@ parquet = { version = "59", features = ["arrow", "async", "object_store"] }
 # `pyarrow` would drag in arrow-pyarrow → pyo3 0.28, conflicting with our pyo3 0.22.
 arrow = { version = "59", features = ["ffi"] }
 object_store = { version = "0.13", features = ["aws"] }
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+# `extension-module` is behind a default feature so `cargo test` can run the
+# pure-Rust unit tests (predicate pruning) by linking libpython:
+#   cargo test --no-default-features
+# maturin builds with default features on, so the shipped extension is unchanged.
+pyo3 = { version = "0.22", features = ["abi3-py39"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
+# Predicate IR is passed from Python as a small JSON string (built from the Ray
+# `Expr` AST) and parsed here into a `Pred` tree for row-group stats pruning.
+# JSON keeps the boundary language-agnostic and lets the pruning logic be
+# unit-tested in pure Rust with string literals (no parquet fixtures needed).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # No optional allocator features: an allocator-retention theory was tested and
 # disproven (Agents.md §3.5.1/§7.8) — the system allocator is correct here, and
 # mimalloc-as-global-allocator segfaulted Ray workers across the FFI boundary.
 # Allocator A/B experiments use LD_PRELOAD, which needs no crate support.
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [profile.release]
 opt-level = 3

@@ -354,7 +354,16 @@ class ParquetFileReader(FileReader):
             else None
         )
         read_columns = _resolve_read_columns(columns, filter_expr, filter_columns)
-        if not _needs_nested_type_fallback(fragment, read_columns):
+        # Benchmark lever (not a product knob): force EVERY fragment down the
+        # ``pq.ParquetFile.iter_batches`` row-level path, not just the ARROW-5030
+        # nested cases. Lets the arrow-rs bench A/B the *scanner* path (the normal
+        # V2 read) against the *iter_batches* path (lower peak, but not Ray's
+        # default) as two distinct PyArrow readers. Off by default → no behavior
+        # change for real reads.
+        force_iter_batches = env_bool("RAY_DATA_PARQUET_FORCE_ITER_BATCHES", False)
+        if not force_iter_batches and not _needs_nested_type_fallback(
+            fragment, read_columns
+        ):
             yield from super()._iter_fragment_tables(fragment, scanner_kwargs)
             return
 
@@ -369,9 +378,16 @@ class ParquetFileReader(FileReader):
 
         batch_size = scanner_kwargs.get("batch_size")
 
+        # ``pre_buffer`` on the iter path defaults to pyarrow's own default
+        # (``False``): iter_batches streams a row group at a time, so coalescing
+        # every column chunk up front would inflate the working set for no I/O
+        # win on local files. ``RAY_DATA_PARQUET_PRE_BUFFER`` overrides it (shared
+        # with the scanner path) so the benchmark can A/B the memory effect of
+        # pre-buffering on both readers.
         pf = pq.ParquetFile(
             fragment.path,
             filesystem=fragment.filesystem,  # pyrefly: ignore[unexpected-keyword]
+            pre_buffer=env_bool("RAY_DATA_PARQUET_PRE_BUFFER", False),
         )
 
         # Scope the safe batch-size calculation to the columns actually being
@@ -454,10 +470,15 @@ class ParquetFileReader(FileReader):
             for column_name in columns_to_null_fill
         }
 
+        # ``use_threads`` defaults to False on the iter path: single-threaded
+        # decode keeps the working set to ~one column chunk at a time. Threaded
+        # decode is faster but holds more of the row group at once;
+        # ``RAY_DATA_PARQUET_ITER_USE_THREADS`` exposes the trade-off for the
+        # benchmark.
         for batch in pf.iter_batches(
             batch_size=fallback_batch_size,
             columns=read_columns,
-            use_threads=False,
+            use_threads=env_bool("RAY_DATA_PARQUET_ITER_USE_THREADS", False),
             row_groups=row_groups,
         ):
             table = pa.Table.from_batches([batch])
@@ -506,11 +527,21 @@ class ParquetFileReader(FileReader):
         # meaningful bytes per round-trip. Tunable via env var for
         # workloads that need a different point on the latency/memory-
         # peak curve.
+        # ``RAY_DATA_PARQUET_PRE_BUFFER`` (default ``True`` here, matching
+        # pyarrow's scanner default) lets the benchmark toggle pre-buffering to
+        # measure its memory cost: with it on, the whole fragment's compressed
+        # column chunks are held in memory alongside the decoded output; with it
+        # off, they are streamed. The same env knob drives the iter_batches path.
         kwargs: dict = {
             "fragment_scan_options": pds.ParquetFragmentScanOptions(
                 use_buffered_stream=True,
                 buffer_size=_PARQUET_FRAGMENT_BUFFER_SIZE,
+                pre_buffer=env_bool("RAY_DATA_PARQUET_PRE_BUFFER", True),
             ),
-            "fragment_readahead": 1,
+            # How many fragments pyarrow scans ahead. Only bites when a read task
+            # spans multiple fragments; 1 keeps the in-flight set to the current
+            # fragment. Tunable so the benchmark can measure the multi-fragment
+            # (per-group-chunk) case.
+            "fragment_readahead": env_integer("RAY_DATA_PARQUET_FRAGMENT_READAHEAD", 1),
         }
         return kwargs

@@ -1566,6 +1566,8 @@ dependencies = [
  "object_store",
  "parquet",
  "pyo3",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

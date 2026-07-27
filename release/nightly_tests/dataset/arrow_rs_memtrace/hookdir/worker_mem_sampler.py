@@ -44,34 +44,69 @@ _started = False
 
 
 def _patch_task_windows(trace_dir, host, pid):
-    """Wrap FileReader.read so every read task appends (t_start, t_end) to
-    tasks_<host>_<pid>.csv. Covers pyarrow AND arrow-rs (shared base class)."""
+    """Wrap ``read`` so every read task appends (t_start, t_end) to
+    tasks_<host>_<pid>.csv.
+
+    Both readers must be covered, but they no longer share ONE read entrypoint:
+    the pyarrow reader inherits ``FileReader.read``, while
+    ``ArrowRsParquetFileReader`` OVERRIDES ``read`` (the PyArrow-free native path,
+    2026-07-24 migration) and only calls ``super().read()`` on its fallback
+    branches. So we patch EACH class that defines ``read``. To avoid double-
+    counting a native-then-fallback arrow-rs read (its override calls the base
+    override), a per-instance reentrancy flag records only the OUTERMOST call —
+    the one true task window. If the arrow-rs reader isn't importable (crate
+    absent), only the base is patched and the sampler still runs."""
+    tpath = os.path.join(trace_dir, f"tasks_{host}_{pid}.csv")
+
+    def _record(t0, n):
+        try:
+            new = not os.path.exists(tpath)
+            with open(tpath, "a", buffering=1) as tf:
+                if new:
+                    tf.write("t_start,t_end,tables\n")
+                tf.write(f"{t0:.6f},{time.time():.6f},{n}\n")
+        except Exception:
+            pass
+
+    def _wrap(cls):
+        orig_read = cls.read
+
+        def read(self, input_split):
+            outer = not getattr(self, "_mem_trace_in_read", False)
+            if outer:
+                self._mem_trace_in_read = True
+            t0 = time.time()
+            n = 0
+            try:
+                for tbl in orig_read(self, input_split):
+                    n += 1
+                    yield tbl
+            finally:
+                if outer:
+                    self._mem_trace_in_read = False
+                    _record(t0, n)
+
+        cls.read = read
+
     try:
         from ray.data._internal.datasource_v2.readers.file_reader import FileReader
     except Exception:
         return  # datasource_v2 unavailable — sampler still runs
+    _wrap(FileReader)
+    try:
+        from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (  # noqa: E501
+            ArrowRsParquetFileReader,
+        )
 
-    orig_read = FileReader.read
-    tpath = os.path.join(trace_dir, f"tasks_{host}_{pid}.csv")
-
-    def read(self, input_split):
-        t0 = time.time()
-        n = 0
+        _wrap(ArrowRsParquetFileReader)
+    except Exception as e:  # crate/module absent — base patch covers pyarrow
+        # Leave a breadcrumb so a missing arrow-rs task trace is diagnosable
+        # (was it "the wrap never applied" vs "the worker died mid-read"?).
         try:
-            for tbl in orig_read(self, input_split):
-                n += 1
-                yield tbl
-        finally:
-            try:
-                new = not os.path.exists(tpath)
-                with open(tpath, "a", buffering=1) as tf:
-                    if new:
-                        tf.write("t_start,t_end,tables\n")
-                    tf.write(f"{t0:.6f},{time.time():.6f},{n}\n")
-            except Exception:
-                pass
-
-    FileReader.read = read
+            with open(os.path.join(trace_dir, f"hookdbg_{host}_{pid}.log"), "a") as fh:
+                fh.write(f"arrow_rs wrap SKIPPED: {type(e).__name__}: {e}\n")
+        except Exception:
+            pass
 
 
 def setup():

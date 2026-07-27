@@ -126,6 +126,27 @@ def _huge_str(rng, n):
     return _str_cols(rng, n, ncols=3, width=48)
 
 
+# Cell size for the ``blob`` schema (bytes per row). ~256 KiB reproduces the
+# ray#49158 / embedding-table geometry: FEW rows, HUGE cells. Override with
+# RAY_DATA_ARROW_RS_BLOB_CELL_BYTES to make the fixture bigger/smaller.
+_BLOB_CELL_BYTES = int(os.environ.get("RAY_DATA_ARROW_RS_BLOB_CELL_BYTES", 256 * 1024))
+
+
+def _blob(rng, n):
+    # Few rows, one HUGE binary cell each — the ray#49158 shape (a 2 GB file with
+    # ~5 000 rows of embeddings). Incompressible random bytes so on-disk ≈ decoded
+    # (snappy can't shrink them), which makes the whole-row-group decode floor
+    # explicit: a whole-group reader must materialize rows/rg × cell bytes, while a
+    # byte-budgeted streamer does not. The row-group *count* is set by the spec's
+    # row_group_size, so the same schema yields both the many-tiny-group churn case
+    # and the few-large-group decode-floor case.
+    blobs = [rng.bytes(_BLOB_CELL_BYTES) for _ in range(n)]
+    return {
+        "id": pa.array(np.arange(n, dtype=np.int64)),
+        "payload": pa.array(blobs, type=pa.binary()),
+    }
+
+
 def _struct(rng, n):
     a = pa.array(rng.integers(0, 1 << 20, n, dtype=np.int64))
     b = pa.array(rng.random(n))
@@ -173,6 +194,7 @@ SCHEMA_BUILDERS = {
     "wide_str": _wide_str,
     "large_str": _large_str,
     "huge_str": _huge_str,
+    "blob": _blob,
     "struct": _struct,
     "list": _list,
     "ray_tensor": _ray_tensor,
@@ -180,9 +202,10 @@ SCHEMA_BUILDERS = {
 }
 
 # Schemas the native arrow-rs path is expected to handle: flat types plus
-# struct/list nesting (ungated 2026-07-21). Extension types (both tensor
-# flavors) still fall back to PyArrow.
-NATIVE_SCHEMAS = {"int", "float", "wide_str", "large_str", "huge_str",
+# struct/list nesting (ungated 2026-07-21). ``blob`` is a flat binary column, so
+# it decodes natively too. Extension types (both tensor flavors) still fall back
+# to PyArrow.
+NATIVE_SCHEMAS = {"int", "float", "wide_str", "large_str", "huge_str", "blob",
                   "struct", "list"}
 
 

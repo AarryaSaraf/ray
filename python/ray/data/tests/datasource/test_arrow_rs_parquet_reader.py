@@ -54,6 +54,18 @@ def _read_sorted(path, use_arrow_rs, restore_ctx, **read_kwargs):
     return pa.Table.from_pandas(ds.to_pandas()).sort_by("id")
 
 
+def _read_arrow_sorted(path, use_arrow_rs, restore_ctx, **read_kwargs):
+    """Like :func:`_read_sorted` but materializes straight to Arrow (no pandas
+    round-trip). Required for columns whose Arrow type can't round-trip through
+    pandas — e.g. multi-dimensional tensor extensions, which ``from_pandas``
+    rejects ("Can only convert 1-dimensional array values"). Both readers go
+    through this identically, so the ``.equals`` comparison stays a fair parity
+    check on the reader output itself."""
+    restore_ctx.use_arrow_rs_parquet_reader = use_arrow_rs
+    ds = ray.data.read_parquet(str(path), **read_kwargs)
+    return pa.concat_tables(ray.get(ds.to_arrow_refs())).sort_by("id")
+
+
 @pytest.mark.parametrize("row_group_size", [20_000, 5_000])
 def test_arrow_rs_parity_full_scan(tmp_path, restore_ctx, row_group_size):
     """arrow-rs and PyArrow produce identical tables (full scan)."""
@@ -190,15 +202,311 @@ def test_native_path_actually_runs(tmp_path):
     assert got.sort_by("id").equals(table.sort_by("id"))
 
 
-def test_filter_pushdown_prunes_row_groups(tmp_path, restore_ctx):
-    """A pushed-down predicate must prune row groups via footer statistics
-    BEFORE the crate fetches/decodes them (mirroring the PyArrow path's
-    ``fragment.subset``). On a sorted ``id`` over 4 row groups, ``id >= 3000``
-    must reach the crate as ``row_groups=[3]``; a predicate no row group can
-    satisfy must not call the crate at all. Results stay byte-correct."""
+def _make_manifest(paths, sizes, chunk_metadatas):
+    from ray.data._internal.datasource_v2.listing.file_manifest import FileManifest
+
+    return FileManifest.construct_manifest(paths, sizes, chunk_metadatas)
+
+
+def test_native_read_is_pyarrow_free(tmp_path, monkeypatch):
+    """The whole point of the ``read()`` rewrite: for a file the native reader
+    supports, PyArrow must *never open it*. The footer, row-group layout, and
+    decode all come from the crate (``read_metadata`` + ``read_row_groups``);
+    ``pyarrow.dataset.dataset`` — the only way the base reader opens a Parquet
+    file — must not be called at all.
+
+    We drive ``reader.read(manifest)`` directly (not through
+    ``ray.data.read_parquet``) so the assertion is scoped to the *read* stage:
+    the listing/indexing stage does call pyarrow to enumerate row groups, and
+    counting over a full pipeline execution would conflate the two. Here the
+    manifest is handed in pre-built, so any ``pds.dataset`` call can only come
+    from the reader itself.
+    """
     import pyarrow.dataset as pds
     from pyarrow.fs import LocalFileSystem
 
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+
+    path = tmp_path / "data.parquet"
+    table = _flat_table()
+    pq.write_table(table, str(path), write_page_index=True)
+
+    # Spy: pyarrow.dataset.dataset must NOT be called for a supported native read.
+    ds_calls = {"n": 0}
+    orig_dataset = pds.dataset
+
+    def spy_dataset(*a, **k):
+        ds_calls["n"] += 1
+        return orig_dataset(*a, **k)
+
+    monkeypatch.setattr(pds, "dataset", spy_dataset)
+
+    # Spy: the native crate must actually run (metadata footer read + decode),
+    # so a "0 pyarrow calls" result can't be a silent no-op.
+    native_calls = {"read_metadata": 0, "read_row_groups": 0}
+    for name in native_calls:
+        orig = getattr(ray_data_arrow_rs, name)
+
+        def make_spy(orig, name):
+            def spy(*a, **k):
+                native_calls[name] += 1
+                return orig(*a, **k)
+
+            return spy
+
+        monkeypatch.setattr(ray_data_arrow_rs, name, make_spy(orig, name))
+
+    reader = ArrowRsParquetFileReader(
+        filesystem=LocalFileSystem(), target_block_size=128 * 1024 * 1024
+    )
+    manifest = _make_manifest([str(path)], [os.path.getsize(path)], [None])
+    got = pa.concat_tables(list(reader.read(manifest)))
+
+    assert ds_calls["n"] == 0, (
+        "pyarrow.dataset.dataset was called during a supported native read "
+        "(pyarrow opened the file — the read is not pyarrow-free)"
+    )
+    assert native_calls["read_metadata"] > 0, "native footer read never ran"
+    assert native_calls["read_row_groups"] > 0, "native decode never ran"
+    assert got.sort_by("id").equals(table.sort_by("id"))
+
+
+def test_native_chunked_read_row_hash_parity(tmp_path):
+    """A chunked file (one manifest row per ``[row_group_start, row_group_end)``
+    range) must produce byte-identical ``row_hash`` values via the native path
+    and PyArrow.
+
+    ``row_hash`` is seeded by ``(fragment_path, file_row_offset)`` per sub-
+    fragment (:func:`_compute_row_hashes`), so this is the load-bearing test for
+    :meth:`ArrowRsParquetFileReader._native_fragments_for_file`: it must emit one
+    native fragment *per row group* seeded with that group's cumulative pre-filter
+    row offset, exactly mirroring the base ``_fragments_from_chunk_metadata``. A
+    single off-by-one in the offset accumulation would shift the hashes and this
+    would catch it. We drive both readers on the *same* hand-built chunked
+    manifest so the only variable is the fragment-offset logic.
+    """
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.chunkers.file_chunker import (
+        ParquetFileChunkMetadata,
+        create_chunk_metadata,
+    )
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+    from ray.data._internal.datasource_v2.readers.parquet_file_reader import (
+        ParquetFileReader,
+    )
+
+    path = tmp_path / "data.parquet"
+    table = _flat_table(20_000)
+    # 4 row groups of 5k rows each.
+    pq.write_table(table, str(path), write_page_index=True, row_group_size=5_000)
+    assert pq.ParquetFile(str(path)).num_row_groups == 4
+
+    # Two chunks over the same file: row groups [0,2) and [2,4). This forces the
+    # per-row-group native fragment path with a non-zero offset on the 2nd chunk.
+    chunks = [
+        create_chunk_metadata(
+            ParquetFileChunkMetadata, row_group_start=0, row_group_end=2
+        ),
+        create_chunk_metadata(
+            ParquetFileChunkMetadata, row_group_start=2, row_group_end=4
+        ),
+    ]
+    size = os.path.getsize(path)
+    manifest = _make_manifest([str(path), str(path)], [size, size], chunks)
+
+    def read_all(reader_cls):
+        reader = reader_cls(
+            filesystem=LocalFileSystem(),
+            target_block_size=128 * 1024 * 1024,
+            include_row_hash=True,
+        )
+        return pa.concat_tables(list(reader.read(manifest))).sort_by("id")
+
+    rs_tbl = read_all(ArrowRsParquetFileReader)
+    pa_tbl = read_all(ParquetFileReader)
+
+    assert "row_hash" in rs_tbl.column_names
+    assert rs_tbl.num_rows == table.num_rows
+    assert rs_tbl.equals(pa_tbl)
+
+
+def test_native_read_include_paths_parity(tmp_path):
+    """``include_paths`` synthesis (the ``path`` column) must match PyArrow when
+    the file is read natively. Driven on the same whole-file manifest through
+    both readers."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+    from ray.data._internal.datasource_v2.readers.parquet_file_reader import (
+        ParquetFileReader,
+    )
+
+    path = tmp_path / "data.parquet"
+    table = _flat_table()
+    pq.write_table(table, str(path), write_page_index=True)
+    manifest = _make_manifest([str(path)], [os.path.getsize(path)], [None])
+
+    def read_all(reader_cls):
+        reader = reader_cls(
+            filesystem=LocalFileSystem(),
+            target_block_size=128 * 1024 * 1024,
+            include_paths=True,
+        )
+        return pa.concat_tables(list(reader.read(manifest))).sort_by("id")
+
+    rs_tbl = read_all(ArrowRsParquetFileReader)
+    pa_tbl = read_all(ParquetFileReader)
+
+    assert "path" in rs_tbl.column_names
+    assert set(rs_tbl.column("path").to_pylist()) == {str(path)}
+    assert rs_tbl.equals(pa_tbl)
+
+
+def test_native_read_partitioning_parity(tmp_path, restore_ctx):
+    """A partition column (encoded in the directory path, absent from the file's
+    on-disk schema) must be synthesized identically on the native path.
+
+    This exercises native-path-specific planning: ``_plan_native_read`` derives
+    ``on_disk_names`` from the *crate's* footer schema, which won't contain the
+    partition column, so it must land in the synthesize set (not be read from the
+    file). End-to-end through ``read_parquet`` so Ray's hive-partition detection
+    drives the layout.
+    """
+    base = tmp_path / "parts"
+    table = _flat_table(6_000)
+    for g in range(3):
+        sub = base / f"grp={g}"
+        sub.mkdir(parents=True)
+        part = table.slice(g * 2_000, 2_000)
+        pq.write_table(part, str(sub / "data.parquet"), write_page_index=True)
+
+    pa_tbl = _read_sorted(base, False, restore_ctx)
+    rs_tbl = _read_sorted(base, True, restore_ctx)
+
+    assert "grp" in rs_tbl.column_names
+    assert pa_tbl.equals(rs_tbl)
+
+
+def test_count_is_metadata_only_under_arrow_rs(tmp_path, restore_ctx):
+    """``ds.count()`` is answered from listing metadata and never invokes the
+    reader — so it is correct under the arrow-rs flag by construction, with zero
+    native decode (a count scan reads no data columns, so there is no working set
+    to shrink; handling it natively would buy no memory). This guards that the
+    metadata short-circuit stays intact when the flag is on."""
+    from ray.data._internal.datasource_v2.readers import (
+        arrow_rs_parquet_file_reader as mod,
+    )
+
+    path = tmp_path / "data.parquet"
+    table = _flat_table()
+    pq.write_table(table, str(path), write_page_index=True)
+
+    read_calls = {"n": 0}
+    orig_read = mod.ArrowRsParquetFileReader.read
+
+    def spy_read(self, *a, **k):
+        read_calls["n"] += 1
+        return orig_read(self, *a, **k)
+
+    mod.ArrowRsParquetFileReader.read = spy_read
+    try:
+        restore_ctx.use_arrow_rs_parquet_reader = True
+        count = ray.data.read_parquet(str(path)).count()
+    finally:
+        mod.ArrowRsParquetFileReader.read = orig_read
+
+    assert count == table.num_rows
+    assert read_calls["n"] == 0, "count unexpectedly invoked the reader"
+
+
+def test_empty_projection_falls_back_to_pyarrow_stub(tmp_path):
+    """A genuinely column-less read (empty projection) is *not* something the
+    native path handles — the gate falls it back to PyArrow's stub-column path,
+    which yields the right row count with a single stub column. This exercises
+    the ``_columns_supported`` empty-projection branch directly (the case
+    ``ds.count()`` would hit if it ever routed through the reader)."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+
+    path = tmp_path / "data.parquet"
+    table = _flat_table()
+    pq.write_table(table, str(path), write_page_index=True)
+    manifest = _make_manifest([str(path)], [os.path.getsize(path)], [None])
+
+    reader = ArrowRsParquetFileReader(
+        filesystem=LocalFileSystem(),
+        target_block_size=128 * 1024 * 1024,
+        columns=[],
+    )
+    tables = list(reader.read(manifest))
+    assert sum(t.num_rows for t in tables) == table.num_rows
+    # PyArrow's count-scan stub column, not a natively-decoded data column.
+    assert all(len(t.column_names) == 1 for t in tables)
+
+
+def test_native_fragment_read_retries_transient_error(tmp_path, monkeypatch):
+    """A transient I/O failure during native decode must be retried and
+    recovered exactly like the PyArrow path — the native ``_NativeParquetFragment``
+    flows through the same ``iterate_with_retry`` wrapper in
+    ``_read_fragments_sequential``. We inject a one-shot retryable error (matching
+    a default ``retried_io_errors`` pattern) into the crate's ``read_row_groups``
+    and assert the read still returns byte-correct data and that the crate was
+    re-invoked (the retry fired)."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+
+    path = tmp_path / "data.parquet"
+    table = _flat_table()
+    pq.write_table(table, str(path), write_page_index=True)
+    manifest = _make_manifest([str(path)], [os.path.getsize(path)], [None])
+
+    calls = {"n": 0}
+    orig = ray_data_arrow_rs.read_row_groups
+
+    def flaky_read_row_groups(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # A default-retryable message (context.DEFAULT_RETRIED_IO_ERRORS), so
+            # no context mutation is needed. Raised before any batch is yielded.
+            raise OSError("AWS Error SLOW_DOWN: injected transient failure")
+        return orig(*a, **k)
+
+    monkeypatch.setattr(ray_data_arrow_rs, "read_row_groups", flaky_read_row_groups)
+
+    reader = ArrowRsParquetFileReader(
+        filesystem=LocalFileSystem(), target_block_size=128 * 1024 * 1024
+    )
+    got = pa.concat_tables(list(reader.read(manifest)))
+
+    assert calls["n"] >= 2, "native read was not retried after a transient error"
+    assert got.sort_by("id").equals(table.sort_by("id"))
+
+
+def test_filter_pushdown_prunes_row_groups(tmp_path, restore_ctx):
+    """A pushed-down predicate is lowered to the native pruning IR and handed to
+    the crate, which drops the row groups whose footer statistics prove no row
+    can match — replacing PyArrow's ``fragment.subset``. On a sorted ``id`` over
+    4 row groups, ``id >= 3000`` reaches the crate as a non-None ``predicate_json``
+    that prunes to row group ``[3]`` (verified via ``select_row_groups``); a
+    predicate no row group can satisfy yields an empty result. Results stay
+    byte-correct because the Python post-filter is the final authority."""
+    import pyarrow.dataset as pds
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data.expressions import col
     from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
         ArrowRsParquetFileReader,
     )
@@ -213,50 +521,59 @@ def test_filter_pushdown_prunes_row_groups(tmp_path, restore_ctx):
     )
     pq.write_table(table, str(path), write_page_index=True, row_group_size=1000)
 
+    # `read_row_groups(path, row_groups, columns, batch_size, budget, k,
+    # split_threshold, predicate_json)` — capture the row_groups handed in and
+    # the predicate_json (8th positional) the reader lowered.
     seen = []
     orig = ray_data_arrow_rs.read_row_groups
 
     def wrapped(path_, row_groups, *a, **k):
-        seen.append(row_groups)
+        predicate_json = a[5] if len(a) > 5 else k.get("predicate_json")
+        seen.append((row_groups, predicate_json))
         return orig(path_, row_groups, *a, **k)
 
-    reader = ArrowRsParquetFileReader(
-        filesystem=LocalFileSystem(), target_block_size=128 * 1024 * 1024
-    )
-    dataset = pds.dataset(str(path), format="parquet", filesystem=LocalFileSystem())
-    fragment = next(dataset.get_fragments())
-    batch_size = reader._resolve_batch_size(dataset)
-
-    ray_data_arrow_rs.read_row_groups = wrapped
-    try:
-        got = pa.concat_tables(
-            list(
-                reader._iter_fragment_tables(
-                    fragment,
-                    {
-                        "columns": None,
-                        "filter": pds.field("id") >= 3000,
-                        "batch_size": batch_size,
-                    },
-                )
-            )
+    def _run(predicate):
+        # Mirror `read()`: the reader's Ray `Expr` predicate drives native
+        # pruning, and its pyarrow form is the scanner filter used for the
+        # post-decode row filter.
+        reader = ArrowRsParquetFileReader(
+            filesystem=LocalFileSystem(),
+            target_block_size=128 * 1024 * 1024,
+            predicate=predicate,
         )
-        pruned_all = list(
+        dataset = pds.dataset(str(path), format="parquet", filesystem=LocalFileSystem())
+        fragment = next(dataset.get_fragments())
+        batch_size = reader._resolve_batch_size(dataset)
+        return list(
             reader._iter_fragment_tables(
                 fragment,
                 {
                     "columns": None,
-                    "filter": pds.field("id") >= 10**9,
+                    "filter": predicate.to_pyarrow(),
                     "batch_size": batch_size,
                 },
             )
         )
+
+    ray_data_arrow_rs.read_row_groups = wrapped
+    try:
+        got = pa.concat_tables(_run(col("id") >= 3000))
+        pruned_all = _run(col("id") >= 10**9)
     finally:
         ray_data_arrow_rs.read_row_groups = orig
 
-    assert seen == [[3]], f"stats pruning didn't reach the crate: {seen}"
+    # The crate receives the fragment's full row-group list plus the lowered
+    # predicate; pruning happens *inside* the crate now, not before the call.
+    (rg0, pj0), (rg1, pj1) = seen
+    assert rg0 == [0, 1, 2, 3], f"expected all row groups handed to crate: {rg0}"
+    assert pj0 is not None, "predicate did not lower to a pruning IR"
+    # Prove the IR actually prunes to the single satisfying row group.
+    assert ray_data_arrow_rs.select_row_groups(str(path), pj0) == [3]
     assert got.sort_by("id").equals(table.slice(3000))
-    assert pruned_all == [] and len(seen) == 1, "fully-pruned fragment hit the crate"
+    # A fully-unsatisfiable predicate prunes every group inside the crate, so
+    # the stream is empty (the crate is still invoked — one cheap footer read).
+    assert pruned_all == []
+    assert ray_data_arrow_rs.select_row_groups(str(path), pj1) == []
 
 
 def test_filter_pushdown_e2e_parity(tmp_path, restore_ctx):
@@ -282,6 +599,55 @@ def test_filter_pushdown_e2e_parity(tmp_path, restore_ctx):
     rs_tbl = _read(True)
     assert pa_tbl.num_rows == rs_tbl.num_rows == 500
     assert pa_tbl.equals(rs_tbl)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        # Partial pruning across the middle two row groups (0 and 3 prune).
+        "id >= 1500 and id < 2500",
+        # Compound over multiple types, with a string equality conjunct.
+        'id >= 1500 and id < 2500 and g == "g2"',
+        # OR of two disjoint ranges — neither end row group prunes.
+        "id < 500 or id >= 3500",
+        # Float comparison drives the pruning column.
+        "x >= 900.0 and x < 1100.0",
+        # A predicate no row group can satisfy (fully pruned → empty).
+        "id >= 100000000",
+    ],
+)
+def test_filter_pushdown_compound_parity(tmp_path, restore_ctx, expr):
+    """Native row-group pruning + Python post-filter must be byte-identical to
+    the PyArrow v2 reader across compound predicates spanning int/float/string
+    columns and multiple row groups. This is the backstop for native pruning
+    being the sole mechanism: any over-pruning bug would drop rows PyArrow keeps
+    and fail here.
+    """
+    path = tmp_path / "compound.parquet"
+    n = 4000
+    table = pa.table(
+        {
+            "id": pa.array(np.arange(n, dtype=np.int64)),
+            "x": pa.array(np.arange(n) * 0.5),
+            "g": pa.array([f"g{i % 5}" for i in range(n)]),
+        }
+    )
+    pq.write_table(table, str(path), write_page_index=True, row_group_size=1000)
+
+    def _read(use_arrow_rs):
+        restore_ctx.use_arrow_rs_parquet_reader = use_arrow_rs
+        # take_all() over sort() preserves the schema even for empty results
+        # (to_pandas() on an empty dataset yields a 0-column frame).
+        ds = ray.data.read_parquet(str(path)).filter(expr=expr).sort("id")
+        return ds.take_all()
+
+    pa_rows = _read(False)
+    rs_rows = _read(True)
+    # Row-for-row parity across every column (dicts compare all keys/values).
+    assert rs_rows == pa_rows, (
+        f"arrow-rs diverged from pyarrow for `{expr}`: "
+        f"{len(rs_rows)} vs {len(pa_rows)} rows"
+    )
 
 
 def _gate_verdict(path, read_columns=None):
@@ -596,83 +962,167 @@ def test_scanner_leak_signature_and_arrow_rs_avoids_it(tmp_path, monkeypatch):
     assert rs_peak < 0.5 * it_small, (rs_peak, it_small)
 
 
-def test_falls_back_for_map_and_nested_extension(tmp_path, restore_ctx):
-    """Map columns, and extension types hiding INSIDE nesting, stay gated: the
-    recursive type check must reject them anywhere in the type tree."""
+def test_map_column_native_parity(tmp_path, restore_ctx):
+    """Map columns decode NATIVELY (the gate admits them) and byte-identically to
+    PyArrow — including null and empty map entries spread across multiple row
+    groups. Verified empirically: the crate emits an identical ``MapType`` (same
+    key/value field names) and the same values, so ``pa.Table.equals`` holds."""
     n = 500
-    # Map column → fallback (still correct end-to-end).
     map_path = tmp_path / "map.parquet"
     map_table = pa.table(
         {
             "id": pa.array(np.arange(n, dtype=np.int64)),
             "m": pa.array(
-                [[(f"k{i}", i)] for i in range(n)],
+                [
+                    None
+                    if i % 50 == 0
+                    else ([] if i % 9 == 0 else [(f"k{i}", i), ("b", i * 2)])
+                    for i in range(n)
+                ],
                 type=pa.map_(pa.string(), pa.int64()),
             ),
         }
     )
-    pq.write_table(map_table, str(map_path), write_page_index=True)
-    assert _gate_verdict(map_path) is False
+    pq.write_table(map_table, str(map_path), write_page_index=True, row_group_size=100)
+    assert _gate_verdict(map_path) is True
     pa_tbl = _read_sorted(map_path, False, restore_ctx)
     rs_tbl = _read_sorted(map_path, True, restore_ctx)
     assert pa_tbl.equals(rs_tbl)
 
-    # Extension type nested inside a struct → the recursive check must catch it
-    # (a top-level-only check would let it slip through to the crate).
+
+def test_dictionary_column_native_parity(tmp_path, restore_ctx):
+    """A *naturally* dictionary-typed column (the file embeds an arrow dictionary
+    type) decodes natively and byte-identically to PyArrow, even with per-row-group
+    dictionaries and nulls — Parquet dictionaries are per-row-group, the classic
+    index-divergence trap, so this spans several row groups on purpose.
+
+    Distinct from the ``dictionary_columns`` *forced* read (columns coerced to
+    dictionary output at read time), which stays gated in
+    ``_reader_level_supported`` because the crate doesn't honor it."""
+    n = 500
+    path = tmp_path / "dict.parquet"
+    vals = [None if i % 37 == 0 else f"cat{(i * 7) % 13}" for i in range(n)]
+    table = pa.table(
+        {
+            "id": pa.array(np.arange(n, dtype=np.int64)),
+            "d": pa.array(vals, type=pa.dictionary(pa.int32(), pa.string())),
+        }
+    )
+    pq.write_table(table, str(path), write_page_index=True, row_group_size=100)
+    assert _gate_verdict(path) is True
+    pa_tbl = _read_sorted(path, False, restore_ctx)
+    rs_tbl = _read_sorted(path, True, restore_ctx)
+    assert pa_tbl.equals(rs_tbl)
+
+
+def test_extension_types_native_parity(tmp_path, restore_ctx):
+    """Extension types decode NATIVELY and byte-identically to PyArrow: Ray's
+    tensor extension, its variable-shaped (ragged) tensor, and pyarrow's canonical
+    ``fixed_shape_tensor``.
+
+    The crate carries the embedded arrow-schema field metadata
+    (``ARROW:extension:name`` / ``:metadata``) straight through the C data
+    interface, so pyarrow reconstructs the *registered* extension identically on
+    the native and PyArrow paths. (This is the case a blanket ``extension_name``
+    rejection used to fall back — empirically it round-trips, so the gate now
+    recurses into the storage type instead.)"""
+    from ray.data.extensions import ArrowTensorArray, ArrowVariableShapedTensorArray
+
+    n = 400
+
+    # Ray fixed-shape tensor, spanning several row groups.
+    tpath = tmp_path / "tensor.parquet"
+    tens = ArrowTensorArray.from_numpy(
+        np.arange(4 * n, dtype=np.float32).reshape(n, 2, 2)
+    )
+    pq.write_table(
+        pa.table({"id": pa.array(np.arange(n, dtype=np.int64)), "t": tens}),
+        str(tpath),
+        write_page_index=True,
+        row_group_size=100,
+    )
+    assert _gate_verdict(tpath) is True
+    assert _read_arrow_sorted(tpath, False, restore_ctx).equals(
+        _read_arrow_sorted(tpath, True, restore_ctx)
+    )
+
+    # Ray variable-shaped (ragged) tensor — storage is a struct(data, shape).
+    vpath = tmp_path / "vtensor.parquet"
+    ragged = np.array(
+        [np.arange(i % 5 + 1, dtype=np.int64) for i in range(n)], dtype=object
+    )
+    vst = ArrowVariableShapedTensorArray.from_numpy(ragged)
+    pq.write_table(
+        pa.table({"id": pa.array(np.arange(n, dtype=np.int64)), "t": vst}),
+        str(vpath),
+        write_page_index=True,
+        row_group_size=100,
+    )
+    assert _gate_verdict(vpath) is True
+    assert _read_arrow_sorted(vpath, False, restore_ctx).equals(
+        _read_arrow_sorted(vpath, True, restore_ctx)
+    )
+
+    # pyarrow canonical fixed_shape_tensor (not isinstance(ExtensionType) on some
+    # versions — caught via extension_name).
+    if hasattr(pa, "fixed_shape_tensor"):
+        cpath = tmp_path / "canonical.parquet"
+        flat = pa.array(np.arange(n * 4, dtype=np.float32), type=pa.float32())
+        storage = pa.FixedSizeListArray.from_arrays(flat, 4)
+        tarr = pa.ExtensionArray.from_storage(
+            pa.fixed_shape_tensor(pa.float32(), [4]), storage
+        )
+        pq.write_table(
+            pa.table({"id": pa.array(np.arange(n, dtype=np.int64)), "t": tarr}),
+            str(cpath),
+            write_page_index=True,
+            row_group_size=100,
+        )
+        assert _gate_verdict(cpath) is True
+        assert _read_arrow_sorted(cpath, False, restore_ctx).equals(
+            _read_arrow_sorted(cpath, True, restore_ctx)
+        )
+
+    # Recursive gate unit checks: map / dictionary / extension are admitted, and
+    # an extension nested inside a struct/list/map recurses into its storage type
+    # (so a top-level check can't be fooled).
     from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
         _arrow_rs_type_supported,
     )
 
     tensor = pa.fixed_shape_tensor(pa.float32(), [2])
-    assert _arrow_rs_type_supported(pa.struct([("t", tensor)])) is False
-    assert _arrow_rs_type_supported(pa.list_(tensor)) is False
+    assert _arrow_rs_type_supported(tensor) is True
+    assert _arrow_rs_type_supported(pa.struct([("t", tensor)])) is True
+    assert _arrow_rs_type_supported(pa.list_(tensor)) is True
+    assert _arrow_rs_type_supported(pa.map_(pa.string(), pa.int64())) is True
+    assert _arrow_rs_type_supported(pa.map_(pa.string(), tensor)) is True
+    assert _arrow_rs_type_supported(pa.dictionary(pa.int32(), pa.string())) is True
+    # Deep, mixed nesting to any depth is admitted (list>struct>map>list).
+    assert (
+        _arrow_rs_type_supported(
+            pa.list_(pa.struct({"m": pa.map_(pa.string(), pa.list_(pa.int64()))}))
+        )
+        is True
+    )
     assert (
         _arrow_rs_type_supported(
             pa.struct([("a", pa.int64()), ("b", pa.list_(pa.string()))])
         )
         is True
     )
-
-
-def test_falls_back_for_canonical_extension(tmp_path, restore_ctx):
-    """A pyarrow *canonical* extension type (fixed_shape_tensor) is NOT
-    ``isinstance(pa.ExtensionType)`` on some pyarrow versions, so it once slipped
-    the support gate into the native crate. The gate must reject any type with an
-    ``extension_name`` and fall back to PyArrow, staying correct."""
-    if not hasattr(pa, "fixed_shape_tensor"):
-        pytest.skip("pyarrow lacks fixed_shape_tensor")
-    path = tmp_path / "tensor.parquet"
-    n = 1000
-    flat = pa.array(np.random.rand(n * 4).astype(np.float32), type=pa.float32())
-    storage = pa.FixedSizeListArray.from_arrays(flat, 4)
-    tarr = pa.ExtensionArray.from_storage(
-        pa.fixed_shape_tensor(pa.float32(), [4]), storage
+    # The still-rejected types (union / list_view / run_end_encoded / interval)
+    # are the ``is_nested`` safety net: they have NO Parquet encoding — PyArrow
+    # refuses to write them ("Unhandled type for Arrow to Parquet schema
+    # conversion"), so a Parquet column can never carry one. The gate rejecting
+    # them is defense in depth, not an unfinished type.
+    assert (
+        _arrow_rs_type_supported(
+            pa.dense_union([pa.field("a", pa.int64()), pa.field("b", pa.string())])
+        )
+        is False
     )
-    pq.write_table(
-        pa.table({"id": pa.array(np.arange(n, dtype=np.int64)), "tns": tarr}),
-        str(path),
-        write_page_index=True,
-    )
-
-    import pyarrow.dataset as pds
-    from pyarrow.fs import LocalFileSystem
-
-    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
-        ArrowRsParquetFileReader,
-    )
-
-    reader = ArrowRsParquetFileReader(filesystem=LocalFileSystem())
-    frag = next(
-        pds.dataset(
-            str(path), format="parquet", filesystem=LocalFileSystem()
-        ).get_fragments()
-    )
-    # Gate must reject it (extension_name present) even though isinstance may be False.
-    assert reader._arrow_rs_supported(frag, None) is False
-    # And the end-to-end read stays byte-identical via the fallback.
-    pa_tbl = _read_sorted(path, False, restore_ctx)
-    rs_tbl = _read_sorted(path, True, restore_ctx)
-    assert pa_tbl.equals(rs_tbl)
+    if hasattr(pa, "list_view"):
+        assert _arrow_rs_type_supported(pa.list_view(pa.int64())) is False
 
 
 def test_arrow_rs_supported_gate(tmp_path):
@@ -720,6 +1170,190 @@ def test_arrow_rs_supported_gate(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# read_metadata FFI (Track 1): arrow-rs owns the footer read. The crate returns
+# the Arrow schema (via the C-schema PyCapsule) plus per-row-group counts, so the
+# Python reader no longer has to build a PyArrow dataset to learn the layout.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("row_group_size", [20_000, 5_000])
+def test_read_metadata_matches_pyarrow(tmp_path, row_group_size):
+    import ray_data_arrow_rs
+
+    table = _flat_table(20_000)
+    path = tmp_path / "meta.parquet"
+    pq.write_table(
+        table, str(path), row_group_size=row_group_size, write_page_index=True
+    )
+
+    pf = pq.ParquetFile(str(path))
+    md = ray_data_arrow_rs.read_metadata(str(path))
+
+    # Schema round-trips exactly through __arrow_c_schema__ (types + names).
+    assert pa.schema(md).equals(pf.schema_arrow)
+    assert md.num_rows == pf.metadata.num_rows
+    assert md.num_row_groups == pf.metadata.num_row_groups
+    assert md.row_group_num_rows == [
+        pf.metadata.row_group(i).num_rows for i in range(pf.metadata.num_row_groups)
+    ]
+    assert len(md.row_group_byte_sizes) == pf.metadata.num_row_groups
+    assert all(b > 0 for b in md.row_group_byte_sizes)
+
+
+# ---------------------------------------------------------------------------
+# Native predicate pushdown, part 1: statistics-based row-group pruning.
+#
+# These cover the seam the Rust unit tests (which use synthetic ColStats) can't:
+# lowering a Ray Expr to the IR (`_predicate_to_ir`) and reading *real* Parquet
+# statistics into that pruning (`select_row_groups` / `read_row_groups`'s
+# `predicate_json`). Pruning is row-group granular — a surviving group is decoded
+# whole; row-level filtering is the reader's post-decode job, exercised
+# separately by the end-to-end filter parity tests above.
+# ---------------------------------------------------------------------------
+
+
+def _sorted_rg_table(n=4000):
+    """A sorted int ``id`` (+ float ``x``, string ``g``) so that with
+    ``row_group_size=1000`` each of the 4 row groups holds a disjoint id range,
+    making stats pruning observable."""
+    return pa.table(
+        {
+            "id": pa.array(np.arange(n, dtype=np.int64)),
+            "x": pa.array(np.arange(n) * 0.5),
+            "g": pa.array([f"k{i // 1000}" for i in range(n)]),  # k0..k3 per group
+        }
+    )
+
+
+def _ir(expr):
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        _predicate_to_ir,
+    )
+
+    return _predicate_to_ir(expr)
+
+
+def test_predicate_to_ir_lowering():
+    """The Ray Expr -> IR lowering produces the expected shapes, flips the op
+    when the column is on the right, and degrades unrepresentable nodes to
+    ``unknown`` (keeping the rest of a conjunction prunable)."""
+    from ray.data.expressions import col, lit
+
+    assert _ir(col("id") >= 3000) == {
+        "t": "cmp",
+        "col": "id",
+        "op": "ge",
+        "value": {"vt": "int", "v": 3000},
+    }
+    # literal-on-left flips ge -> le
+    assert _ir(lit(3000) <= col("id")) == {
+        "t": "cmp",
+        "col": "id",
+        "op": "ge",
+        "value": {"vt": "int", "v": 3000},
+    }
+    # conjunction; float + string literals tagged by type
+    assert _ir((col("x") < 1.5) & (col("g") == "k2")) == {
+        "t": "and",
+        "preds": [
+            {"t": "cmp", "col": "x", "op": "lt", "value": {"vt": "float", "v": 1.5}},
+            {"t": "cmp", "col": "g", "op": "eq", "value": {"vt": "str", "v": "k2"}},
+        ],
+    }
+    assert _ir(col("id").is_null()) == {"t": "is_null", "col": "id"}
+    assert _ir(col("id").is_in([1, 2, 3])) == {
+        "t": "in",
+        "col": "id",
+        "values": [
+            {"vt": "int", "v": 1},
+            {"vt": "int", "v": 2},
+            {"vt": "int", "v": 3},
+        ],
+        "negated": False,
+    }
+    # a UDF conjunct is unrepresentable -> unknown, but the other conjunct stays.
+    part = _ir((col("id") >= 3000) & (col("x").abs() > 1.0))
+    assert part["t"] == "and"
+    assert part["preds"][0] == {
+        "t": "cmp",
+        "col": "id",
+        "op": "ge",
+        "value": {"vt": "int", "v": 3000},
+    }
+    assert part["preds"][1] == {"t": "unknown"}
+
+
+def test_predicate_json_skips_when_nothing_prunable():
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        _predicate_json,
+    )
+    from ray.data.expressions import col
+
+    assert _predicate_json(None) is None
+    # A bare UDF predicate lowers entirely to unknown -> no pushdown arg.
+    assert _predicate_json(col("x").abs() > 1.0) is None
+    assert _predicate_json(col("id") >= 3000) is not None
+
+
+def test_select_row_groups_pruning_on_real_stats(tmp_path):
+    """``select_row_groups`` prunes using the file's actual footer statistics,
+    across int / float / string columns, and never over-prunes."""
+    import json
+
+    path = tmp_path / "sorted.parquet"
+    table = _sorted_rg_table(4000)
+    pq.write_table(table, str(path), write_page_index=True, row_group_size=1000)
+
+    def sel(expr):
+        return ray_data_arrow_rs.select_row_groups(str(path), json.dumps(_ir(expr)))
+
+    from ray.data.expressions import col
+
+    # No predicate -> all four groups.
+    assert ray_data_arrow_rs.select_row_groups(str(path), None) == [0, 1, 2, 3]
+    # id in [0,999],[1000,1999],[2000,2999],[3000,3999] per group.
+    assert sel(col("id") >= 3000) == [3]
+    assert sel(col("id") >= 3500) == [3]  # group-granular: whole group 3 survives
+    assert sel(col("id") < 1000) == [0]
+    assert sel(col("id") >= 10**9) == []  # nothing can match
+    assert sel((col("id") >= 1500) & (col("id") < 2500)) == [1, 2]
+    # float column (x = id*0.5, so group 3 is [1500, 1999.5])
+    assert sel(col("x") >= 1800.0) == [3]
+    # string column pruning (g = "k0".."k3")
+    assert sel(col("g") == "k2") == [2]
+    assert sel(col("g") == "zzz") == []
+    # is_in over the string groups
+    assert sel(col("g").is_in(["k0", "k3"])) == [0, 3]
+
+
+def test_read_row_groups_predicate_json_decodes_only_surviving_groups(tmp_path):
+    """End to end through the crate: ``predicate_json`` prunes row groups before
+    decode, so the stream contains exactly the surviving groups' rows (whole
+    groups — row-level filtering is applied by the reader, not here) and stays
+    byte-correct and in order."""
+    import json
+
+    path = tmp_path / "sorted.parquet"
+    table = _sorted_rg_table(4000)
+    pq.write_table(table, str(path), write_page_index=True, row_group_size=1000)
+
+    from ray.data.expressions import col
+
+    # id >= 3000 keeps only group 3 (rows 3000..3999).
+    got = _read_crate_stream(path, predicate_json=json.dumps(_ir(col("id") >= 3000)))
+    assert got.equals(table.slice(3000, 1000))
+
+    # id >= 3500 keeps group 3 whole (pruning is row-group granular).
+    got = _read_crate_stream(path, predicate_json=json.dumps(_ir(col("id") >= 3500)))
+    assert got.equals(table.slice(3000, 1000))
+
+    # A fully-pruning predicate yields an empty (schema-correct) stream.
+    got = _read_crate_stream(path, predicate_json=json.dumps(_ir(col("id") >= 10**9)))
+    assert got.num_rows == 0
+    assert got.column_names == ["id", "x", "g"]
+
+
+# ---------------------------------------------------------------------------
 # S3 (moto server). The crate reads S3 through the Rust `object_store` client,
 # so it needs a real HTTP endpoint — Ray Data's `s3_server` fixture (a moto
 # server) provides one. These prove the native path (a) connects with the same
@@ -757,6 +1391,43 @@ def test_s3_config_recovers_endpoint_and_creds(s3_fs):
     assert cfg["access_key_id"] == "testing"
     assert cfg["secret_access_key"] == "testing"
     assert cfg["anonymous"] is False
+
+
+def test_read_metadata_s3_matches_pyarrow(s3_fs, s3_path):
+    """`read_metadata_s3` fetches the footer over the moto endpoint (same config
+    recovery as the data path) and returns the same schema + row-group counts as
+    PyArrow reading the same object."""
+    import ray_data_arrow_rs
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        _s3_config,
+    )
+
+    table = _flat_table(20_000)
+    uri = _s3_write(table, s3_fs, s3_path, name="meta.parquet")
+    bucket, _, key = _unwrap_protocol(uri).partition("/")
+
+    pf = pq.ParquetFile(_unwrap_protocol(uri), filesystem=s3_fs)
+
+    cfg = _s3_config(s3_fs)
+    md = ray_data_arrow_rs.read_metadata_s3(
+        bucket,
+        key,
+        cfg["region"],
+        cfg["anonymous"],
+        endpoint=cfg["endpoint"],
+        access_key_id=cfg["access_key_id"],
+        secret_access_key=cfg["secret_access_key"],
+        session_token=cfg["session_token"],
+        allow_http=cfg["allow_http"],
+        virtual_hosted_style=cfg["virtual_hosted_style"],
+    )
+
+    assert pa.schema(md).equals(pf.schema_arrow)
+    assert md.num_rows == pf.metadata.num_rows
+    assert md.num_row_groups == pf.metadata.num_row_groups
+    assert md.row_group_num_rows == [
+        pf.metadata.row_group(i).num_rows for i in range(pf.metadata.num_row_groups)
+    ]
 
 
 def test_arrow_rs_s3_parity(s3_fs, s3_path, restore_ctx):
@@ -885,6 +1556,52 @@ def test_arrow_rs_s3_kspilt_windowed_order(s3_fs, s3_path, k):
     assert got["id"].to_pylist() == list(range(n))
 
 
+@pytest.mark.parametrize("prefetch_windows", [1, 2, 4])
+def test_arrow_rs_s3_window_prefetch_order(s3_fs, s3_path, prefetch_windows):
+    """The window-prefetch pipeline (K=1 single stream, many fetch windows) must
+    return rows in EXACT file order at every prefetch depth. This is the common S3
+    path the knob targets: one row group sliced into many small windows, with up to
+    ``prefetch_windows`` of them fetching+decoding concurrently. depth=1 is the old
+    strictly-serial behavior; depth>1 overlaps window N+1's fetch with window N's
+    decode. A monotone ``id`` makes any window mis-ordering a hard failure, so this
+    guards that the concurrent look-ahead never lets a later window's rows overtake
+    an earlier one's.
+    """
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        _s3_config,
+    )
+
+    n = 50_000
+    table = pa.table({"id": pa.array(np.arange(n, dtype=np.int64))})
+    _s3_write(table, s3_fs, s3_path, name="mono_pf.parquet")
+
+    base = _unwrap_protocol(s3_path)
+    bucket, _, key = os.path.join(base, "mono_pf.parquet").partition("/")
+    cfg = _s3_config(s3_fs)
+
+    stream = ray_data_arrow_rs.read_row_groups_s3(
+        bucket,
+        key,
+        cfg["region"],
+        cfg["anonymous"],
+        endpoint=cfg["endpoint"],
+        access_key_id=cfg["access_key_id"],
+        secret_access_key=cfg["secret_access_key"],
+        session_token=cfg["session_token"],
+        allow_http=cfg["allow_http"],
+        virtual_hosted_style=cfg["virtual_hosted_style"],
+        row_groups=[0],
+        columns=["id"],
+        batch_size=4096,
+        fetch_window_mb=1,  # force many sub-windows within the single stream
+        k=1,  # single stream: isolate the prefetch pipeline from K-split
+        prefetch_windows=prefetch_windows,
+    )
+    got = pa.RecordBatchReader.from_stream(stream).read_all()
+    assert got.num_rows == n
+    assert got["id"].to_pylist() == list(range(n))
+
+
 def test_arrow_rs_s3_struct_parity(s3_fs, s3_path, restore_ctx):
     """A struct column over S3 decodes natively (the gate admits struct now,
     on S3 exactly as it does locally) and stays byte-identical to PyArrow."""
@@ -908,6 +1625,208 @@ def test_arrow_rs_s3_struct_parity(s3_fs, s3_path, restore_ctx):
         ray.data.read_parquet(uri, filesystem=s3_fs).to_pandas()
     ).sort_by("id")
     assert pa_tbl.equals(rs_tbl)
+
+
+@pytest.mark.parametrize(
+    "target_chunk_size",
+    [0, 6_000, 11_000, 10 * 1024**3],
+    ids=["one_rg_per_chunk", "bundle_pairs_a", "bundle_pairs_b", "whole_file"],
+)
+def test_chunker_native_metadata_matches_pyarrow(
+    tmp_path, restore_ctx, target_chunk_size
+):
+    """Step 3: with the arrow-rs flag on, ``ParquetFileChunker`` reads the footer
+    through the native crate instead of PyArrow. The crate's
+    ``row_group_compressed_sizes`` equals PyArrow's ``sum(col.total_compressed_size)``,
+    so the greedy row-group bundling produces byte-for-byte identical chunk ranges
+    *and* chunk sizes whether the flag is on or off."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.chunkers.file_chunker import (
+        ParquetFileChunker,
+    )
+
+    path = tmp_path / "data.parquet"
+    table = _flat_table(num_rows=4_000)
+    pq.write_table(table, str(path), write_page_index=True, row_group_size=1_000)
+    size = path.stat().st_size
+    fs = LocalFileSystem()
+
+    def chunks_for(use_arrow_rs):
+        restore_ctx.use_arrow_rs_parquet_reader = use_arrow_rs
+        chunker = ParquetFileChunker(target_chunk_size=target_chunk_size)
+        return [
+            (m["row_group_start"], m["row_group_end"], sz)
+            for m, sz in chunker.generate_chunk_metadatas(str(path), size, fs)
+        ]
+
+    assert chunks_for(True) == chunks_for(False)
+
+
+def test_chunker_native_metadata_makes_no_pyarrow_footer_read(tmp_path, restore_ctx):
+    """With the flag on, the chunker must not touch PyArrow's ``read_metadata`` —
+    the whole supported-file footer read goes through the arrow-rs crate."""
+    import pyarrow.parquet as pqmod
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.chunkers.file_chunker import (
+        ParquetFileChunker,
+    )
+
+    path = tmp_path / "data.parquet"
+    pq.write_table(
+        _flat_table(num_rows=4_000),
+        str(path),
+        write_page_index=True,
+        row_group_size=1_000,
+    )
+    size = path.stat().st_size
+    fs = LocalFileSystem()
+
+    calls = {"n": 0}
+    orig = pqmod.read_metadata
+
+    def _spy(*args, **kwargs):
+        calls["n"] += 1
+        return orig(*args, **kwargs)
+
+    pqmod.read_metadata = _spy
+    try:
+        restore_ctx.use_arrow_rs_parquet_reader = True
+        list(ParquetFileChunker().generate_chunk_metadatas(str(path), size, fs))
+        assert calls["n"] == 0, "flag ON must not call pyarrow.parquet.read_metadata"
+
+        restore_ctx.use_arrow_rs_parquet_reader = False
+        list(ParquetFileChunker().generate_chunk_metadatas(str(path), size, fs))
+        assert calls["n"] == 1, "flag OFF must use pyarrow.parquet.read_metadata"
+    finally:
+        pqmod.read_metadata = orig
+
+
+def _write_int96(path, embed_arrow_schema):
+    """Write a Parquet file storing the timestamp column as the legacy INT96
+    physical type. ``embed_arrow_schema=False`` mimics Spark/Hive/Impala (no
+    embedded Arrow schema); ``True`` mimics a PyArrow writer, which pins the
+    source ``timestamp[us]`` unit in the file's key-value metadata."""
+    import datetime
+
+    ts = pa.array(
+        [
+            datetime.datetime(2021, 6, 1) + datetime.timedelta(minutes=i)
+            for i in range(2000)
+        ],
+        type=pa.timestamp("us"),
+    )
+    table = pa.table({"id": pa.array(np.arange(2000, dtype=np.int64)), "t": ts})
+    pq.write_table(
+        table,
+        str(path),
+        use_deprecated_int96_timestamps=True,
+        store_schema=embed_arrow_schema,
+        write_page_index=True,
+    )
+    return table
+
+
+def _read_manifest_with_path_verdict(path, monkeypatch):
+    """Drive ``ArrowRsParquetFileReader.read`` in-process over a whole-file
+    manifest and report ``(table, took_native_decode)``.
+
+    In-process (not via ``ray.data.read_parquet``) so the crate/pyarrow spies
+    actually observe the decode — Ray would run it in a worker where a
+    driver-side monkeypatch is invisible. ``took_native_decode`` is True iff the
+    crate's ``read_row_groups`` ran (the file took the native path); a fallback
+    instead opens the file via ``pyarrow.dataset.dataset``."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+
+    calls = {"read_row_groups": 0}
+    orig = ray_data_arrow_rs.read_row_groups
+
+    def spy(*a, **k):
+        calls["read_row_groups"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(ray_data_arrow_rs, "read_row_groups", spy)
+
+    reader = ArrowRsParquetFileReader(
+        filesystem=LocalFileSystem(), target_block_size=128 * 1024 * 1024
+    )
+    manifest = _make_manifest([str(path)], [os.path.getsize(path)], [None])
+    table = pa.concat_tables(list(reader.read(manifest))).sort_by("id")
+    return table, calls["read_row_groups"] > 0
+
+
+def test_int96_no_arrow_hint_reads_native_as_ns(tmp_path, restore_ctx, monkeypatch):
+    """A Spark/Hive/Impala-style INT96 file (no embedded Arrow schema) decodes to
+    ``timestamp[ns]`` on both paths, so the crate handles it *natively* and stays
+    byte-identical to PyArrow — bringing the common INT96 case onto the
+    memory-efficient native path."""
+    path = tmp_path / "spark_int96.parquet"
+    _write_int96(path, embed_arrow_schema=False)
+
+    # The crate's footer read reports the column as INT96 and decodes it to ns.
+    md = ray_data_arrow_rs.read_metadata(str(path))
+    assert "t" in list(md.int96_columns)
+    assert pa.schema(md).field("t").type == pa.timestamp("ns")
+
+    rs_tbl, took_native = _read_manifest_with_path_verdict(path, monkeypatch)
+    pa_tbl = pa.Table.from_pandas(ray.data.read_parquet(str(path)).to_pandas()).sort_by(
+        "id"
+    )
+
+    assert took_native, "INT96/ns file should take the native decode path"
+    assert rs_tbl.schema.field("t").type == pa.timestamp("ns")
+    assert pa_tbl.equals(rs_tbl)
+
+
+def test_int96_with_non_ns_hint_falls_back(tmp_path, restore_ctx, monkeypatch):
+    """A PyArrow-written INT96 file embeds a ``timestamp[us]`` hint that the crate
+    honors (→ us) but PyArrow ignores (always ns). The gate must fall this file
+    back to PyArrow so the result stays ``ns`` — identical to the non-arrow-rs
+    path — rather than silently changing the unit."""
+    path = tmp_path / "pyarrow_int96.parquet"
+    _write_int96(path, embed_arrow_schema=True)
+
+    # Crate would decode to us (honoring the embedded hint) — the divergence.
+    assert pa.schema(ray_data_arrow_rs.read_metadata(str(path))).field(
+        "t"
+    ).type == pa.timestamp("us")
+
+    rs_tbl, took_native = _read_manifest_with_path_verdict(path, monkeypatch)
+    pa_tbl = pa.Table.from_pandas(ray.data.read_parquet(str(path)).to_pandas()).sort_by(
+        "id"
+    )
+
+    assert not took_native, "INT96/non-ns-hint file must fall back to PyArrow"
+    assert rs_tbl.schema.field("t").type == pa.timestamp("ns")
+    assert pa_tbl.equals(rs_tbl)
+
+
+def test_int96_gate_rejects_non_ns_in_columns_supported(tmp_path):
+    """Unit-level: ``_columns_supported`` admits an INT96 column only when the
+    crate's decoded type is ns/no-tz, and rejects a non-ns unit."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+
+    reader = ArrowRsParquetFileReader(filesystem=LocalFileSystem())
+    ns_schema = pa.schema([("id", pa.int64()), ("t", pa.timestamp("ns"))])
+    us_schema = pa.schema([("id", pa.int64()), ("t", pa.timestamp("us"))])
+
+    # 't' flagged as INT96: ns is admitted, us (non-ns) is rejected.
+    assert reader._columns_supported(ns_schema, ["id", "t"], ["t"]) is True
+    assert reader._columns_supported(us_schema, ["id", "t"], ["t"]) is False
+    # A genuine (non-INT96) timestamp[us] column stays supported — only INT96
+    # columns are unit-gated.
+    assert reader._columns_supported(us_schema, ["id", "t"], []) is True
+    # Projecting away the INT96 column sidesteps the gate.
+    assert reader._columns_supported(us_schema, ["id"], ["t"]) is True
 
 
 if __name__ == "__main__":

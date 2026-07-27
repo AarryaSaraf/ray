@@ -21,6 +21,10 @@ from typing import (
     get_type_hints,
 )
 
+from ray.data._internal.datasource_v2.native_metadata import (
+    native_metadata_supported_filesystem,
+    read_native_metadata,
+)
 from ray.data._internal.util import MiB, infer_compression
 from ray.util.annotations import DeveloperAPI
 
@@ -217,17 +221,25 @@ class ParquetFileChunker(FileChunker):
         else:
             self._target_chunk_size = self._FALLBACK_TARGET_CHUNK_SIZE
 
+        # Read the arrow-rs flag *here* on the driver and carry it as instance
+        # state: this chunker is constructed at plan time and pickled into the
+        # listing tasks, so capturing the driver's config now ships it with the
+        # object rather than re-reading a possibly-default context in the worker.
+        # When on (and the file's filesystem is native-eligible), the footer is
+        # read through the same arrow-rs crate the reader uses, so a supported
+        # file is never touched by PyArrow — not even for its footer.
+        self._use_arrow_rs = ctx.use_arrow_rs_parquet_reader
+
     def generate_chunk_metadatas(
         self,
         path: str,
         file_size: int,
         filesystem: Optional["FileSystem"] = None,
     ) -> Iterable[Tuple[Optional[ChunkMetadata], int]]:
-        import pyarrow.parquet as pq
-
         try:
-            # Reads only the Parquet footer (file metadata), not data.
-            metadata = pq.read_metadata(path, filesystem=filesystem)
+            # Reads only the Parquet footer (file metadata), not data. Returns
+            # ``(num_row_groups, per_row_group_compressed_sizes)``.
+            num_row_groups, rg_sizes = self._read_row_group_sizes(path, filesystem)
         except Exception as e:
             # Corrupt / unreadable footer (or a non-Parquet file that slipped
             # through). Fall back to a single whole-file chunk so the file is
@@ -241,7 +253,6 @@ class ParquetFileChunker(FileChunker):
             yield None, file_size
             return
 
-        num_row_groups = metadata.num_row_groups
         if num_row_groups == 0:
             yield None, file_size
             return
@@ -252,16 +263,7 @@ class ParquetFileChunker(FileChunker):
         start = 0
         running_size = 0
         for rg_idx in range(num_row_groups):
-            rg_meta = metadata.row_group(rg_idx)
-            # On-disk (compressed) row-group size. ``RowGroupMetaData`` exposes
-            # only the *uncompressed* ``total_byte_size``; the on-disk size lives
-            # on each ``ColumnChunkMetaData``, so sum the per-column compressed
-            # sizes. Keeping chunk sizes in on-disk units matches the manifest's
-            # ``file_sizes`` and the ``×encoding_ratio`` in-memory estimator.
-            rg_size = sum(
-                rg_meta.column(c).total_compressed_size
-                for c in range(rg_meta.num_columns)
-            )
+            rg_size = rg_sizes[rg_idx]
             if running_size > 0 and running_size + rg_size > self._target_chunk_size:
                 yield (
                     create_chunk_metadata(
@@ -284,3 +286,37 @@ class ParquetFileChunker(FileChunker):
             ),
             running_size,
         )
+
+    def _read_row_group_sizes(
+        self,
+        path: str,
+        filesystem: Optional["FileSystem"],
+    ) -> Tuple[int, list]:
+        """Read the footer and return ``(num_row_groups, per_rg_on_disk_sizes)``.
+
+        The per-row-group size is the *compressed* (on-disk) byte size, so
+        greedily bundling by it matches the manifest's ``file_sizes`` and the
+        ``×encoding_ratio`` in-memory estimator. Both backends return the same
+        numbers: the arrow-rs crate's ``row_group_compressed_sizes`` is the sum
+        of each column chunk's compressed size, identical to PyArrow's
+        ``sum(col.total_compressed_size)`` — so chunk boundaries are byte-for-byte
+        the same whether the flag is on or off.
+        """
+        if self._use_arrow_rs and native_metadata_supported_filesystem(filesystem):
+            # Read the footer through the same arrow-rs crate the reader uses, so
+            # a supported (Local/S3) file is PyArrow-free end to end.
+            md = read_native_metadata(path, filesystem)
+            return md.num_row_groups, list(md.row_group_compressed_sizes)
+
+        import pyarrow.parquet as pq
+
+        metadata = pq.read_metadata(path, filesystem=filesystem)
+        num_row_groups = metadata.num_row_groups
+        rg_sizes = [
+            sum(
+                metadata.row_group(rg_idx).column(c).total_compressed_size
+                for c in range(metadata.row_group(rg_idx).num_columns)
+            )
+            for rg_idx in range(num_row_groups)
+        ]
+        return num_row_groups, rg_sizes

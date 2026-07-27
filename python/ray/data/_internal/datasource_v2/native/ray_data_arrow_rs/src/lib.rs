@@ -37,6 +37,14 @@
 //! stream (K=1). Output is order-preserving (per-unit channels drained in order),
 //! and the decode batch is byte-budgeted just like the local path.
 //!
+//! Within a single stream, consecutive fetch windows are pipelined by
+//! `prefetch_windows` (default 2): window N+1's GET is issued while window N
+//! decodes, hiding S3 first-byte latency behind decode without staging the whole
+//! row group. depth=1 restores the strictly-serial windows. This is orthogonal to
+//! K: K adds parallel streams (spatial split), prefetch overlaps fetch/decode
+//! within one stream. Both stay memory-bounded knobs
+//! (`≈ k * prefetch_windows * fetch_window` compressed in flight).
+//!
 //! Public API (consumed by `ArrowRsParquetFileReader` on the Python side via
 //! `pa.RecordBatchReader.from_stream(...)`):
 //!
@@ -46,15 +54,24 @@
 //!   read_row_groups_s3(bucket, key, region, anonymous, endpoint=None, ...creds...,
 //!                      row_groups=None, columns=None, batch_size=131072,
 //!                      decode_budget_bytes=2*1024*1024, fetch_window_mb=16, k=1,
-//!                      split_threshold_bytes=128*1024*1024)
+//!                      split_threshold_bytes=128*1024*1024, prefetch_windows=2)
 
+mod predicate;
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::sync::mpsc::{sync_channel, Receiver};
 use std::thread;
 
+use crate::predicate::{can_match, ColStats, Pred, Value};
+use parquet::basic::Type as PhysicalType;
+use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::statistics::Statistics;
+
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
+use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchReader;
 use parquet::arrow::arrow_reader::{
@@ -130,6 +147,96 @@ fn byte_budget_rows(
 }
 
 // --------------------------------------------------------------------------- //
+// Row-group statistics pruning (predicate pushdown, part 1)
+// --------------------------------------------------------------------------- //
+/// Map one column chunk's Parquet statistics to `(min, max)` in `Value` terms.
+/// Types we can't order for pruning (Int96, fixed-len byte arrays, non-UTF8
+/// byte arrays) return `None`, which `can_match` treats as "keep".
+fn stat_min_max(stats: &Statistics) -> (Option<Value>, Option<Value>) {
+    match stats {
+        Statistics::Boolean(v) => (
+            v.min_opt().map(|b| Value::Bool(*b)),
+            v.max_opt().map(|b| Value::Bool(*b)),
+        ),
+        Statistics::Int32(v) => (
+            v.min_opt().map(|x| Value::Int(*x as i64)),
+            v.max_opt().map(|x| Value::Int(*x as i64)),
+        ),
+        Statistics::Int64(v) => (
+            v.min_opt().map(|x| Value::Int(*x)),
+            v.max_opt().map(|x| Value::Int(*x)),
+        ),
+        Statistics::Float(v) => (
+            v.min_opt().map(|x| Value::Float(*x as f64)),
+            v.max_opt().map(|x| Value::Float(*x as f64)),
+        ),
+        Statistics::Double(v) => (
+            v.min_opt().map(|x| Value::Float(*x)),
+            v.max_opt().map(|x| Value::Float(*x)),
+        ),
+        Statistics::ByteArray(v) => (
+            v.min_opt()
+                .and_then(|b| b.as_utf8().ok().map(|s| Value::Str(s.to_string()))),
+            v.max_opt()
+                .and_then(|b| b.as_utf8().ok().map(|s| Value::Str(s.to_string()))),
+        ),
+        // Int96 (legacy timestamps) and FixedLenByteArray: not ordered here.
+        _ => (None, None),
+    }
+}
+
+/// Build the per-column statistics map for one row group. Keyed by the leaf
+/// column path string, which equals the field name for the flat columns
+/// predicates push on; nested paths (dotted) simply won't match a top-level
+/// predicate column and are left un-pruned (conservative).
+fn row_group_col_stats(rg: &RowGroupMetaData) -> HashMap<String, ColStats> {
+    let num_rows = rg.num_rows();
+    let mut map = HashMap::with_capacity(rg.num_columns());
+    for i in 0..rg.num_columns() {
+        let col = rg.column(i);
+        if let Some(stats) = col.statistics() {
+            let (min, max) = stat_min_max(stats);
+            let null_count = stats.null_count_opt().map(|n| n as i64);
+            map.insert(
+                col.column_path().string(),
+                ColStats {
+                    min,
+                    max,
+                    null_count,
+                    num_rows,
+                },
+            );
+        }
+    }
+    map
+}
+
+/// Drop the row groups in `selected` that `pred` proves cannot contain a match.
+/// Conservative by construction (see `predicate::can_match`): a row group is
+/// removed only when provably empty for the predicate, so this never drops a
+/// group that could have contributed rows.
+fn prune_row_groups(meta: &ArrowReaderMetadata, selected: Vec<usize>, pred: &Pred) -> Vec<usize> {
+    let md = meta.metadata();
+    selected
+        .into_iter()
+        .filter(|&rg| can_match(pred, &row_group_col_stats(md.row_group(rg))))
+        .collect()
+}
+
+/// Parse the optional predicate IR and prune `selected` in one step; `None`
+/// (no pushdown) returns `selected` unchanged.
+fn apply_predicate(
+    meta: &ArrowReaderMetadata,
+    selected: Vec<usize>,
+    predicate_json: &Option<String>,
+) -> Vec<usize> {
+    match predicate_json {
+        None => selected,
+        Some(j) => prune_row_groups(meta, selected, &Pred::from_json(j)),
+    }
+}
+
+// --------------------------------------------------------------------------- //
 // Column projection helper
 // --------------------------------------------------------------------------- //
 /// Build a leaf-column ProjectionMask from column names using the parquet schema
@@ -201,6 +308,114 @@ impl ArrowStream {
 fn into_py_stream(reader: Box<dyn RecordBatchReader + Send>) -> ArrowStream {
     ArrowStream {
         inner: Some(FFI_ArrowArrayStream::new(reader)),
+    }
+}
+
+// --------------------------------------------------------------------------- //
+// Footer metadata returned to Python (Track 1: arrow-rs owns the footer read)
+// --------------------------------------------------------------------------- //
+/// The parts of the Parquet footer the Python reader needs so PyArrow no longer
+/// has to open the file for supported fragments: the full Arrow schema (exposed
+/// zero-copy via the Arrow C-schema PyCapsule, so it round-trips extension/field
+/// metadata for the UDT path) plus per-row-group row counts and byte sizes (for
+/// chunking, row-offset bookkeeping, `count()`, and the split threshold). Column
+/// statistics for row-group pruning are a follow-up on this same struct.
+#[pyclass]
+struct ParquetFileMetadata {
+    schema: SchemaRef,
+    #[pyo3(get)]
+    num_rows: i64,
+    #[pyo3(get)]
+    num_row_groups: usize,
+    #[pyo3(get)]
+    row_group_num_rows: Vec<i64>,
+    #[pyo3(get)]
+    row_group_byte_sizes: Vec<i64>,
+    // Per-row-group *compressed* (on-disk) byte size — the sum of each column
+    // chunk's compressed size. This is what the Python chunker bundles by, so it
+    // must match PyArrow's `sum(col.total_compressed_size)`. Distinct from
+    // `row_group_byte_sizes`, which is the *uncompressed* `total_byte_size()`.
+    #[pyo3(get)]
+    row_group_compressed_sizes: Vec<i64>,
+    // Root (top-level) column names that contain an INT96-physical leaf. The
+    // support gate needs this because parquet-rs honors an embedded Arrow-schema
+    // unit hint for INT96 (→ us/ms/s) whereas PyArrow always forces ns: a column
+    // in this list whose decoded unit isn't ns would diverge from PyArrow, so the
+    // gate must fall it back. INT96 columns that come out as ns already match.
+    #[pyo3(get)]
+    int96_columns: Vec<String>,
+}
+
+#[pymethods]
+impl ParquetFileMetadata {
+    /// Arrow PyCapsule protocol: `pa.schema(obj)` / `Schema._import_from_c_capsule`
+    /// pull the schema through this. Rebuilt each call (cheap, non-consuming).
+    fn __arrow_c_schema__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
+        let ffi = FFI_ArrowSchema::try_from(self.schema.as_ref()).map_err(to_py)?;
+        let name = CString::new("arrow_schema").unwrap();
+        PyCapsule::new_bound(py, ffi, Some(name))
+    }
+}
+
+/// Reader options shared by *every* entry point (metadata reads, local decode,
+/// S3 decode), so the schema a metadata read reports can never diverge from what
+/// a decode produces. `page_index` varies by caller: pruning paths ask for the
+/// page index (`Optional`); a bare footer/metadata read skips it (`Skip`).
+///
+/// INT96 note: parquet-rs decodes the legacy INT96 timestamp physical type to
+/// `Timestamp(Nanosecond, None)` by default (arrow/schema/primitive.rs), which is
+/// exactly what PyArrow produces for INT96 by default — so a Spark/Hive/Impala
+/// INT96 file (the common producers, which embed no Arrow schema) decodes
+/// byte-identically on both paths and takes the native path with no coercion.
+/// The one divergence is a file that embeds an Arrow schema pinning a *non-ns*
+/// unit (e.g. a PyArrow writer with `use_deprecated_int96_timestamps=True` over a
+/// `timestamp[us]` column): parquet-rs honors that embedded hint (→ us) while
+/// PyArrow forces ns. That mismatch is caught by the support gate's
+/// per-file-vs-unified type check, which falls the file back to PyArrow — correct,
+/// if not yet native. parquet 59 has no `with_coerce_int96`, so forcing ns there
+/// would need a per-column `with_schema` override; deferred (narrow case, and the
+/// fallback is already correct).
+fn reader_options(page_index: PageIndexPolicy) -> ArrowReaderOptions {
+    ArrowReaderOptions::new().with_page_index_policy(page_index)
+}
+
+/// Pull the fields Python needs out of an already-loaded `ArrowReaderMetadata`.
+/// Local and S3 both funnel through here so the shape is identical.
+fn build_file_metadata(meta: &ArrowReaderMetadata) -> ParquetFileMetadata {
+    let md = meta.metadata();
+    let n = md.num_row_groups();
+    let mut row_group_num_rows = Vec::with_capacity(n);
+    let mut row_group_byte_sizes = Vec::with_capacity(n);
+    let mut row_group_compressed_sizes = Vec::with_capacity(n);
+    let mut num_rows = 0i64;
+    for i in 0..n {
+        let rg = md.row_group(i);
+        row_group_num_rows.push(rg.num_rows());
+        row_group_byte_sizes.push(rg.total_byte_size());
+        row_group_compressed_sizes.push(rg.compressed_size());
+        num_rows += rg.num_rows();
+    }
+
+    // Collect the root column names backing an INT96 leaf. Walk the flat leaf
+    // descriptors and key by the first path component so a nested INT96 (e.g. a
+    // struct field) still surfaces its top-level column to the gate.
+    let mut int96_roots: HashSet<String> = HashSet::new();
+    for col in md.file_metadata().schema_descr().columns() {
+        if col.physical_type() == PhysicalType::INT96 {
+            if let Some(root) = col.path().parts().first() {
+                int96_roots.insert(root.clone());
+            }
+        }
+    }
+
+    ParquetFileMetadata {
+        schema: meta.schema().clone(),
+        num_rows,
+        num_row_groups: n,
+        row_group_num_rows,
+        row_group_byte_sizes,
+        row_group_compressed_sizes,
+        int96_columns: int96_roots.into_iter().collect(),
     }
 }
 
@@ -394,6 +609,7 @@ impl RecordBatchReader for ParallelRangeReader {
 // --------------------------------------------------------------------------- //
 // Local entry point: choose sequential vs K-split
 // --------------------------------------------------------------------------- //
+#[allow(clippy::too_many_arguments)]
 fn open_local_reader(
     path: String,
     row_groups: Option<Vec<usize>>,
@@ -402,6 +618,7 @@ fn open_local_reader(
     budget_bytes: u64,
     k: usize,
     split_threshold_bytes: u64,
+    predicate_json: Option<String>,
 ) -> Result<Box<dyn RecordBatchReader + Send>, ParquetError> {
     // Lean footer parse (#6): the page index is only needed for the K-split
     // RowSelection (to skip pages by byte range). K-split can only fire when k > 1,
@@ -413,13 +630,17 @@ fn open_local_reader(
     } else {
         PageIndexPolicy::Skip
     };
-    let opts = ArrowReaderOptions::new().with_page_index_policy(policy);
+    let opts = reader_options(policy);
     let meta = ArrowReaderMetadata::load(&File::open(&path)?, opts)?;
     let mask = projection_mask(meta.metadata().file_metadata().schema_descr(), &columns);
     let selected: Vec<usize> = match row_groups {
         Some(v) => v,
         None => (0..meta.metadata().num_row_groups()).collect(),
     };
+    // Statistics-based row-group pruning (conservative — see predicate.rs). This
+    // is the mechanism that replaces PyArrow's `fragment.subset(filter=...)` so
+    // pruned groups are never fetched or decoded.
+    let selected = apply_predicate(&meta, selected, &predicate_json);
     let schema = probe_schema(&path, &meta, &mask)?;
 
     // K-split only for a *single* row group above the threshold, and only when the
@@ -458,7 +679,8 @@ fn open_local_reader(
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, row_groups=None, columns=None, batch_size=131072, decode_budget_bytes=2*1024*1024, k=1, split_threshold_bytes=134217728))]
+#[pyo3(signature = (path, row_groups=None, columns=None, batch_size=131072, decode_budget_bytes=2*1024*1024, k=1, split_threshold_bytes=134217728, predicate_json=None))]
+#[allow(clippy::too_many_arguments)]
 fn read_row_groups(
     path: String,
     row_groups: Option<Vec<usize>>,
@@ -467,6 +689,10 @@ fn read_row_groups(
     decode_budget_bytes: u64,
     k: usize,
     split_threshold_bytes: u64,
+    // Optional predicate IR (JSON, built from the Ray `Expr`) for statistics
+    // row-group pruning. None = no pushdown. Row-level filtering still happens
+    // in Python post-decode, so this only avoids IO/decode, never changes rows.
+    predicate_json: Option<String>,
 ) -> PyResult<ArrowStream> {
     let reader = open_local_reader(
         path,
@@ -476,6 +702,7 @@ fn read_row_groups(
         decode_budget_bytes,
         k,
         split_threshold_bytes,
+        predicate_json,
     )
     .map_err(to_py)?;
     Ok(into_py_stream(reader))
@@ -487,6 +714,14 @@ fn read_row_groups(
 /// Number of decoded batches a unit task may run ahead of the consumer. Depth 2
 /// bounds resident memory while still letting a task fetch/decode one batch ahead.
 const S3_CHANNEL_DEPTH: usize = 2;
+
+/// Per-window decoded buffer, used by the `prefetch_windows` pipeline. Kept at 1:
+/// the cross-window prefetch (fetching window N+1 while N decodes) is what hides S3
+/// latency; we do NOT also want each in-flight window buffering several decoded
+/// batches, which would multiply the decode transient. So each window may hold at
+/// most one decoded batch, and `prefetch_windows` controls how many windows are in
+/// flight at once.
+const S3_WINDOW_CHANNEL_DEPTH: usize = 1;
 
 /// A sync `RecordBatchReader` fed by K background tokio tasks (one per row-range
 /// unit), each draining its unit into a bounded async channel. The consumer drains
@@ -532,14 +767,69 @@ fn window_rows_for(rgm: &parquet::file::metadata::RowGroupMetaData, fetch_window
     (((fetch_window_mb as f64) * 1024.0 * 1024.0) / comp_bpr).max(1.0) as usize
 }
 
+/// Spawn a background task that fetches + decodes ONE fetch window — rows
+/// `[w, w+wlen)` within row group `rg` — streaming its batches into a bounded
+/// channel, and return the receiver. Building the stream is cheap (metadata is
+/// already loaded); the S3 fetch for this window's pages is issued when the task
+/// first polls the stream. So the moment this returns, that fetch is in flight on
+/// the runtime — which is what lets the caller prefetch window N+1 while draining
+/// window N. `S3_WINDOW_CHANNEL_DEPTH` bounds how far ahead a single window decodes.
+fn spawn_window(
+    store: Arc<dyn ObjectStore>,
+    path: ObjPath,
+    meta: ArrowReaderMetadata,
+    mask: ProjectionMask,
+    rg: usize,
+    w: usize,
+    wlen: usize,
+    batch_rows: usize,
+) -> mpsc::Receiver<Result<RecordBatch, ArrowError>> {
+    let (tx, rx) = mpsc::channel::<Result<RecordBatch, ArrowError>>(S3_WINDOW_CHANNEL_DEPTH);
+    tokio::spawn(async move {
+        // Select rows [w, w+wlen) WITHIN this row group (we restrict to `rg`), so
+        // only this window's pages are fetched (page index skips the rest by byte
+        // range).
+        let sel = RowSelection::from(vec![RowSelector::skip(w), RowSelector::select(wlen)]);
+        let reader = ParquetObjectReader::new(store, path);
+        let built = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, meta)
+            .with_row_groups(vec![rg])
+            .with_row_selection(sel)
+            .with_batch_size(batch_rows)
+            .with_projection(mask)
+            .build();
+        let mut stream = match built {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(Err(ArrowError::ExternalError(Box::new(e)))).await;
+                return;
+            }
+        };
+        while let Some(item) = stream.next().await {
+            let is_err = item.is_err();
+            let msg = item.map_err(|e| ArrowError::ExternalError(Box::new(e)));
+            if tx.send(msg).await.is_err() {
+                return; // consumer dropped
+            }
+            if is_err {
+                return;
+            }
+        }
+    });
+    rx
+}
+
 /// Drive one unit (a list of contiguous `(rg, start, len)` sub-ranges, in order)
-/// over the async object store, sending decoded batches to `tx`. Each unit's rows
-/// are sliced into fetch windows; every window builds a fresh stream restricted to
-/// that window's rows via a `RowSelection`, so only that window's pages are fetched
-/// and buffered (the page index, loaded below, lets object_store skip unselected
-/// pages by byte range). The decode batch is byte-budgeted (knob 1); the window is
-/// compressed-byte-budgeted (knob 2). Backpressure via `tx.send(..).await` on the
-/// bounded channel keeps at most `S3_CHANNEL_DEPTH` batches resident per unit.
+/// over the async object store, sending decoded batches to `tx` in row order.
+///
+/// The unit's rows are sliced into fetch windows, each holding ~`fetch_window_mb`
+/// of compressed bytes (knob 2); the decode batch inside a window is byte-budgeted
+/// (knob 1). `prefetch_windows` (knob 3) is the pipeline depth: we keep that many
+/// window decoders in flight at once via [`spawn_window`], draining their channels
+/// in window order. depth=1 is the old strictly-serial behavior (fetch W0, decode
+/// W0, fetch W1, ...); depth=2 issues window N+1's S3 fetch while window N decodes,
+/// hiding the fetch latency behind the decode. Resident memory stays bounded to
+/// ~`prefetch_windows` windows of compressed bytes (plus one decoded batch each) —
+/// far below a whole-row-group prefetch, and still a knob.
 #[allow(clippy::too_many_arguments)]
 async fn drive_unit(
     store: Arc<dyn ObjectStore>,
@@ -550,8 +840,12 @@ async fn drive_unit(
     budget_bytes: u64,
     batch_clamp: usize,
     fetch_window_mb: u64,
+    prefetch_windows: usize,
     tx: mpsc::Sender<Result<RecordBatch, ArrowError>>,
 ) {
+    // Flatten every (row group, window) this unit will read into one ordered list
+    // of specs. We enumerate here only — no fetch happens until a window is spawned.
+    let mut specs: Vec<(usize, usize, usize, usize)> = Vec::new(); // (rg, w, wlen, batch_rows)
     for (rg, start, len) in subranges {
         let rgm = meta.metadata().row_group(rg);
         let batch_rows = byte_budget_rows(
@@ -570,69 +864,81 @@ async fn drive_unit(
         let mut w = start;
         while w < end {
             let wlen = step.min(end - w);
-            // Select rows [w, w+wlen) WITHIN this row group (we restrict to `rg`).
-            let sel = RowSelection::from(vec![RowSelector::skip(w), RowSelector::select(wlen)]);
-            let reader = ParquetObjectReader::new(store.clone(), path.clone());
-            let built = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, meta.clone())
-                .with_row_groups(vec![rg])
-                .with_row_selection(sel)
-                .with_batch_size(batch_rows)
-                .with_projection(mask.clone())
-                .build();
-            let mut stream = match built {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(Err(ArrowError::ExternalError(Box::new(e)))).await;
-                    return;
-                }
-            };
-            while let Some(item) = stream.next().await {
-                let is_err = item.is_err();
-                let msg = item.map_err(|e| ArrowError::ExternalError(Box::new(e)));
-                if tx.send(msg).await.is_err() {
-                    return; // consumer dropped
-                }
-                if is_err {
-                    return;
-                }
-            }
+            specs.push((rg, w, wlen, batch_rows));
             w += wlen;
+        }
+    }
+
+    // Bounded look-ahead: keep at most `depth` window decoders in flight, draining
+    // their channels in spec order so output stays row-ordered while up to `depth`
+    // windows fetch+decode concurrently.
+    let depth = prefetch_windows.max(1);
+    let mut in_flight: VecDeque<mpsc::Receiver<Result<RecordBatch, ArrowError>>> = VecDeque::new();
+    let mut next = 0usize;
+    // Prime the pipeline: start `depth` window fetches concurrently.
+    while next < specs.len() && in_flight.len() < depth {
+        let (rg, w, wlen, br) = specs[next];
+        in_flight.push_back(spawn_window(
+            store.clone(),
+            path.clone(),
+            meta.clone(),
+            mask.clone(),
+            rg,
+            w,
+            wlen,
+            br,
+        ));
+        next += 1;
+    }
+    while let Some(mut rx) = in_flight.pop_front() {
+        while let Some(item) = rx.recv().await {
+            let is_err = item.is_err();
+            if tx.send(item).await.is_err() {
+                return; // consumer dropped
+            }
+            if is_err {
+                return;
+            }
+        }
+        // Front window exhausted — top the pipeline back up to `depth`, so window
+        // N+depth's fetch starts as soon as window N's finishes draining.
+        if next < specs.len() {
+            let (rg, w, wlen, br) = specs[next];
+            in_flight.push_back(spawn_window(
+                store.clone(),
+                path.clone(),
+                meta.clone(),
+                mask.clone(),
+                rg,
+                w,
+                wlen,
+                br,
+            ));
+            next += 1;
         }
     }
 }
 
-#[pyfunction]
-#[pyo3(signature = (bucket, key, region, anonymous, endpoint=None, access_key_id=None,
-                    secret_access_key=None, session_token=None, allow_http=false,
-                    virtual_hosted_style=false, row_groups=None, columns=None,
-                    batch_size=131072, decode_budget_bytes=2*1024*1024,
-                    fetch_window_mb=16, k=1, split_threshold_bytes=134217728))]
+/// Build an S3 `ObjectStore` from the config recovered from the pyarrow
+/// `S3FileSystem` on the Python side (`fs.__reduce__()[1][0]`) so credentialed /
+/// custom-endpoint (MinIO, moto) / anonymous buckets all connect identically to
+/// PyArrow. Empty/None fields are treated as unset. Shared by `read_row_groups_s3`
+/// and `read_metadata_s3`.
 #[allow(clippy::too_many_arguments)]
-fn read_row_groups_s3(
-    bucket: String,
-    key: String,
-    region: String,
+fn build_s3_store(
+    bucket: &str,
+    region: &str,
     anonymous: bool,
-    // Full S3 config, recovered from the pyarrow S3FileSystem on the Python side
-    // (fs.__reduce__()[1][0]) so credentialed / custom-endpoint (MinIO, moto) /
-    // anonymous buckets all decode identically to PyArrow. Empty/None → unset.
     endpoint: Option<String>,
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
     session_token: Option<String>,
     allow_http: bool,
     virtual_hosted_style: bool,
-    row_groups: Option<Vec<usize>>,
-    columns: Option<Vec<String>>,
-    batch_size: usize,
-    decode_budget_bytes: u64,
-    fetch_window_mb: u64,
-    k: usize,
-    split_threshold_bytes: u64,
-) -> PyResult<ArrowStream> {
+) -> Result<Arc<dyn ObjectStore>, object_store::Error> {
     let mut sb = AmazonS3Builder::new()
-        .with_bucket_name(&bucket)
-        .with_region(&region)
+        .with_bucket_name(bucket)
+        .with_region(region)
         .with_virtual_hosted_style_request(virtual_hosted_style);
     if let Some(ep) = endpoint.filter(|s| !s.is_empty()) {
         sb = sb.with_endpoint(ep);
@@ -656,7 +962,54 @@ fn read_row_groups_s3(
             sb = sb.with_token(t);
         }
     }
-    let store: Arc<dyn ObjectStore> = Arc::new(sb.build().map_err(to_py)?);
+    Ok(Arc::new(sb.build()?))
+}
+
+#[pyfunction]
+#[pyo3(signature = (bucket, key, region, anonymous, endpoint=None, access_key_id=None,
+                    secret_access_key=None, session_token=None, allow_http=false,
+                    virtual_hosted_style=false, row_groups=None, columns=None,
+                    batch_size=131072, decode_budget_bytes=2*1024*1024,
+                    fetch_window_mb=16, k=1, split_threshold_bytes=134217728,
+                    prefetch_windows=2, predicate_json=None))]
+#[allow(clippy::too_many_arguments)]
+fn read_row_groups_s3(
+    bucket: String,
+    key: String,
+    region: String,
+    anonymous: bool,
+    // Full S3 config, recovered from the pyarrow S3FileSystem on the Python side
+    // (fs.__reduce__()[1][0]) so credentialed / custom-endpoint (MinIO, moto) /
+    // anonymous buckets all decode identically to PyArrow. Empty/None → unset.
+    endpoint: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    session_token: Option<String>,
+    allow_http: bool,
+    virtual_hosted_style: bool,
+    row_groups: Option<Vec<usize>>,
+    columns: Option<Vec<String>>,
+    batch_size: usize,
+    decode_budget_bytes: u64,
+    fetch_window_mb: u64,
+    k: usize,
+    split_threshold_bytes: u64,
+    prefetch_windows: usize,
+    // See `read_row_groups`: statistics row-group pruning only.
+    predicate_json: Option<String>,
+) -> PyResult<ArrowStream> {
+    let store = build_s3_store(
+        &bucket,
+        &region,
+        anonymous,
+        endpoint,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        allow_http,
+        virtual_hosted_style,
+    )
+    .map_err(to_py)?;
     let obj_path = ObjPath::from(key);
 
     let rt = shared_runtime();
@@ -667,7 +1020,7 @@ fn read_row_groups_s3(
     // what keeps it matching the projected batches at the FFI boundary.
     let (meta, mask, schema) = rt
         .block_on(async {
-            let opts = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional);
+            let opts = reader_options(PageIndexPolicy::Optional);
             let mut probe = ParquetObjectReader::new(store.clone(), obj_path.clone());
             let meta = ArrowReaderMetadata::load_async(&mut probe, opts).await?;
             let mask = projection_mask(meta.metadata().file_metadata().schema_descr(), &columns);
@@ -688,6 +1041,9 @@ fn read_row_groups_s3(
         Some(v) => v,
         None => (0..meta.metadata().num_row_groups()).collect(),
     };
+    // Statistics-based pruning (conservative) before any range GET is issued, so
+    // pruned groups cost no S3 traffic. Same mechanism as the local path.
+    let selected = apply_predicate(&meta, selected, &predicate_json);
 
     // K-split ONLY for a lone row group above the threshold with a page index —
     // the case Ray's fragment pool can't parallelize. Mirrors the local rule so
@@ -743,6 +1099,7 @@ fn read_row_groups_s3(
             decode_budget_bytes,
             batch_size,
             fetch_window_mb,
+            prefetch_windows,
             tx,
         ));
     }
@@ -754,6 +1111,78 @@ fn read_row_groups_s3(
     })))
 }
 
+// --------------------------------------------------------------------------- //
+// Footer-only metadata reads (Track 1): one footer parse, no data decode.
+// --------------------------------------------------------------------------- //
+/// Read just the Parquet footer of a local file and return schema + per-row-group
+/// counts. Page index is skipped (not needed for metadata). Lets the Python reader
+/// stop building a PyArrow dataset to learn the schema / row-group layout.
+#[pyfunction]
+fn read_metadata(path: String) -> PyResult<ParquetFileMetadata> {
+    let opts = reader_options(PageIndexPolicy::Skip);
+    let meta =
+        ArrowReaderMetadata::load(&File::open(&path).map_err(to_py)?, opts).map_err(to_py)?;
+    Ok(build_file_metadata(&meta))
+}
+
+/// S3 counterpart of [`read_metadata`]: one async footer fetch via `object_store`,
+/// same connection config recovery as `read_row_groups_s3`.
+#[pyfunction]
+#[pyo3(signature = (bucket, key, region, anonymous, endpoint=None, access_key_id=None,
+                    secret_access_key=None, session_token=None, allow_http=false,
+                    virtual_hosted_style=false))]
+#[allow(clippy::too_many_arguments)]
+fn read_metadata_s3(
+    bucket: String,
+    key: String,
+    region: String,
+    anonymous: bool,
+    endpoint: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    session_token: Option<String>,
+    allow_http: bool,
+    virtual_hosted_style: bool,
+) -> PyResult<ParquetFileMetadata> {
+    let store = build_s3_store(
+        &bucket,
+        &region,
+        anonymous,
+        endpoint,
+        access_key_id,
+        secret_access_key,
+        session_token,
+        allow_http,
+        virtual_hosted_style,
+    )
+    .map_err(to_py)?;
+    let obj_path = ObjPath::from(key);
+    let rt = shared_runtime();
+    let meta = rt
+        .block_on(async {
+            let opts = reader_options(PageIndexPolicy::Skip);
+            let mut probe = ParquetObjectReader::new(store.clone(), obj_path.clone());
+            ArrowReaderMetadata::load_async(&mut probe, opts).await
+        })
+        .map_err(to_py)?;
+    Ok(build_file_metadata(&meta))
+}
+
+/// Return the row-group ids of `path` that survive `predicate_json`'s statistics
+/// pruning (all of them when it's None). This is the exact selection
+/// `read_row_groups` would decode; exposed so callers (and tests) can observe
+/// pruning without decoding, and so the pyarrow-free reader can learn the read
+/// set up front. Page index is skipped (stats live in the footer).
+#[pyfunction]
+#[pyo3(signature = (path, predicate_json=None))]
+fn select_row_groups(path: String, predicate_json: Option<String>) -> PyResult<Vec<usize>> {
+    let opts = reader_options(PageIndexPolicy::Skip);
+    let meta =
+        ArrowReaderMetadata::load(&File::open(&path).map_err(to_py)?, opts).map_err(to_py)?;
+    let all: Vec<usize> = (0..meta.metadata().num_row_groups()).collect();
+    Ok(apply_predicate(&meta, all, &predicate_json))
+}
+
 fn to_py<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
@@ -762,5 +1191,9 @@ fn to_py<E: std::fmt::Display>(e: E) -> PyErr {
 fn ray_data_arrow_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_row_groups, m)?)?;
     m.add_function(wrap_pyfunction!(read_row_groups_s3, m)?)?;
+    m.add_function(wrap_pyfunction!(read_metadata, m)?)?;
+    m.add_function(wrap_pyfunction!(read_metadata_s3, m)?)?;
+    m.add_function(wrap_pyfunction!(select_row_groups, m)?)?;
+    m.add_class::<ParquetFileMetadata>()?;
     Ok(())
 }

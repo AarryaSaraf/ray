@@ -6,3 +6,8 @@ runs/
 figs/
 __pycache__/
 *.pyc
+# Full-suite run logs + the pointer file summarize.py drops — regenerable.
+*.log
+.last_full_run_log
+# Ad-hoc fixture dirs the leak-sweep scripts (gen.py / sweep.sh) write.
+leak_linux_data/

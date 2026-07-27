@@ -7,6 +7,7 @@ srcs:
   - python/ray/data/_internal/datasource_v2/native/ray_data_arrow_rs/pyproject.toml
   - python/ray/data/_internal/datasource_v2/native/ray_data_arrow_rs/README.md
   - python/ray/data/_internal/datasource_v2/native/ray_data_arrow_rs/src/lib.rs
+  - python/ray/data/_internal/datasource_v2/native/ray_data_arrow_rs/src/predicate.rs
 build_args:
   - DOCKER_IMAGE_BASE_BUILD=cr.ray.io/rayproject/datalbuild-py$PYTHON
   - PYTHON=$PYTHON

@@ -254,3 +254,6 @@ CLAUDE.local.md
 # Worktrees
 .worktrees/
 .claude/worktrees/
+
+# arrow-rs prototype: compiled paper PDF (regenerate from doc.tex with pdflatex)
+/python/ray/data/doc.pdf

@@ -15,30 +15,36 @@ real (Ray-integrated) benchmark numbers, the optimizations and fixes by phase, a
 most importantly — the open holes we want critiqued. It is self-contained: it assumes
 you know Ray Data and Parquet at a high level but nothing about this work.
 
-> **Note on an older version of this file.** A previous version reported 7–29× memory /
-> 4–5× speed wins "over S3." Those came from a *standalone* Rust benchmark binary
-> (`main.rs`) that decoded-and-dropped over S3 — not from Ray. Every number in *this*
-> document comes from the **real Ray-integrated reader** running locally on macOS. The
-> S3 story is deferred to a later phase and is explicitly **not** claimed here.
-
 ---
 
 ## 0. The 60-second version
 
 - **What we target:** the single painful Parquet layout Ray's own reader can't
-  parallelize — **one big row group in a lone fragment** — on **local or S3**, with flat
-  **or struct/list** schemas (nested types ungated 2026-07-21 after byte-parity
-  validation). Dictionary / extension (tensor) / map / union types and other filesystems
-  fall back to PyArrow, transparently and by design.
-- **Why arrow-rs helps:** PyArrow must **materialize the whole decoded row group** to
-  emit any batch, so its peak RSS is dictated by the file. arrow-rs **streams
-  byte-budgeted batches** (~8 MiB each), so its decode working set is a knob we set, not
-  a property of the file.
+  parallelize — **one big row group in a lone fragment** — on **local or S3**. The
+  **column-type gate is now complete** (2026-07-24): every type Parquet can actually
+  store — flat, dictionary, map, extension (Ray tensor / variable-shaped / canonical
+  `fixed_shape_tensor`), and struct/list/map nesting of them to any depth — decodes
+  natively byte-identically to PyArrow (§6.8). The only types still on the PyArrow
+  fallback have **no Parquet encoding at all** (union, list_view, run_end_encoded,
+  interval — PyArrow itself refuses to write them), so that rejection is an unreachable
+  fail-safe, not a limitation. What still routes to PyArrow is **filesystem** (non-Local/S3)
+  and a few reader-level kwargs (§1) — *types are no longer the axis.*
+- **Why arrow-rs helps:** Ray's **normal** V2 path decodes a row group through PyArrow's
+  **dataset scanner** (`fragment.scanner().scan_batches()`, `pre_buffer=True`), which holds
+  the selected columns of the whole row group resident *plus* prefetched compressed bytes —
+  so peak RSS grows with row-group size, which the file dictates. (`pq.ParquetFile.iter_batches`,
+  often *assumed* to stream, is only the ARROW-5030 nested fallback and *also* materializes
+  the whole decoded row group — §3.2.) arrow-rs instead sizes each decode batch **by bytes**
+  (~8 MiB), turning the dominant O(row group) term into O(decode budget). Its peak is **not**
+  literally flat — it's `budget + S3 fetch window + read-ahead + page/dict buffers + allocator
+  retention` (§3.4) — but the row-group-scaled term is gone.
 - **Headline finding (real integrated reader, macOS, 800 MB single-row-group file,
   `iter_batches`):** arrow-rs peaks at **519 MB vs PyArrow's 2332 MB (4.5× less)** and
   finishes in **5.14 s vs 8.15 s (1.6× faster)**. The memory win is the robust result;
   the speed win is a *consequence* of it (less memory pressure on the materialization
-  path).
+  path). Note this pins PyArrow to `iter_batches`; the **production** path is the scanner,
+  which is *worse* still (§3.2 measured it ~2.3× above `iter_batches`), so 4.5× is a
+  conservative floor vs what Ray actually runs.
 - **The one honest speed regression:** on a *pure-decode-bound* scan (touch every column,
   throw the output away) arrow-rs's raw decode is slower — but this is **single-thread and
   schema-dependent**: at the thread count a Ray worker actually gets (`pa.cpu_count()==1`)
@@ -76,9 +82,11 @@ you know Ray Data and Parquet at a high level but nothing about this work.
   **2.6–2.8× less memory at speed parity** (`large_1rg` 2.63×, `large_str_1rg` 2.83×), and
   the per-task graphs now carry the ideal-streaming-reader line: PyArrow towers ~+2.4 GB
   above it, arrow-rs ~+0.6 GB (§5.10).
-- **What's unproven:** the `oom` end-to-end demo, nested/dictionary/decimal *edge* schemas
-  beyond the struct/list parity tests, and whether the K-split concurrency can be
-  redesigned to win locally too (§7).
+- **What's unproven:** column-type *correctness* is now settled — map/dictionary/extension
+  decode byte-identically (§6.8) — but the *memory-win magnitude* for those richer schemas at
+  node level (beyond the flat/string/struct cells in §5.10) isn't separately measured; also
+  open: the `oom` end-to-end demo, whether the K-split concurrency can be redesigned to win
+  locally too, and **filesystem breadth (GCS/Azure)**, which needs new crate connectors (§7).
 
 ---
 
@@ -92,39 +100,53 @@ big row group* (common: Spark/pandas defaults, `row_group_size` = row count), th
 group is a lone fragment handed to a single worker, and PyArrow decodes it essentially
 single-threaded while holding the entire decoded group resident.
 
-That is the case we route to arrow-rs. Concretely, `_arrow_rs_supported()` admits a
-fragment **only** if all of these hold:
+That is the case we route to arrow-rs. The routing gate is now applied **per file** at
+plan time (`_columns_supported`, inside the PyArrow-free `read()` — §2/§7.10), with a
+conservative per-fragment re-gate (`_arrow_rs_supported`) on the fallback path. A file is
+read natively **only** if all of these hold:
 
 - **local or S3 filesystem** (`LocalFileSystem` / `S3FileSystem`) — every other
-  filesystem (GCS, ABFS, HTTP, …) falls back. The S3 path recovers the full connection
-  config (endpoint, credentials, region, addressing style) from the pyarrow
-  `S3FileSystem` via `fs.__reduce__()`, so credentialed / MinIO / moto / custom-endpoint
-  buckets decode identically to PyArrow (§5.9);
-- **flat columns only** — no nested / dictionary / extension types;
-- **no `int96` timestamp coercion**, no forced `dictionary_columns`;
+  filesystem (GCS, ABFS, HTTP, …) falls back. This is the crate's only real remaining
+  boundary: `object_store` is compiled with the `aws` feature only, so the crate has no
+  connector to fetch bytes from other backends — an implementation gap, not a property of
+  the data (§7). The S3 path recovers the full connection config (endpoint, credentials,
+  region, addressing style) from the pyarrow `S3FileSystem` via `fs.__reduce__()`, so
+  credentialed / MinIO / moto / custom-endpoint buckets decode identically to PyArrow (§5.9);
+- **any column type Parquet can store** — flat, dictionary, map, extension (Ray tensor /
+  variable-shaped / canonical `fixed_shape_tensor`), and struct/list/map nesting to any
+  depth, all verified byte-identical (§6.8). The recursive `_arrow_rs_type_supported`
+  rejects only the `is_nested` exotics (union, list_view, run_end_encoded, interval), and
+  those are **unreachable from Parquet**: they have no Parquet encoding, so a column read
+  from a Parquet file can never carry one (PyArrow's writer throws "Unhandled type for
+  Arrow to Parquet schema conversion"). The rejection is a fail-safe, not a real limit;
+- **no `int96` timestamp coercion** (`coerce_int96_timestamp_unit`), no forced
+  `dictionary_columns` read — the crate doesn't mirror those read-time coercions. A file
+  *written* with legacy int96 timestamps still goes native (parquet-rs defaults int96 →
+  `timestamp[ns]`, matching PyArrow) unless it embeds a non-ns Arrow hint, which the gate
+  detects via the crate's `int96_columns` and falls back (§6.10);
 - **non-empty, non-dotted projection** — empty projection (count-style scans) and nested
   projections fall back;
 - **no per-fragment schema evolution** — a column whose per-fragment type differs from
   the unified schema, or is absent from the fragment, falls back (PyArrow does the
   null-fill / cast).
 
-Anything failing the gate transparently calls `super()._iter_fragment_tables(...)`
-(PyArrow). **Correctness is therefore never at risk** — the gate only narrows *where the
+Any file failing the gate is read by PyArrow (fallback fragments built only for those
+files). **Correctness is therefore never at risk** — the gate only narrows *where the
 arrow-rs path runs*, never what the output is. The cost of the gate is that benchmarks
-must confirm the arrow-rs path actually ran (it does — see the `test_native_path_actually_runs`
+must confirm the arrow-rs path actually ran (it does — see the `test_native_read_is_pyarrow_free`
 test and the parity tests).
 
 ```mermaid
 flowchart TD
     RP["read_parquet()"] -->|"use_datasource_v2=True"| SC["ParquetScanner.create_reader()"]
     SC -->|"branch on flag"| SW{"use_arrow_rs_<br/>parquet_reader?"}
-    SW -->|"False"| PA["ParquetFileReader<br/>(PyArrow, unchanged)"]
-    SW -->|"True"| AR["ArrowRsParquetFileReader"]
-    AR -->|"per fragment"| GATE{"_arrow_rs_supported?"}
-    GATE -->|"no (nested / S3 / int96 / …)"| PA
-    GATE -->|"yes (local flat)"| RS["ray_data_arrow_rs.read_row_groups<br/>(native crate, Arrow C-stream)"]
+    SW -->|"False"| PA["ParquetFileReader<br/>(PyArrow scanner path)"]
+    SW -->|"True"| AR["ArrowRsParquetFileReader.read()<br/>(PyArrow-free plan)"]
+    AR -->|"footer-read every file via crate<br/>read_metadata; gate per file"| GATE{"_columns_supported?"}
+    GATE -->|"no (unreachable type / int96-hint /<br/>schema-evo / non-Local-S3)"| PAF["PyArrow fragment (scanner)<br/>for fallback files only"]
+    GATE -->|"yes"| RS["ray_data_arrow_rs.read_row_groups<br/>(+ native stats pruning, Arrow C-stream)"]
     RS -->|"zero-copy FFI"| TB["byte-budgeted pa.Table batches"]
-    PA --> OUT["yield pa.Table → BlockOutputBuffer → blocks"]
+    PAF --> OUT["yield pa.Table → BlockOutputBuffer → blocks"]
     TB --> OUT
 ```
 
@@ -145,12 +167,18 @@ Three edits, all mirroring the existing `use_datasource_v2` flag pattern:
    benchmark attribution).
 3. **`readers/arrow_rs_parquet_file_reader.py`** — the reader (below).
 
-The reader subclasses `ParquetFileReader` and overrides **only** three methods:
-`_iter_fragment_tables` (the decode step), `_resolve_batch_size` (byte-budget sizing),
-and `_on_batch_read` (no-op). Everything else — row-group fan-out, projection
-resolution, `path`/`row_hash` synthesis, `limit` slicing, block sizing, per-fragment
-retry — is inherited unchanged. This is the smallest possible seam: we swap the decode
-kernel and nothing else.
+The reader began as a narrow seam (override `_iter_fragment_tables` only), but the memory
+win is now banked through a **PyArrow-free `read()`** (§7.10): for a supported file the
+reader footer-reads via the crate's `read_metadata`, prunes row groups from footer
+statistics natively (`predicate.rs`, replacing `fragment.subset`), and decodes via
+`read_row_groups` — PyArrow never opens the file. It decides native-vs-PyArrow **per file**
+(`_columns_supported`), building PyArrow `ParquetFileFragment`s only for the fallback files.
+The listing-stage footer read was migrated too (§6.11): with the flag on, `ParquetFileChunker`
+reads row-group sizes via the crate, so a supported Local/S3 file is PyArrow-free *end to
+end* — footer and data. The format-agnostic finishing (limit, `path`/`row_hash` synthesis,
+projection, block sizing, per-fragment retry) is still inherited from the base `FileReader`,
+which was refactored to share `_split_columns` / `_postprocess` / `_dispatch_fragment_reads`
+between the two paths.
 
 A Ray "block" *is* a `pyarrow.Table`, and the reader contract is just
 `Iterator[pa.Table]`, so no block-layer or executor changes are needed. The native crate
@@ -229,9 +257,28 @@ each block in the **worker's private heap**, then `yield`s it into shared plasma
 *post-yield* object-store size. The **decode working set** — everything the worker
 allocates to produce that block — lives in private heap and is invisible to the gate.
 
-For PyArrow that working set is the whole row group: to emit even one small batch,
-`iter_batches` materializes the **entire decoded row group**, whose size is a property of
-the file you don't control. So the real picture is:
+For PyArrow that working set is the whole row group. Ray's **normal** V2 path decodes via
+the dataset scanner (`fragment.scanner().scan_batches()`, `file_reader.py:555`) with
+`pre_buffer=True`, which holds the selected columns of the whole row group resident *and*
+prefetches coalesced compressed bytes on top. (The `pq.ParquetFile.iter_batches` path —
+`parquet_file_reader.py:457`, reached **only** under the ARROW-5030 nested fallback, not
+in the normal path — is no better: it too materializes the entire decoded row group before
+handing out `batch_size`-row slices; the batch size controls only the *output* chunk, not
+peak. The common belief that `iter_batches` streams within a row group is **false** for a
+wide read.) Measured, one 320 MB single-row-group file, 8 float64 cols, `batch_size=4096`
+rows (0.26 MB/batch), isolated-subprocess peak RSS above a warm floor:
+
+```
+scanner (pre_buffer) — the normal V2 path   +805 MB   decoded row group + prefetched compressed
+read_row_group(0) (whole)                   +740 MB
+iter_batches, all 8 cols (fallback path)    +346 MB   ≈ the whole decoded row group
+iter_batches, 1 of 8 cols                   + 46 MB   ≈ one 40 MB column chunk (scales w/ cols)
+arrow-rs crate (8 MB budget, K=1)           + 14 MB   ≈ the byte budget
+```
+
+The 1-column vs 8-column `iter_batches` rows (46 vs 346 MB, ~8×) are the proof that peak
+scales with *(projected columns × row-group size)*, never with `batch_size`. So the real
+picture is:
 
 ```
 what Ray budgets   = table.nbytes of the output block   (logical, ~128 MiB coalesced)
@@ -272,6 +319,18 @@ Both readers on one axis (solid = actual private heap, dashed = plasma occupancy
 PyArrow's heap (4388 MB) towers over plasma (~1400 MB); arrow-rs's heap (678 MB) is small.
 Side-by-side per-worker versions of every plot are in `agents_assets/`
 (`*__iter_batches.png`, `*__decode_drop.png`).
+
+**This decode floor is not tunable from PyArrow's Python API — verified by sweeping every
+knob that plausibly bounds it** (§5.12). On the scanner path, `batch_readahead` (1→32),
+`pre_buffer` (on/off), and `buffer_size` (1→64 MiB) leave the per-task working set
+**completely flat** (144 MB across all of them, on a 30-group / one-read-task fixture).
+`iter_batches` is a fixed ~85 MB floor (≈ one row group), unmoved by `pre_buffer` or
+`use_threads`. The reason: the scanner decodes whole row groups with PyArrow's own internal
+concurrency, and none of these knobs bound that; `batch_readahead` shapes only the
+batch-level look-ahead *within* an already-decoded group. arrow-rs is the **only** reader
+whose working set is a settable number — its byte budget moves it directly (26 MB @ 2 MiB
+budget, well under the scanner's 144 MB). So "just configure PyArrow to use less" is not an
+option the API offers; a different decoder is.
 
 ### 3.3 The decode-heavy, output-light case (real workloads)
 
@@ -332,6 +391,17 @@ is on the invisible decode-transient term. And critically, arrow-rs's private he
 **smaller than the object store Ray already tracks** — so it converts an unbounded,
 invisible explosion into mostly-visible, spillable, object-store-accounted memory. That is
 the structural win, beyond the raw ratio.
+
+**"Flat" is an idealization, stated honestly.** The decode-transient term is bounded by the
+byte budget, but arrow-rs's *total* peak is a sum of several terms: `decode budget + S3
+compressed fetch window (the fetch_window_mb knob; absent on local reads) + a few read-ahead
+batches buffered in the order-preserving channel + current page/dictionary buffers per active
+column + memory the Rust system allocator keeps mapped after free (RSS does not drop on a
+logical free — the MALLOC_ARENA_MAX / allocator discussion in §7.8)`. The clean ~8–14 MB
+local numbers above are a **best case** — local read (no fetch window), incompressible floats,
+K=1. The defensible claim is therefore **O(decoded row group) → O(budget + window + constants)**:
+a large reduction on big-row-group files, not a literally flat line. The real S3 peak (window
++ budget + allocator retention) is exactly what the Linux/S3 run in §5.10 measures.
 
 **Where arrow-rs neither helps nor hurts:** when a file has many small row groups, Ray's
 own thread pool spreads them across workers so no single worker ever holds a big group.
@@ -889,10 +959,26 @@ prefetch hides it under decode, and a *synchronous* per-group path would stall s
 `object_store`, drained on the shared tokio runtime into bounded per-unit channels), sized
 memory-first: a small compressed **fetch window** bounds in-flight bytes, and Ray's
 4-thread fragment pool overlaps fetch/decode across files (with K-split reserved for the
-lone big row group Ray can't split). Peak stays `≈ window + decode_budget`. Whether that
-bounded window still reaches PyArrow's throughput — or needs a larger window / intra-unit
-prefetch — is what the Linux/S3 sweep decides; memory-parity-or-better is the bar, speed
-parity the constraint.
+lone big row group Ray can't split). Peak stays `≈ window + decode_budget`.
+
+**But within a single stream the windows were themselves serial** (fetch window → decode
+it → fetch next → decode it …), so a lone row group larger than one fetch window still
+stalled on S3 latency between windows — the one case Ray's cross-file pool can't hide,
+because it's *one* file. That intra-unit prefetch is now a knob:
+**`prefetch_windows`** (env `RAY_DATA_ARROW_RS_PREFETCH_WINDOWS`, default 2). `drive_unit`
+now flattens all of a unit's windows into a spec list, primes up to `prefetch_windows`
+of them concurrently (each its own tokio task streaming into a depth-1 channel), and
+drains them **in row order** while topping the pipeline back up — so window N+1's GET is
+in flight while window N decodes. This is the bounded, memory-first analog of PyArrow's
+`pre_buffer=True`: it overlaps I/O with decode without front-loading the whole fragment.
+Depth 2 (one look-ahead) is the pipeline minimum that reaches steady-state throughput
+`max(fetch, decode) / window`; deeper only smooths S3 tail-latency jitter at +1 window of
+compressed RAM per level, which is why the memory bound is `≈ k × prefetch_windows ×
+fetch_window` compressed in flight (still a knob, still flat in row-group size). A
+parametrized moto test (`prefetch_windows ∈ {1,2,4}`, one stream, monotone ids) asserts
+the concurrent look-ahead never reorders rows. Whether depth 2 is the right *default* on
+real S3 — or a lone-big-group wants deeper — is a sweep axis the Linux/S3 run decides;
+memory-parity-or-better is the bar, speed parity the constraint.
 
 **Best-tuned, not single-thread-crippled.** The right comparison (per the memory-first bar)
 is PyArrow-in-Ray as-is vs arrow-rs with its knobs *tuned* (byte budget + K), not `k=1`:
@@ -954,6 +1040,18 @@ storage — so S3 is now a first-class, tested path. What landed in this phase:
   order, depth-2 backpressure), covered by a moto K-split test that asserts exact `0..n-1`
   order for K∈{2,4,8}. Also: one **shared process-wide tokio runtime** (was: a fresh
   runtime built+destroyed per fragment).
+
+- **Intra-unit fetch/decode prefetch (`prefetch_windows`, new).** Within a single stream
+  the windows were processed serially, so a lone row group bigger than one fetch window
+  stalled on S3 latency *between* windows. `drive_unit` now runs a bounded look-ahead
+  pipeline: up to `prefetch_windows` windows (env `RAY_DATA_ARROW_RS_PREFETCH_WINDOWS`,
+  default 2) are fetched+decoded concurrently — each in its own tokio task feeding a
+  depth-1 channel — and drained **in row order**, topping the pipeline up as each drains,
+  so window N+1's GET overlaps window N's decode. It is the memory-first analog of
+  PyArrow's `pre_buffer` (overlap I/O with decode without front-loading the whole
+  fragment); the memory bound becomes `≈ k × prefetch_windows × fetch_window` compressed,
+  still a knob and still flat in row-group size (§5.8). A parametrized moto test
+  (`prefetch_windows ∈ {1,2,4}`) asserts the look-ahead never reorders rows.
 
 **Still deferred to Linux + real S3 (§7.1):** *measuring* the memory/speed. The mechanism
 is in place and correct, but the win **cannot** be measured here — moto is in-process (no
@@ -1096,6 +1194,94 @@ pitch is *removing the OOMs at no speed cost*, which the deciding run confirms.
 heap OOM-kills the read and arrow-rs finishes — the end-to-end demonstration of §3.2's failure
 mode and its removal.
 
+### 5.11 Reproducing the arrow#39808 leak geometry *inside Ray* (the multi-row-group axis)
+
+The original `leak` axis (§5.5) reads a **single-row-group** file 8× and confirms no
+ratchet. But that geometry cannot exhibit the actual #39808 signature, which is the scanner
+accumulating **across many row groups**: with one group, "whole file" == "one row group",
+so scanner and `iter_batches` hold the same thing and there is nothing to distinguish. The
+new `leak_multigrp` axis (`bench_suite.py`) fixes this — 6 M rows of fat strings,
+`row_group_size=200_000` ⇒ **30 row groups** (~32 MB decoded each, ~900 MB total) — and
+reads it two ways, controlled by `ctx.parquet_chunker_target_chunk_size` (the knob
+`ParquetFileChunker` resolves from; default falls back to `target_min_block_size` = 1 MiB):
+
+* **`one_chunk`** — target huge ⇒ all 30 groups land in **one read task**, so the scanner
+  spans the whole file in a single `scan_batches` (the leak geometry).
+* **`per_group`** — target 0 ⇒ **one row group per read task** (the bounded geometry V2
+  normally produces).
+
+**Isolating the reader from Ray's block packing.** A first run came back *flat ~500 MB
+across every reader* — the confound §6.1/§7 warns about: a fixture that fits in one 128 MB
+output block is held whole by every worker regardless of how it decodes. The fix is to make
+the fixture ≫ one block **and** pin `ctx.target_max_block_size = 8 MiB` with a `decode_drop`
+consume, so what USS shows is the reader's own decode transient, not the output buffer. The
+metric reported is `max_task` = the decoding worker's USS growth above its warm floor (the
+cleanest macOS signal; only one worker grows because `preserve_order` serializes the tasks).
+
+| chunk_mode | pyarrow (scanner) | pyarrow_iter | arrow-rs |
+|---|---|---|---|
+| **one_chunk** (30 groups, 1 task) | **144 MB** | 85 MB | **39 MB** |
+| **per_group** (1 group/task) | 110 MB | ~78 MB | 39 MB |
+
+Three things fall out, each measured, not assumed:
+
+1. **The #39808 tiering reproduces end-to-end in Ray**: scanner > `iter_batches` > arrow-rs,
+   consistently. This is the issue's shape shown through real Ray tasks, not just
+   `pa.total_allocated_bytes()` (which is all the leak-signature *unit* test, §6.4, can see).
+2. **But V2's scanner does *not* catastrophically leak.** In `one_chunk` it holds ~144 MB of
+   a ~900 MB file — about 4–5 groups of readahead, i.e. it **streams**, it does not
+   accumulate the whole file. The classic "holds the whole file" #39808 does **not** happen
+   in V2 even in the worst geometry, because the chunker bounds each task and
+   `fragment_readahead=1` bounds the in-flight fragment.
+3. **There is a real but bounded residual.** Bundling groups (`per_group`→`one_chunk`) raises
+   the scanner 110→144 MB — a genuine, chunk-size-dependent growth. This is the "still leaks
+   in some cases" a raised `target_min_block_size` / a single fat row group hits. `iter` and
+   arrow-rs are flat across both modes (bounded by design).
+
+![arrow#39808 geometry: 30 groups, one_chunk vs per_group, all 3 readers](agents_assets/leak_multigrp__uss.png)
+
+### 5.12 Sweeping the PyArrow reader's own settings (the "just tune PyArrow" question)
+
+`leak_multigrp` showed a 144 MB scanner floor; `reader_settings` (`bench_suite.py`) asks
+whether *any* reader knob lowers it, sweeping one setting per run in the same `one_chunk`
+geometry. New env knobs added for this (all read per-call, so live per session):
+`RAY_DATA_PARQUET_PRE_BUFFER` (both scanner and iter paths),
+`RAY_DATA_PARQUET_ITER_USE_THREADS`, `RAY_DATA_PARQUET_FRAGMENT_READAHEAD`;
+`batch_readahead` and `buffer_size` were already env-wired.
+
+| reader | knob swept | `max_task` (decoding worker's USS growth) |
+|---|---|---|
+| pyarrow (scanner) | `batch_readahead` 1 / 2 / 8 / 32 | **144 / 144 / 144 / 144 MB — flat** |
+| | `buffer_size` 1 / 8 / 64 MiB | **144 MB — flat** |
+| | `pre_buffer` on / off | 144 / 142 MB — flat |
+| pyarrow_iter | `pre_buffer` on / off | 85 MB — flat |
+| | `use_threads` off / on | 85 MB — flat |
+| arrow-rs | `decode_budget` 2 / 8 / 32 MiB | **26 / 39 / 431 MB — moves** |
+
+**The finding: PyArrow exposes no knob that lowers its decode floor.** The scanner is a
+rigid ~144 MB and nothing — `batch_readahead` across 32×, `buffer_size` across 64×,
+`pre_buffer` — moves it. (Verified the knobs genuinely reach the workers: a fresh-process
+import reads `_ARROW_SCANNER_BATCH_READAHEAD` = the env value, and the arrow-rs budget
+clearly moved memory in the same harness, proving per-config env is live — the flatness is
+real, not a plumbing bug.) The reason is the same as §3.2: the scanner decodes whole row
+groups with PyArrow's internal concurrency; batch/buffer/pre_buffer knobs don't bound that.
+`iter_batches` is likewise a fixed ~85 MB floor (≈ one row group). **arrow-rs is the only
+reader with a working memory knob** — its byte budget sets the working set directly (26 MB
+at a 2 MiB budget, far under the scanner's 144 MB). So the answer to "can we just tune
+PyArrow to match arrow-rs's memory?" is a measured **no**.
+
+Two honest caveats: (a) **`pre_buffer` is not a local memory lever at all** — it is an S3
+I/O-coalescing knob (it coalesces compressed byte ranges); on local reads it moves nothing
+(144 vs 142 MB). This corrects a natural but wrong intuition that turning `pre_buffer` off
+is the memory fix. (b) **arrow-rs `budget=32 MiB` → 431 MB is a non-linear cliff** (vs 39 MB
+at 8 MiB) — directionally "bigger budget = more memory," but the jump is larger than the
+budget change and is an open anomaly (likely the byte-budget batcher producing an oversized
+batch over a 30-group chunk, or a `fetch_window`/K interaction); not a number to quote as
+clean. As always on macOS the *ordering and flatness* are robust; absolute magnitudes want a
+Linux/USS run to be authoritative.
+
+![reader-setting sweep — scanner flat, arrow-rs budget the only lever](agents_assets/reader_settings__max_task.png)
+
 ---
 
 ## 6. Optimizations and fixes, by phase
@@ -1178,17 +1364,25 @@ fragment skips the crate call entirely. Tests assert the crate receives exactly 
 surviving row-group ids (`row_groups=[3]` on a sorted 4-group file) and end-to-end
 parity through the planner rule.
 
-**6.8 Struct/list ungated after parity validation.** The gate's blanket `is_nested`
-rejection is replaced by a recursive type check (`_arrow_rs_type_supported`): flat
-types plus struct / list / large_list / fixed_size_list nesting to any depth are
-native; dictionary, extension (both tensor flavors), map, and union stay on the
-fallback **anywhere in the type tree** (a top-level-only check would let a tensor
-inside a struct slip through to the crate). The crate needed no changes —
-`ProjectionMask::roots` already projects whole root columns, and the FFI C-stream
-carries nested children. Parity tests: list, struct, and struct-of-list/struct
-byte-identical locally and struct over S3; map still falls back correctly. The mixed
-benchmark fixture becomes `mixed7_tensor` (6 native files + ray_tensor as the fallback
-member) so it keeps proving heterogeneous routing.
+**6.8 Column-type gate completed — every Parquet-representable type is native.** The
+blanket `is_nested` rejection was first replaced (2026-07-21) by a recursive
+`_arrow_rs_type_supported` admitting flat + struct/list nesting; then extended (2026-07-24)
+to **dictionary, map, and all extension types** — Ray `ArrowTensorTypeV2`,
+`ArrowVariableShapedTensorType`, pyarrow canonical `fixed_shape_tensor`, and even
+*unregistered* custom extensions. The crate needed **no changes**: `ProjectionMask::roots`
+projects whole root columns, and the FFI C-stream carries the embedded arrow-schema field
+metadata (`ARROW:extension:name`/`:metadata`), so pyarrow reconstructs a registered
+extension identically and surfaces an unknown one as storage-type + metadata — exactly its
+own read behavior. Verified byte-identical via direct crate-vs-PyArrow probes (map incl.
+null/empty entries; multi-row-group per-group dictionaries + nulls, the index-divergence
+trap; tensors with projection; a 4-level `list<struct<map<string,list<int>>>>`) plus
+end-to-end parity tests. The earlier blanket `extension_name` rejection (once logged as a
+"gate bug fix") was over-conservative — the crate simply didn't pass embedded schema through
+at that time. **What remains rejected cannot occur in Parquet:** union, list_view,
+run_end_encoded, and interval have no Parquet encoding (PyArrow's writer throws), so the
+`is_nested` fail-safe is *unreachable* rather than a limitation. Net: column type is no
+longer a routing axis to PyArrow. The mixed benchmark fixture (`mixed7_tensor`, 6 native +
+a tensor member) predates this and now routes fully native.
 
 **6.9 Dependency minimization.** The optional `mimalloc`/`jemalloc` allocator features
 and the unused `anyhow` dependency were removed from the crate (the allocator-retention
@@ -1196,6 +1390,27 @@ theory they existed for was disproven — §3.5.1/§7.8 — and mimalloc segfaul
 cdylib global allocator anyway). The tree is now: `parquet`, `arrow` (ffi only),
 `object_store` (aws), `pyo3`, `tokio`, `futures`. Allocator A/B stays possible via
 `LD_PRELOAD`, which needs no crate support.
+
+**6.10 int96 timestamps on the native path (+ a latent correctness bug fixed).** parquet-rs
+defaults int96 → `timestamp[ns]` (matching PyArrow's default), so a Spark/Hive/Impala int96
+file — no embedded Arrow hint — now decodes natively byte-identically. A *pyarrow-written*
+int96 file, however, embeds a `timestamp[us]` Arrow hint that parquet-rs **honors** (→us)
+but PyArrow **ignores** (always ns); with no user `schema=` the per-file type check was being
+skipped, so such a file went native and silently produced `us` ≠ PyArrow's `ns`. Fixed by
+exposing `int96_columns` from the crate footer and gating both entry points: the plan-time
+gate (`_columns_supported`) admits an int96 column only when the crate lands on ns/no-tz; the
+conservative pyarrow-fragment re-gate falls back any int96-physical read column (it can't see
+the crate's output). Verified: no-hint → native/ns, us-hint → fallback/ns, both parity.
+
+**6.11 Listing-stage footer read migrated to the crate (PyArrow-free end to end).** With the
+flag on and a Local/S3 filesystem, `ParquetFileChunker` reads row-group sizes via the crate's
+`read_metadata` (shared `native_metadata.py`) instead of `pq.read_metadata`, so a supported
+file's footer is never touched by PyArrow either. The crate now exposes
+`row_group_compressed_sizes` (= `rg.compressed_size()`), which equals PyArrow's
+`sum(col.total_compressed_size)` **exactly**, so greedy row-group bundling yields byte-for-byte
+identical chunk boundaries flag on/off (verified across target sizes; flag-on makes zero
+`pq.read_metadata` calls). Result: the two footer reads a supported file used to incur
+(PyArrow in the listing task + arrow-rs in the read task) are now both arrow-rs.
 
 ---
 
@@ -1211,9 +1426,13 @@ Ranked by how much they'd change the decision:
    pool. What remains is purely *measurement*: it can't be done locally (moto has no network
    latency or cache pressure; macOS USS is directional), so the memory/speed comparison must
    run on **real S3 on Linux**. Harness ready and it **sweeps the memory knobs**
-   (`fetch_window_mb` ∈ {4,16,64,0}, `MALLOC_ARENA_MAX` on/off) vs PyArrow: `bench_suite.py
-   s3` — now judged on the metric of record (per-task USS vs E, §3.5.1) like every other
-   axis. This is the single most important remaining item and the natural next PR.
+   (`fetch_window_mb` ∈ {4,16,64,0}, `prefetch_windows` ∈ {1,2,4}, `MALLOC_ARENA_MAX`
+   on/off) vs PyArrow: `bench_suite.py s3` — now judged on the metric of record (per-task
+   USS vs E, §3.5.1) like every other axis. The `prefetch_windows` sweep is the open
+   question the intra-unit pipeline (§5.8/§5.9) raises: does the default depth 2 already
+   reach PyArrow's throughput on a lone big row group, or does that geometry want deeper
+   look-ahead (at +1 window of compressed RAM per level)? This is the single most
+   important remaining item and the natural next PR.
 
 2. **The single-thread wide-string decode gap (§5.7).** Isolated from Ray, at the
    1-thread count a Ray worker gets, arrow-rs decode is parity on moderate strings and
@@ -1502,9 +1721,290 @@ cheaply read a sub-row-group page range (`iter_batches` materializes the whole g
 would fight a page-index chunker — which is the strongest strategic argument for the arrow-rs
 reader as the engine underneath that planned change.
 
+### 7.10 Full migration: making arrow-rs the default reader (scope + plan)
+
+The gate today is an **allowlist** — arrow-rs runs only for a narrow supported set, PyArrow
+is the default. The goal recorded here is to **invert that**: arrow-rs becomes the default,
+PyArrow shrinks to a *denylist fallback* for cases we choose not to port. Motivation: the
+memory win holds across the whole gated subset at speed parity (§5.10), so there is no reason
+to keep it niche.
+
+**Scoping conclusion: nothing here is fundamentally impossible.** Every current gate exclusion
+is "not ported yet," not "arrow-rs can't." Two things that looked like hard walls are not:
+
+- **Extension / user-defined types** (Ray's `ArrowTensorType`, `ArrowVariableShapedTensorType`,
+  `ArrowPythonObjectType`, and *any* user-registered `pa.ExtensionType`). An extension type is
+  a storage type + field metadata (`ARROW:extension:name` + params). Parquet stores the storage
+  type; the Arrow C Data Interface carries field metadata across FFI; pyarrow auto-reconstructs
+  a *registered* extension on import. So: decode the storage array in Rust, preserve field
+  metadata, let pyarrow rebuild the extension in the worker. Generalizes to all UDTs — no
+  per-type special-casing. Effort: mostly metadata plumbing (verify metadata survives our
+  C-stream).
+- **Arbitrary Python / fsspec / HDFS filesystems.** Not a wall: because the crate is a pyo3
+  extension, Rust can hold the Python filesystem object and implement `object_store::ObjectStore`
+  by calling back into it (open / read-range) via pyo3 inside `spawn_blocking`. This **keeps the
+  memory win** (streaming decode is independent of how bytes arrive) but **loses async fetch
+  concurrency** (GIL-bound, serialized range GETs → slower on high-latency opaque stores).
+  Trade-off vs PyArrow fallback: bridge = memory win + slower fetch; fallback = native fetch +
+  no memory win. For the memory bar the bridge is strictly better. HDFS/fsspec reach us through
+  their Python fs via the same bridge.
+
+Capability classification (✅ done · 🔧 port, effort · ❓ niche/uncertain · ⭐ arrow-rs *better*):
+
+| Area | Item | Verdict |
+|---|---|---|
+| filesystem | local, S3 | ✅ |
+| | HTTP(S) | 🔧 easy (`object_store` HTTP) |
+| | GCS | 🔧 med (config recovery like `_s3_config`) |
+| | Azure/ABFS | 🔧 med (`object_store` Azure) |
+| | HDFS / fsspec / opaque Python fs | 🔧 via pyo3 fs-bridge (memory-yes, async-no) |
+| types | flat; struct/list/large_list/fixed_size_list | ✅ (§6.8) |
+| | dictionary; map; extension (tensor / variable / canonical / unregistered) | ✅ (§6.8 — metadata round-trips through FFI, byte-identical) |
+| | union / list_view / run_end_encoded / interval | ✅ n/a — **no Parquet encoding**, unreachable (§6.8) |
+| | int96 (default ns) | ✅ (§6.10) |
+| | int96 *coerce* to a non-default unit | 🔧 easy (per-column `with_schema` unit override) |
+| | dotted nested projection (`a.b`) | 🔧 med (`ProjectionMask` leaf) |
+| | forced `dictionary_columns` read output | ❓ niche — crate has no read-time dict-coerce knob |
+| pipeline | empty projection / `count()` | 🔧 easy + ⭐ (metadata-only, no decode) |
+| | schema evolution null-fill | 🔧 med — **the correctness centerpiece** |
+| | per-fragment → unified cast | 🔧 med (Arrow compute cast) |
+| | row-group pruning by stats | 🔧 med (Rust, or Python from footer stats) |
+| | in-decode row filtering | 🔧 large (§7.9, `RowFilter`) |
+| | limit pushdown | ✅ (post-decode slice) |
+| | ARROW-5030 (nested rg > 2 GB) | ⭐ arrow-rs avoids it (64-bit offsets) |
+| | pickle object columns | 🔧 easy (decode binary, keep Python check) |
+| | partition / path / row_hash | ✅ unchanged (Python path-string work) |
+
+**Two non-negotiable caveats to accept before flipping the default:**
+1. **Wide-string decode gap (§5.7 / open-hole #2).** Broadening to all files means the
+   single-thread ~1.5× wide-string decode deficit now applies to workloads PyArrow handles fine
+   today. Recovered end-to-end by concurrency/materialization, but a pure decode-bound wide-string
+   scan is measurably slower. Accept, or budget the Rust kernel work.
+2. **Rust build/CI ownership.** Ray Data would own a cross-platform Rust build (Linux x86/arm,
+   mac wheels) in CI — a standing maintenance cost independent of any feature.
+
+**Plan — five tracks.** Discipline for *every* item: per-column hash parity vs PyArrow, routing
+confirmed via `RAY_DATA_ARROW_RS_PATH_TRACE`, PyArrow fallback stays until that item is
+parity-proven.
+
+- **Track 1 — arrow-rs self-sufficient (foundation; do first).** Add a `read_metadata()` FFI
+  (open once via `object_store`, return Arrow schema + per-row-group `(num_rows, byte_size,
+  per-column min/max/null_count)`). Rewire the worker `read()` so PyArrow stops opening supported
+  files (schema/names from `read_metadata`; drop the PyArrow batch-size estimate — the byte budget
+  is the real lever; chunker emits `(path, [row_group_ids])`). Move row-group pruning off PyArrow
+  (Python-from-stats first). *Delivers: single footer read, PyArrow out of the hot path for the
+  current supported set.* Everything else builds on Rust owning metadata.
+- **Track 2 — broaden the type gate** (independent, parity-tested, by value ÷ effort):
+  (1) `count()`/empty projection; (2) int96 coerce; (3) schema evolution null-fill + per-fragment
+  cast — start strict (identical schemas native, evolution → fallback), then add null-fill;
+  (4) dotted nested projection; (5) extension/UDTs via storage decode + metadata round-trip;
+  (6) dictionary-output/map/union/list_view — niche, last or never.
+- **Track 3 — broaden the filesystem gate:** (1) HTTP; (2) GCS; (3) Azure/ABFS; (4) the pyo3
+  fs-bridge for HDFS/fsspec/opaque Python fs (memory-yes/async-no; the permanent long tail).
+- **Track 4 — push filtering into decode (§7.9), optional.** `RowFilter` + page-index skipping.
+  A CPU/IO win, not needed for the memory bar; sequence last or only if filter-heavy workloads
+  justify the `Expr` → arrow-rs translation layer.
+- **Track 5 — flip the default + shrink the fallback.** Invert `_arrow_rs_supported` to a
+  denylist, promote arrow-rs to default (keep the flag one release), delete dead PyArrow
+  metadata/scanner wiring on the main path.
+
+**First three PRs:** (1) Track 1 (metadata FFI + rewire) — after the S3 measurement lands;
+(2) Track 2.1 + 2.2 + Track 3.1 (count, int96, HTTP — cheap, all shrink the fallback);
+(3) Track 2.3 (schema evolution) — the hard correctness one, on its own for full review attention.
+
+#### 7.10.1 Status — metadata FFI + native pruning + PyArrow-free `read()` + chunker footer + full type gate + int96 done (flag-gated); default-flip, RowFilter, GCS/Azure deferred
+
+**Landed since the rewrite (2026-07-24), all still flag-gated, nothing committed:** the
+**listing-stage footer read** migrated to the crate (§6.11, PyArrow-free end to end); the
+**column-type gate completed** (§6.8 — dictionary/map/all extensions native; only
+non-Parquet-representable types rejected, and that fail-safe is unreachable); **int96**
+brought native with a latent-bug fix (§6.10). What that leaves genuinely open: the
+**default flip** (needs the crate shipped in the wheel + a field-validation pass),
+in-decode **`RowFilter`** (§7 — we prune row groups but still decode surviving rows before
+`table.filter` drops them), and **filesystem breadth (GCS/Azure)** — the last real routing
+axis, gated only because `object_store` is compiled `aws`-only, so it needs new crate
+connectors + config bridging in both the listing and reader gates, not because storage
+location matters to the data. The remaining non-filesystem fallbacks (schema-evolution
+cast/null-fill, empty/dotted projection) are small Python-side reconciliation steps (§1).
+
+Two reorderings vs the list above, both forced by the pruning analysis:
+
+- **`read_metadata` FFI landed** (Track 1's keystone). `read_metadata(path)` /
+  `read_metadata_s3(...)` open the footer once and return the Arrow schema (via the C-schema
+  PyCapsule, so extension/field metadata round-trips for the UDT track) + per-row-group
+  `(num_rows, byte_size)`. Verified byte-identical to PyArrow on local + moto-S3.
+- **Track 4 (part 1) pulled *before* the `read()` rewrite.** Removing PyArrow from `read()` means
+  giving up `fragment.subset(filter=)` pruning. The memory win is *already* banked in the decode
+  (footer reads are a fixed cost, not the scaling term), so the metadata rewrite alone buys ~zero
+  memory and, done as originally scoped ("Python-from-stats"), risks a hand-rolled stats evaluator
+  that could *silently drop rows* if a null/interval case is wrong. So pruning was moved into the
+  crate first, where it's sound and testable, and the rewrite rides on it.
+
+**Track 4 part 1 — native statistics row-group pruning (done):**
+- `predicate.rs`: a small JSON predicate IR (`cmp`/`and`/`or`/`not`/`is_null`/`is_not_null`/`in`/
+  `unknown`) + `can_match(pred, ColStats)`. **Soundness contract:** conservative — a row group is
+  dropped only when the predicate is provably false for *every* row; every uncertainty (missing
+  column, absent stats, cross-type/NaN compare, `NOT`, unmodeled op, malformed IR) resolves to
+  *keep*. Over-pruning (the only data-loss path) is impossible by construction; 19 Rust unit tests
+  pin the boundaries.
+- `lib.rs`: `stat_min_max` maps parquet `Statistics` → IR `Value` (int/float/utf8/bool; Int96 &
+  FixedLenByteArray → unknown → keep); `prune_row_groups`/`apply_predicate` thread an optional
+  `predicate_json` into `read_row_groups` / `read_row_groups_s3` (pruned groups are never
+  fetched/decoded — no S3 GET). New introspection fn `select_row_groups(path, predicate_json)`
+  returns the surviving ids without decoding (tests + the future rewrite use it).
+- Python: `_predicate_to_ir` lowers the *Ray `Expr`* (not the PyArrow expr — the Ray AST is
+  directly introspectable) to the IR. **Total** — unrepresentable subtrees become `unknown`, so
+  `a>5 AND udf(b)` still prunes on `a>5`. Op flips when the column is on the right (`5 < col` →
+  `col > 5`). `_predicate_json` returns None when nothing is prunable (skip the arg).
+- Cargo: `serde`/`serde_json` added; `extension-module` behind a default feature so
+  `cargo test --no-default-features` runs the pure-Rust unit tests by linking libpython.
+
+**Track 4 part 1 — now wired live + the `read()` rewrite (done):**
+- **Native pruning is load-bearing.** `_iter_fragment_tables` no longer calls PyArrow
+  `fragment.subset`; the lowered `predicate_json` is passed straight to the crate, which prunes
+  row groups from footer statistics before fetch/decode. Python `table.filter()` remains the
+  post-decode *final authority*, so the composition is sound: native pruning can only avoid
+  IO/decode, never change which rows surface.
+- **`read()` is PyArrow-free for supported files.** The override footer-reads every unique path
+  via `read_metadata` (any footer failure → whole-split PyArrow fallback), splits columns off the
+  union of on-disk names, decides native-vs-PyArrow *per file* via `_columns_supported(schema,
+  read_columns)`, and builds PyArrow `ParquetFileFragment`s **only** for fallback paths. Supported
+  files are read entirely through the crate — PyArrow never opens them (proven by
+  `test_native_read_is_pyarrow_free`, which spies `pyarrow.dataset.dataset` and asserts zero calls
+  while the crate's `read_metadata`/`read_row_groups` do run). The native work unit is
+  `_NativeParquetFragment{path, row_groups|None}`; `_native_fragments_for_file` mirrors the base
+  chunker's granularity (whole-file → one fragment at offset 0; chunked → one fragment *per row
+  group*, seeded with its cumulative pre-filter offset) so synthesized `row_hash` is byte-identical
+  (pinned by `test_native_chunked_read_row_hash_parity`).
+- The format-agnostic finishing (limit / partition / `path` / `row_hash` / projection) is shared
+  with the base reader via extracted `FileReader._split_columns` / `_postprocess` /
+  `_dispatch_fragment_reads` (behavior-preserving for the CSV/JSON/PyArrow readers).
+- **`count` / empty-projection resolved (not a gap).** `ds.count()` is answered entirely from
+  listing metadata — it never invokes the reader (verified: `reader.read` call count 0), so it is
+  correct under the flag by construction and there is nothing to decode natively (a count scan reads
+  no data columns → no working set to shrink → zero memory to win). A *genuinely* column-less read
+  (empty projection) is deliberately fallen back to PyArrow's stub-column path (one `__bsp_stub`
+  column, right row count). Pinned by `test_count_is_metadata_only_under_arrow_rs` and
+  `test_empty_projection_falls_back_to_pyarrow_stub`.
+- **Transient-error retry parity proven.** Native `_NativeParquetFragment`s flow through the same
+  `iterate_with_retry` wrapper as PyArrow fragments (`_read_fragments_sequential`), so a retryable
+  I/O failure mid-read is re-attempted and recovered identically. Pinned by
+  `test_native_fragment_read_retries_transient_error` (injects a one-shot default-retryable error
+  into the crate's `read_row_groups`, asserts byte-correct data + re-invocation).
+- Verified: **19 Rust unit tests + Python (arrow-rs 45 local + 13 moto-S3 skipped; v2 unit +
+  parquet_v2 78; `test_parquet.py` non-S3 256) green**, ruff/black clean. (Remaining clippy
+  warnings are pre-existing pyo3-macro artifacts.)
+
+**One remaining PyArrow touch-point for supported files (documented non-goal):** the *listing*
+stage still reads each Parquet footer via PyArrow — `ParquetFileChunker.generate_chunk_metadatas`
+calls `pyarrow.parquet.read_metadata` to compute row-group chunk boundaries — so a supported file's
+footer is read twice (once by the chunker at listing, once by the reader's `read_metadata` at read).
+The *decode* is PyArrow-free (where all the memory lives); the residual is one footer-only read.
+Unifying it on the crate would remove the last PyArrow file access but touches shared listing
+infrastructure that also serves the PyArrow reader — disproportionate blast radius for a footer read
+that costs no memory. Left as-is on purpose.
+
+**Remaining for the full migration (deferred, with rationale):**
+- *Track 4 part 2 — in-decode `RowFilter`* (skip-decode of non-matching rows via arrow compute +
+  `RowSelection`). **Deferred:** the worthwhile version is a *speed/IO* win, but the filter-case
+  *memory* win already exists without it (byte-budget streaming + per-batch Python filter, §5.10),
+  and the project frame is memory-first / speed-parity-is-enough — so it chases speed we don't need
+  while carrying an unrecoverable over-drop risk. Belongs at the query-planner level as a pushdown
+  hint (§7.9), not hand-rolled in the reader.
+- *Flip the default* (`use_arrow_rs_parquet_reader` → True). **Deferred:** would raise in every
+  environment without the compiled crate (not shipped in the wheel). The default flip is a
+  follow-up PR after field validation + packaging — exactly as `use_datasource_v2` itself still
+  defaults False. The coherent PR here is "introduce the flag-gated arrow-rs reader that fully
+  replaces the PyArrow read path for supported files," default off.
+- *Track 2 — broaden the type gate.* **Deferred:** each new type (dictionary, extension/tensor,
+  map, int96, nested-column projection) needs its own per-column-hash parity proof.
+
+**Filesystems beyond local + S3 — analysis (deferred, not blocked).** The gate allows only
+`LocalFileSystem` / `S3FileSystem` today; everything else falls back to PyArrow (correct, just no
+memory win). Whether to add more:
+
+| Backend | Native feasible? | What it takes | Verdict |
+|---|---|---|---|
+| **GCS** (`GcsFileSystem`) | Yes | `object_store` feature `gcp` (already vendored in 0.13) + a `_gcs_config` bridge (config *is* recoverable via `__reduce__`: `access_token`/`anonymous`/`endpoint_override`/`project_id`/…) | **Defer** — token risk |
+| **Azure** (`AzureFileSystem`) | Yes | `object_store` feature `azure` + an `_azure_config` bridge | **Defer** — token risk |
+| **HDFS** (`HadoopFileSystem`) | No | `object_store` has no HDFS backend | Never native — fall back |
+| **HTTP / fsspec-wrapped** (`PyFileSystem`) | No / low-value | fsspec is arbitrary Python — can't bridge to `object_store` | Fall back |
+
+Recommendation: **stay local + S3 for now.** `object_store` 0.13 already ships `aws`/`azure`/`gcp`
+backends (we enable only `aws`), and adding GCS/Azure is a one-line Cargo feature + one
+`_s3_config`-style bridge each — so it is *cheap to add later, per backend*. The blocker is the same
+one that deferred the whole fs-broadening: **credential bridging + real cloud validation.** S3's
+static keys round-trip cleanly through `__reduce__`; GCS/Azure use short-lived tokens / ambient ADC
+that `__reduce__` often does *not* carry, so a naive bridge would connect with the wrong (or no)
+credentials — and unlike a type-gate miss, that fails the read rather than falling back. Since S3 is
+the dominant object store for the OOM cases this project targets, local + S3 covers the vast
+majority; GCS/Azure are a clean follow-up once we can test against real buckets.
+
 ---
 
-## 8. How to build / run
+## 8. Tunable environment variables (complete reference)
+
+Every knob that affects the arrow-rs reader, in one place. Most are read **once at worker
+import** (module-level `env_integer`/`env_bool`), so they must be set in the driver/worker
+environment *before* Ray starts the workers — changing `os.environ` after import has no
+effect. (The three per-call PyArrow-path knobs at the end of §8 are the exception — noted
+there.) Defaults are the ones committed today; every default was chosen memory-first
+(§5.4, §5.8, §5.10).
+
+**Activation (both required for the arrow-rs path to run at all):**
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `RAY_DATA_USE_DATASOURCE_V2` | `0` (False) | Routes `read_parquet` through the V2 datasource. The arrow-rs reader lives *only* under V2; with this off, the flag below is inert. |
+| `RAY_DATA_USE_ARROW_RS_PARQUET_READER` | `0` (False) | The prototype flag. When True *and* V2 is on, `ParquetScanner.create_reader()` returns `ArrowRsParquetFileReader` instead of the PyArrow `ParquetFileReader`. If True but the native module can't import, the reader raises (no silent fallback — that would corrupt benchmark attribution). |
+
+Both map to `DataContext` fields (`use_datasource_v2`, `use_arrow_rs_parquet_reader`,
+`context.py:820-821`); the env vars only set the *defaults* — code can override per-context.
+
+**Arrow-rs reader knobs** (defined in `arrow_rs_parquet_file_reader.py`; passed into the
+crate call per read):
+
+| Env var | Default | Path | Meaning / when to touch |
+|---|---|---|---|
+| `RAY_DATA_ARROW_RS_DECODE_BUDGET_BYTES` | `2 MiB` | local + S3 | Byte budget per decode batch (`rows × bytes_per_row ≈ budget`). Bounds the *decode transient*. Flat above ~1 MB in `iter_batches` (the 128 MB coalesce downstream dominates); visible only in `decode_drop`. A **wall** lever, not a local memory lever (§5.10): 1 MB=1.22×, 2 MB=1.05×, ≥4 MB≈0.91×. Left at 2 MB (lowest safe transient). |
+| `RAY_DATA_ARROW_RS_K` | `1` | local + S3 | Intra-row-group range split: K concurrent byte-budgeted readers over **one** row group. Only engages for a lone row group above the split threshold (the layout Ray's fragment pool can't split) — never multiplies Ray's 4-thread pool. Scales memory up ~linearly (~15–35 MB/level) for negligible local speed gain ⇒ **K=1 default**. Its speed payoff is the S3 lone-big-group case. |
+| `RAY_DATA_ARROW_RS_FETCH_WINDOW_MB` | `16` | **S3 only** | Compressed bytes in flight per stream — **the S3 memory knob**. S3 peak `≈ window + decode_budget`, flat in row-group size, vs PyArrow's whole-row-group pre-buffer. Ablation (§5.10): w4=1.32× slower, w16=speed parity at 0.81–0.89× mem, w64/w0 give the memory back (w0 worse than PyArrow). 16 is the validated knee. |
+| `RAY_DATA_ARROW_RS_PREFETCH_WINDOWS` | `2` | **S3 only** | Intra-unit look-ahead depth: how many fetch windows are fetched+decoded concurrently within one stream, drained in row order (§5.8/§5.9). Overlaps window N+1's GET with window N's decode — the memory-first analog of PyArrow's `pre_buffer`. Depth 2 = the pipeline minimum for steady-state throughput; deeper only smooths S3 tail jitter at **+1 window of compressed RAM per level**. Total in-flight compressed `≈ K × prefetch_windows × fetch_window`. |
+| `RAY_DATA_ARROW_RS_PATH_TRACE` | unset | both | **Benchmark instrumentation only** — inert unless set. When set to a dir, the reader appends `native`/`fallback` per fragment to `path_<pid>.log` so the harness can assert which path the support gate chose. Not a production knob. |
+
+Two arrow-rs limits are **internal constants, not env-exposed** (change requires an edit):
+`_ARROW_RS_MIN_DECODE_BATCH_ROWS = 2048` (floor so a wide-string budget never yields a
+1-row batch) and `_ARROW_RS_DEFAULT_SPLIT_THRESHOLD_BYTES = 128 MiB` (the row-group size
+above which K-split is allowed to engage; passed to the crate as `split_threshold_bytes`).
+
+**Inherited base-reader knobs** (defined in the PyArrow `parquet_file_reader.py` /
+`file_reader.py`; they apply to the arrow-rs path too because it subclasses the base and
+reuses `read()`):
+
+| Env var | Default | Meaning for the arrow-rs path |
+|---|---|---|
+| `RAY_DATA_READ_FILES_NUM_THREADS` | `4` | The `make_async_gen` pool that fans one sub-fragment (= one row group) per thread across files/groups — Ray's parallelism *above* the reader. Gated on `preserve_order=False`. This is why the crate stays K=1 for multi-group layouts (never double-parallelize). |
+| `RAY_DATA_ARROW_SCANNER_BATCH_READAHEAD` | `8` | PyArrow scanner `batch_readahead`. A **PyArrow-path** knob (arrow-rs drives its own streaming). **Measured to not move memory** (§5.12): flat 144 MB across 1→32. It shapes batch look-ahead *within* an already-decoded row group, not the group-level decode. |
+| `RAY_DATA_PARQUET_FRAGMENT_BUFFER_SIZE` | `8 MiB` | PyArrow buffered-stream `buffer_size` — **PyArrow-path** baseline knob; the arrow-rs S3 path uses its own fetch window. Also **measured not to move memory** (§5.12, flat across 1→64 MiB). |
+| `RAY_DATA_PARQUET_PRE_BUFFER` | scanner `True`, iter `False` | PyArrow's `pre_buffer` (both paths honor it; each keeps its prior default when unset). Coalesces a fragment's compressed column-chunk reads into one I/O burst. **An S3 latency knob, not a local memory lever** (§5.12: 144 vs 142 MB local). Bench-and-diagnosis knob. |
+| `RAY_DATA_PARQUET_ITER_USE_THREADS` | `False` | `pq.ParquetFile.iter_batches(use_threads=...)` on the fallback/iter path. `True` decodes columns in parallel (faster, larger transient); default `False` keeps the working set to ~one column chunk. Memory-flat in §5.12. |
+| `RAY_DATA_PARQUET_FRAGMENT_READAHEAD` | `1` | PyArrow scanner `fragment_readahead` — how many fragments scanned ahead. Bites only when a read task spans multiple fragments (per-group chunking); `1` keeps the in-flight set to the current fragment. |
+
+These last three (`PRE_BUFFER`, `ITER_USE_THREADS`, `FRAGMENT_READAHEAD`) are read
+**per-call** inside `_iter_fragment_tables` / `_arrow_scanner_kwargs`, not once at import, so
+they take effect on the next read within a session — unlike the module-level constants
+above. They exist mainly for the §5.12 sweep; production defaults preserve prior behavior.
+
+**Allocator lever (not a Ray var, harness-only):** `MALLOC_ARENA_MAX` (glibc). Demoted
+from "fix" to "available knob" after the many-tiny-groups allocator theory was disproven
+(§5.10, §7.8): `MALLOC_ARENA_MAX=2` was inert on the S3 sweep (2424≈2494 MB). The crate's
+old `mimalloc`/`jemalloc` features were **removed** (§6.9) — a `#[global_allocator]` in the
+cdylib segfaulted Ray workers across the FFI boundary; A/B an allocator with `LD_PRELOAD`,
+no recompile.
+
+---
+
+## 9. How to build / run
 
 ```bash
 # Build the native crate (macOS dev; needed for the flag to work at all):
@@ -1529,9 +2029,11 @@ RAY_DATA_USE_DATASOURCE_V2=1 python \
 ```
 
 Consume modes: `iter_batches` (realistic), `decode_drop` (isolate decode CPU/transient),
-`sum`, `materialize` (retained blocks). Knobs are env-driven at worker import:
+`sum`, `materialize` (retained blocks). Knobs are env-driven at worker import — the full
+list with defaults is **§8**; the ones you'll touch most:
 `RAY_DATA_ARROW_RS_DECODE_BUDGET_BYTES`, `RAY_DATA_ARROW_RS_K`,
-`RAY_DATA_ARROW_RS_FETCH_WINDOW_MB` (S3 in-flight compressed bytes; the S3 memory knob).
+`RAY_DATA_ARROW_RS_FETCH_WINDOW_MB` (S3 in-flight compressed bytes; the S3 memory knob),
+`RAY_DATA_ARROW_RS_PREFETCH_WINDOWS` (S3 intra-unit look-ahead depth).
 
 **Memory-over-time + the expanded suite** live in
 `release/nightly_tests/dataset/arrow_rs_memtrace/`:
@@ -1576,7 +2078,7 @@ assert which path the support gate chose. The knob is inert unless the env var i
 
 ---
 
-## 9. Key files
+## 10. Key files
 
 - `context.py` — the `use_arrow_rs_parquet_reader` flag (3 edits, mirrors `use_datasource_v2`).
 - `_internal/datasource_v2/scanners/parquet_scanner.py` — `create_reader()` branch.
@@ -1597,7 +2099,7 @@ assert which path the support gate chose. The knob is inert unless the env var i
 
 ---
 
-## 10. One-paragraph verdict
+## 11. One-paragraph verdict
 
 Integrated into Ray Data V2 and measured locally, an arrow-rs Parquet reader gives a
 **flat, file-size-independent decode working set** where PyArrow's scales with the row
