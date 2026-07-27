@@ -66,6 +66,11 @@ def _fresh_session(
     extra_env=None,
 ):
     ray.shutdown()
+    # Anyscale workspaces inject RAY_RUNTIME_ENV_HOOK=cgroup_runtime_plugin..., a hook
+    # that ships with the platform's Ray build but NOT the OSS nightly wheel in this
+    # venv — so ray.init() would die importing it. We don't need it for a local bench;
+    # drop it in-process so the suite is self-contained regardless of shell env.
+    os.environ.pop("RAY_RUNTIME_ENV_HOOK", None)
     # Let the allocator levers be flipped for the WHOLE suite from the environment,
     # so an axis that doesn't thread them through (e.g. layout) can still be A/B'd
     # against the uncapped system allocator without a code edit. Explicit args win.
@@ -132,8 +137,18 @@ def _fresh_session(
     # still isolates the workers that actually decoded from the shared cluster's
     # idle ones. On a PLAIN box (no cluster running) start an isolated local cluster
     # with num_cpus pinned, so those axes' knob does take effect there.
-    cluster_running = bool(os.environ.get("RAY_ADDRESS")) or os.path.exists(
-        "/tmp/ray/ray_current_cluster"
+    # Force a PRIVATE local cluster when RAY_ADDRESS=local (or RAY_DATA_BENCH_FORCE_LOCAL
+    # =1). Needed on an Anyscale workspace whose running cluster is a DIFFERENT Ray
+    # version than this venv's nightly: attaching (address="auto") would fail the
+    # version check, so we start our own 3.x cluster with num_cpus pinned. This wins
+    # over the attach path even though the workspace cluster's /tmp marker exists.
+    force_local = (
+        os.environ.get("RAY_DATA_BENCH_FORCE_LOCAL") == "1"
+        or os.environ.get("RAY_ADDRESS") == "local"
+    )
+    cluster_running = not force_local and (
+        bool(os.environ.get("RAY_ADDRESS"))
+        or os.path.exists("/tmp/ray/ray_current_cluster")
     )
     if cluster_running:
         ray.init(
@@ -143,7 +158,11 @@ def _fresh_session(
             runtime_env=runtime_env,
         )
     else:
+        # address="local" forces a NEW instance instead of auto-attaching to a
+        # running cluster on the node; include_dashboard=False dodges the dashboard
+        # agent (it imports modules that assert proto-sync and can die on drift).
         ray.init(
+            address="local",
             num_cpus=num_cpus,
             include_dashboard=False,
             ignore_reinit_error=True,

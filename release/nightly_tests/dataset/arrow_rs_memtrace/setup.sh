@@ -61,18 +61,28 @@ PIP() { uv pip install --python "$PY" "$@"; }
 say "python: $($PY --version)"
 
 # --- 2. Ray nightly + local-source symlink ---
+# CRITICAL: the wheel's compiled protobuf must match the branch's Python source, or
+# `custom_types.py` asserts "out of sync" at import. setup-dev.py symlinks THIS repo's
+# python/ray over the wheel, so we install the per-commit nightly built from the
+# branch's base commit (merge-base with upstream/master), NOT "latest" — latest drifts.
+BASE_SHA="$(git -C "$REPO" merge-base HEAD upstream/master 2>/dev/null \
+            || git -C "$REPO" merge-base HEAD origin/master 2>/dev/null \
+            || echo 7dc67bed3ba2f3504325b206a70adcc470422860)"
 if [ "${SKIP_RAY:-0}" != "1" ]; then
   if [ -z "${RAY_WHEEL_URL:-}" ]; then
     if [ "$OS" = "Linux" ]; then
-      RAY_WHEEL_URL="https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp312-cp312-manylinux2014_x86_64.whl"
+      PYTAG=cp312; PLAT=manylinux2014_x86_64
     elif [ "$ARCH" = "arm64" ]; then
-      RAY_WHEEL_URL="https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp312-cp312-macosx_11_0_arm64.whl"
+      PYTAG=cp312; PLAT=macosx_11_0_arm64
     else
-      RAY_WHEEL_URL="https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-3.0.0.dev0-cp312-cp312-macosx_10_15_x86_64.whl"
+      PYTAG=cp312; PLAT=macosx_10_15_x86_64
     fi
+    RAY_WHEEL_URL="https://s3-us-west-2.amazonaws.com/ray-wheels/master/${BASE_SHA}/ray-3.0.0.dev0-${PYTAG}-${PYTAG}-${PLAT}.whl"
   fi
-  say "installing Ray nightly: $RAY_WHEEL_URL"
-  PIP "ray[data] @ $RAY_WHEEL_URL"
+  say "installing Ray nightly (base commit ${BASE_SHA:0:12}): $RAY_WHEEL_URL"
+  # --force-reinstall so a re-run over a mismatched "latest" wheel actually swaps it
+  # (the version string 3.0.0.dev0 is identical, so pip would otherwise skip it).
+  PIP --force-reinstall "ray[data] @ $RAY_WHEEL_URL"
   # Symlink THIS repo's python/ray over the installed wheel so the local
   # arrow-rs reader source is what actually runs (mirrors the mac dev setup).
   say "symlinking local python/ray via setup-dev.py"
@@ -106,20 +116,23 @@ PIP psutil matplotlib numpy
 
 # --- 6. verify the arrow-rs path actually engages ---
 say "verifying arrow-rs read path end to end"
-"$PY" - <<'PYEOF'
+# Force a private local cluster: on an Anyscale workspace, ray.init() would attach to
+# the running (different-version) cluster and fail the version check. RAY_ADDRESS=local
+# + a cleared platform hook make this self-contained.
+RAY_ADDRESS=local RAY_DATA_USE_DATASOURCE_V2=1 RAY_DATA_USE_ARROW_RS_PARQUET_READER=1 \
+  "$PY" - <<'PYEOF'
 import os, tempfile
+os.environ.pop("RAY_RUNTIME_ENV_HOOK", None)  # Anyscale platform hook not in this venv
 import numpy as np, pyarrow as pa, pyarrow.parquet as pq
 import ray_data_arrow_rs  # noqa: F401  -> import must succeed (crate built)
-
-os.environ["RAY_DATA_USE_DATASOURCE_V2"] = "1"
-os.environ["RAY_DATA_USE_ARROW_RS_PARQUET_READER"] = "1"
 import ray
 
 d = tempfile.mkdtemp()
 p = os.path.join(d, "t.parquet")
 pq.write_table(pa.table({"a": np.arange(1000), "b": np.arange(1000) * 1.5}),
                p, write_page_index=True)
-ray.init(ignore_reinit_error=True, log_to_driver=False)
+ray.init(address="local", include_dashboard=False,
+         ignore_reinit_error=True, log_to_driver=False)
 ds = ray.data.read_parquet(p)
 assert ds.count() == 1000, ds.count()
 assert ds.sum("a") == sum(range(1000))
@@ -128,4 +141,6 @@ ray.shutdown()
 PYEOF
 
 say "DONE. Activate with:  source $RAY_VENV/bin/activate"
-echo "Then run the suite from: $SCRIPT_DIR"
+echo "Then, from $SCRIPT_DIR, run the suite with a private local cluster:"
+echo "  export RAY_ADDRESS=local"
+echo "  python bench_suite.py leak_rgsize && python summarize.py"
