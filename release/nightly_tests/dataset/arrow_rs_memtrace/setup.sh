@@ -93,7 +93,9 @@ PIP maturin
 # --- 4. build the native crate into the venv ---
 if [ "${SKIP_CRATE:-0}" != "1" ]; then
   say "building ray_data_arrow_rs (maturin develop --release) — this compiles arrow/parquet, ~2-5 min"
-  ( cd "$CRATE" && VIRTUAL_ENV="$RAY_VENV" "$RAY_VENV/bin/maturin" develop --release )
+  # maturin refuses if BOTH VIRTUAL_ENV and CONDA_PREFIX are set (common when a
+  # base conda env is active); unset CONDA_PREFIX for this build only.
+  ( cd "$CRATE" && unset CONDA_PREFIX && VIRTUAL_ENV="$RAY_VENV" "$RAY_VENV/bin/maturin" develop --release )
 else
   say "SKIP_CRATE=1 — assuming ray_data_arrow_rs is already built"
 fi
