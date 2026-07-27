@@ -80,9 +80,14 @@ if [ "${SKIP_RAY:-0}" != "1" ]; then
     RAY_WHEEL_URL="https://s3-us-west-2.amazonaws.com/ray-wheels/master/${BASE_SHA}/ray-3.0.0.dev0-${PYTAG}-${PYTAG}-${PLAT}.whl"
   fi
   say "installing Ray nightly (base commit ${BASE_SHA:0:12}): $RAY_WHEEL_URL"
-  # --force-reinstall so a re-run over a mismatched "latest" wheel actually swaps it
-  # (the version string 3.0.0.dev0 is identical, so pip would otherwise skip it).
-  PIP --force-reinstall "ray[data] @ $RAY_WHEEL_URL"
+  # Wipe any prior ray install FIRST. A re-run over a setup-dev'd tree has symlinked
+  # subpackages (ray/workflow -> local source); pip/uv --force-reinstall dies trying
+  # to rmdir a symlink ("Not a directory"). Removing the dir just unlinks those
+  # symlinks (never touches the repo source they point to), so a clean install lands
+  # the commit-matched wheel — and swaps a same-version "latest" wheel too.
+  SITE="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+  rm -rf "$SITE/ray" "$SITE"/ray-*.dist-info "$SITE"/ray_*.dist-info 2>/dev/null || true
+  PIP "ray[data] @ $RAY_WHEEL_URL"
   # Symlink THIS repo's python/ray over the installed wheel so the local
   # arrow-rs reader source is what actually runs (mirrors the mac dev setup).
   say "symlinking local python/ray via setup-dev.py"
