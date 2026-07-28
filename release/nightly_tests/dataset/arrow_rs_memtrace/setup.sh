@@ -127,7 +127,11 @@ say "verifying arrow-rs read path end to end"
 # Force a private local cluster: on an Anyscale workspace, ray.init() would attach to
 # the running (different-version) cluster and fail the version check. RAY_ADDRESS=local
 # + a cleared platform hook make this self-contained.
+# RAY_task_events_report_interval_ms=0: some 2026-07 master nightlies SIGSEGV workers
+# AND the driver in the core task-event aggregator flush
+# (TaskEventBufferImpl::SendRayEventsToAggregator); we don't need task events here.
 RAY_ADDRESS=local RAY_DATA_USE_DATASOURCE_V2=1 RAY_DATA_USE_ARROW_RS_PARQUET_READER=1 \
+  RAY_task_events_report_interval_ms=0 \
   "$PY" - <<'PYEOF'
 import os, tempfile
 os.environ.pop("RAY_RUNTIME_ENV_HOOK", None)  # Anyscale platform hook not in this venv
@@ -156,5 +160,6 @@ say "DONE. Activate with:  source $RAY_VENV/bin/activate"
 echo "Then, from $SCRIPT_DIR, run the suite with a private local cluster:"
 echo "  export RAY_ADDRESS=local"
 echo "  python bench_suite.py leak_rgsize && python summarize.py"
-echo "If workers SIGSEGV in the core task-event aggregator (seen on 2026-07 master),"
-echo "set RAY_task_events_report_interval_ms=0 as a workaround."
+echo "bench_suite.py disables core task-event reporting itself (a 2026-07 master"
+echo "nightly SIGSEGVs in the aggregator flush); for ad-hoc scripts outside the suite,"
+echo "export RAY_task_events_report_interval_ms=0."

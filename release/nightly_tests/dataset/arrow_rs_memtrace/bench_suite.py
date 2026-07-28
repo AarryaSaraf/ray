@@ -79,6 +79,12 @@ def _fresh_session(
     # agent inherit this env) so the suite is self-contained regardless of shell env.
     os.environ.pop("RAY_RUNTIME_ENV_HOOK", None)
     os.environ.pop("RAY_RUNTIME_ENV_PLUGINS", None)
+    # Core task-event aggregator SIGSEGV (TaskEventBufferImpl::SendRayEventsToAggregator
+    # → GrpcClient::CallMethod) crashes workers AND the driver on some 2026-07 master
+    # nightlies (reproduced deterministically on the 2026-07-28 workspace box). The
+    # bench doesn't use task events; disable the periodic flush. setdefault so an
+    # explicit shell override still wins.
+    os.environ.setdefault("RAY_task_events_report_interval_ms", "0")
     # Let the allocator levers be flipped for the WHOLE suite from the environment,
     # so an axis that doesn't thread them through (e.g. layout) can still be A/B'd
     # against the uncapped system allocator without a code edit. Explicit args win.

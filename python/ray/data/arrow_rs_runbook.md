@@ -45,9 +45,13 @@ time) hits three traps; none are arrow-rs-related:
 2. **`aiohttp` must be in the venv** — the `ray[data]` extra omits it, the
    runtime-env agent crashes on import, and the raylet fate-shares with it: the
    symptom is `ray start` hanging indefinitely. `setup.sh` now installs it.
-3. **`RAY_task_events_report_interval_ms=0`** dodged a core task-event-aggregator
-   SIGSEGV on the 2026-07 master commit. Only set it if workers segfault in the
-   event aggregator; it disables task-event reporting.
+3. **`RAY_task_events_report_interval_ms=0`** dodges a core task-event-aggregator
+   SIGSEGV on 2026-07 master nightlies (stack:
+   `TaskEventBufferImpl::SendRayEventsToAggregator` → `GrpcClient::CallMethod`;
+   crashes workers *and* the driver — reproduced deterministically on the
+   2026-07-28 box). `setup.sh`'s verify and `bench_suite.py` now set it
+   themselves (it disables task-event reporting, which the harness doesn't use);
+   export it manually for ad-hoc scripts outside the suite.
 4. **Unset the platform runtime-env extensions** (learned 2026-07-28, a different
    workspace image): the image injects the platform's cgroup module either as a
    driver hook (`RAY_RUNTIME_ENV_HOOK`) or as agent plugins
