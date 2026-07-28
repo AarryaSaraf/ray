@@ -2072,6 +2072,66 @@ def test_flat_column_named_with_dot_native_parity(tmp_path, monkeypatch):
     assert rs.equals(pa_tbl)
 
 
+def test_perf_only_format_kwargs_stay_native(tmp_path, monkeypatch):
+    """I/O-tuning format kwargs (``pre_buffer`` / ``buffer_size`` /
+    ``use_buffered_stream``) cannot change decoded bytes, so the native path
+    ignores them and stays native; the PyArrow reader honors them and must
+    produce identical output."""
+    path = tmp_path / "perf_kwargs.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2, 3], pa.int64()),
+                "s": pa.array(["a", "b", "c"]),
+            }
+        ),
+        str(path),
+        write_page_index=True,
+    )
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path],
+        monkeypatch,
+        parquet_format_kwargs={
+            "pre_buffer": False,
+            "buffer_size": 64 * 1024,
+            "use_buffered_stream": True,
+        },
+    )
+    assert native_decodes >= 1, "perf-only format kwargs must not force fallback"
+    assert rs.sort_by("id").equals(pa_tbl.sort_by("id"))
+
+
+def test_unsupported_format_kwarg_falls_back(tmp_path, monkeypatch):
+    """A format kwarg outside the native allowlist forces a PyArrow fallback
+    (which honors it) instead of being silently ignored. Exercised with
+    ``thrift_string_size_limit`` because it visibly changes behavior: a
+    generous limit reads fine (but must NOT take the native path), and a tiny
+    limit makes PyArrow reject the footer — the fallback keeps that
+    parity-of-error, where a native read would wrongly succeed."""
+    path = tmp_path / "audit_kwargs.parquet"
+    pq.write_table(
+        pa.table({"id": pa.array([1, 2], pa.int64())}), str(path), write_page_index=True
+    )
+
+    # Generous limit: reads succeed and match, but via the PyArrow path.
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path],
+        monkeypatch,
+        parquet_format_kwargs={"thrift_string_size_limit": 1 << 20},
+    )
+    assert native_decodes == 0, "unsupported format kwarg must force fallback"
+    assert rs.equals(pa_tbl)
+
+    # Tiny limit: PyArrow rejects the footer; the arrow-rs reader must raise
+    # identically (parity-of-error), not decode the file natively anyway.
+    with pytest.raises(OSError):
+        _read_both_in_process(
+            [path],
+            monkeypatch,
+            parquet_format_kwargs={"thrift_string_size_limit": 10},
+        )
+
+
 def test_unified_only_column_not_dropped_natively(tmp_path, monkeypatch):
     """A unified-schema column absent from EVERY file in the split must still
     surface (all-null), matching the base reader under a pinned schema — the

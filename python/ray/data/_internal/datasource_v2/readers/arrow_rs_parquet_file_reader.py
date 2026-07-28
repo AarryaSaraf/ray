@@ -73,7 +73,10 @@ Prototype limitations (documented, not hidden)
   forced ``dictionary_columns`` reads are dictionary-cast. An empty projection
   with no predicate (count-style scan) decodes nothing at all — footer row
   counts answer it (:class:`_NativeCountFragment`).
-- Still gated to PyArrow: non-local/S3 filesystems, extension-typed
+- Still gated to PyArrow: non-local/S3 filesystems, Parquet-format kwargs
+  outside the native allowlist (anything not I/O-only and not reproduced by
+  the alignment — e.g. decryption, thrift limits, ``binary_type``; see
+  :meth:`ArrowRsParquetFileReader._blocking_format_kwargs`), extension-typed
   schema drift, and tz-carrying / nested INT96 oddities. There is no per-type
   gate: every type Parquet can encode decodes byte-identically through the
   crate, and Arrow's in-memory-only types (``union``, ``list_view``, …) cannot
@@ -175,6 +178,21 @@ _ARROW_RS_FETCH_WINDOW_MB = env_integer("RAY_DATA_ARROW_RS_FETCH_WINDOW_MB", 16)
 # (no prefetch). Only affects the S3 path (local reads have no fetch latency to
 # hide); reserved for and swept on the Linux/S3 run (Agents.md §7.1).
 _ARROW_RS_PREFETCH_WINDOWS = env_integer("RAY_DATA_ARROW_RS_PREFETCH_WINDOWS", 2)
+
+# Parquet-format kwargs (``pds.ParquetFileFormat``) that tune PyArrow's I/O
+# strategy only — they cannot change decoded bytes, so the native path (which
+# has its own I/O strategy: byte-budgeted streaming + bounded fetch window) may
+# safely ignore them. Every other format kwarg either has a native equivalent
+# planned per file (see ``_FORMAT_KWARGS_ALIGNED``) or forces a PyArrow
+# fallback (see ``ArrowRsParquetFileReader._blocking_format_kwargs``).
+_FORMAT_KWARGS_PERF_ONLY = frozenset(
+    {"pre_buffer", "buffer_size", "use_buffered_stream", "cache_options"}
+)
+# Parquet-format kwargs whose *semantic* effect the planned native read
+# reproduces post-decode via ``_ColumnAlignment`` casts.
+_FORMAT_KWARGS_ALIGNED = frozenset(
+    {"coerce_int96_timestamp_unit", "dictionary_columns"}
+)
 
 
 # There is deliberately NO per-type support gate: every type Parquet can store
@@ -542,12 +560,19 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         if len(input_split) == 0:
             return
 
-        # Reader-wide ineligibility (unsupported filesystem): nothing native to
-        # do — use the base pyarrow read() unchanged. Format kwargs
-        # (``coerce_int96_timestamp_unit`` / ``dictionary_columns``) are *not*
-        # gated here: the planned path realigns for them per file via
-        # :meth:`_plan_column_alignment`.
-        if not self._filesystem_supported():
+        # Reader-wide ineligibility: unsupported filesystem, or a Parquet-format
+        # kwarg outside the native allowlist (anything not perf-only and not
+        # reproduced by the per-file :class:`_ColumnAlignment` — e.g. thrift
+        # limits, decryption, ``binary_type``) — use the base pyarrow read()
+        # unchanged, which honors every format kwarg.
+        blocked = self._blocking_format_kwargs(aligned_ok=True)
+        if not self._filesystem_supported() or blocked:
+            if blocked:
+                logger.debug(
+                    "arrow-rs read falling back to pyarrow: unsupported "
+                    "parquet format kwargs %s",
+                    sorted(blocked),
+                )
             yield from super().read(input_split)
             return
 
@@ -786,10 +811,45 @@ class ArrowRsParquetFileReader(ParquetFileReader):
 
         return isinstance(self._filesystem, (LocalFileSystem, S3FileSystem))
 
+    def _blocking_format_kwargs(self, aligned_ok: bool) -> Dict[str, Any]:
+        """Parquet-format kwargs (the ``dataset_kwargs`` payload spread into
+        ``pds.ParquetFileFormat``) that the native path cannot honor — a
+        non-empty result forces a PyArrow fallback, which honors them all.
+
+        The audit rule is an explicit ALLOWLIST, so a format kwarg added by a
+        future pyarrow version is *unsupported until proven supported* — never
+        silently ignored (e.g. pyarrow 21+'s ``binary_type`` / ``list_type`` /
+        ``arrow_extensions_enabled`` change the decoded schema, and
+        ``thrift_string_size_limit`` changes which files are *rejected*, so
+        ignoring any of them would diverge from the PyArrow paths):
+
+        - :data:`_FORMAT_KWARGS_PERF_ONLY` (``pre_buffer``, ``buffer_size``,
+          ``use_buffered_stream``, ``cache_options``) tune PyArrow's I/O
+          strategy only and cannot change decoded bytes; the crate has its own
+          I/O strategy (byte-budgeted streaming + fetch window), so they are
+          safely ignorable natively.
+        - :data:`_FORMAT_KWARGS_ALIGNED` (``coerce_int96_timestamp_unit``,
+          ``dictionary_columns``) are reproduced by the *planned* path via
+          :class:`_ColumnAlignment` (``aligned_ok=True``); the per-fragment
+          re-gate can't plan an alignment (see
+          :meth:`_reader_level_supported`), so there they block too
+          (``aligned_ok=False``).
+        - A ``None`` value means "pyarrow default" for every format kwarg, so
+          ``None``-valued keys never block.
+        """
+        allowed = _FORMAT_KWARGS_PERF_ONLY | (
+            _FORMAT_KWARGS_ALIGNED if aligned_ok else frozenset()
+        )
+        return {
+            key: value
+            for key, value in self._parquet_format_kwargs.items()
+            if key not in allowed and value is not None
+        }
+
     def _reader_level_supported(self) -> bool:
         """Reader-wide half of the *per-fragment* re-gate (the pyarrow-fragment
         path in :meth:`_iter_fragment_tables`): filesystem + Parquet-format
-        kwargs. The kwarg checks stay here — not in the planned native
+        kwargs. The aligned-kwarg checks stay here — not in the planned native
         ``read()`` — because the per-fragment path has no crate footer metadata
         to plan a :class:`_ColumnAlignment` from (a pyarrow
         ``physical_schema`` already reflects ``coerce_int96_timestamp_unit`` /
@@ -798,9 +858,7 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         :meth:`_plan_column_alignment`."""
         if not self._filesystem_supported():
             return False
-        if self._parquet_format_kwargs.get("coerce_int96_timestamp_unit") is not None:
-            return False
-        if self._parquet_format_kwargs.get("dictionary_columns"):
+        if self._blocking_format_kwargs(aligned_ok=False):
             return False
         return True
 

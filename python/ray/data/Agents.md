@@ -2064,6 +2064,38 @@ and `test_flat_column_named_with_dot_native_parity`.
 **Verified:** arrow-rs suite 61 passed + 13 skipped (moto-S3 env), `test_read_parquet_v2.py` 15
 passed, `test_parquet.py` non-S3 256 passed + 1 skipped, ruff + black clean.
 
+**Phase 4 — format-kwarg audit (2026-07-28, same day).** Audited every kwarg that can reach the
+reader. Constructor kwargs are all handled by shared base machinery; the one opaque surface is
+`parquet_format_kwargs` (the deprecated `dataset_kwargs` payload, spread into
+`pds.ParquetFileFormat`). pyarrow 24 accepts 16 keys there; the native path used to check exactly
+two and silently ignore the rest while the fallback honored them all. Now an explicit **allowlist**
+(`_blocking_format_kwargs`) — a future pyarrow key is *unsupported until proven supported*:
+
+- perf-only, ignorable natively (`pre_buffer`, `buffer_size`, `use_buffered_stream`,
+  `cache_options`): tune PyArrow's I/O strategy, cannot change decoded bytes; the crate has its own
+  I/O strategy.
+- aligned (`coerce_int96_timestamp_unit`, `dictionary_columns`): reproduced per file by
+  `_ColumnAlignment` on the planned path; still block the per-fragment re-gate (no crate footer to
+  plan from).
+- everything else blocks → whole-read PyArrow fallback (with a debug log naming the keys):
+  decryption, thrift limits (change which files are *rejected* — parity-of-error requires the
+  fallback), `page_checksum_verification`, nested option bags (`read_options`,
+  `default_fragment_scan_options`), and pyarrow 21+'s schema-shaping `binary_type` / `list_type` /
+  `arrow_extensions_enabled` (latent silent-divergence bug fixed by the audit — though note
+  `binary_type` is inert on files with an embedded arrow schema, which Ray-written files have).
+
+Pinned by `test_perf_only_format_kwargs_stay_native` (native + parity) and
+`test_unsupported_format_kwarg_falls_back` (generous thrift limit → fallback + equality; tiny
+thrift limit → both paths raise identically). Suites: arrow-rs 63 + 13 skipped, v2 15, ruff+black
+clean.
+
+**Separate base-V2 finding (NOT an arrow-rs divergence, not fixed here):** top-level
+`arrow_parquet_args` on `read_parquet` — the very thing the `dataset_kwargs` deprecation message
+tells users to use — are threaded into `ParquetDatasourceV2.__init__`, stored as
+`self._arrow_parquet_args`, and **never read again**: V2 silently drops them for BOTH readers
+(V1 spreads them into `fragment.to_batches`). Needs its own fix/decision at the V2-datasource
+level (honor them, or reject loudly), independent of this migration.
+
 ---
 
 ## 8. Tunable environment variables (complete reference)
