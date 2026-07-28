@@ -2132,6 +2132,101 @@ def test_unsupported_format_kwarg_falls_back(tmp_path, monkeypatch):
         )
 
 
+def test_arrow_rs_tuning_kwargs_reach_crate(tmp_path, monkeypatch):
+    """``arrow_rs_*`` tuning knobs in ``dataset_kwargs`` must (a) reach the
+    crate's decode call with the requested values, (b) keep the read native,
+    and (c) be ignored by the base PyArrow reader (popped before
+    ``pds.ParquetFileFormat`` sees them) — the mirror image of the native
+    reader ignoring ``pre_buffer``. The base reader reading the same kwargs
+    without a TypeError is assertion (c)."""
+    path = tmp_path / "tuning_kwargs.parquet"
+    table = _flat_table(10_000)
+    pq.write_table(table, str(path), write_page_index=True, row_group_size=10_000)
+
+    # Capture the crate call args underneath the helper's own decode spy.
+    # Local signature (positional): (path, row_groups, columns, batch_size,
+    # decode_budget_bytes, k, split_threshold_bytes, predicate_json).
+    captured = []
+    orig = ray_data_arrow_rs.read_row_groups
+
+    def capture(*a, **k):
+        captured.append(a)
+        return orig(*a, **k)
+
+    monkeypatch.setattr(ray_data_arrow_rs, "read_row_groups", capture)
+
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path],
+        monkeypatch,
+        parquet_format_kwargs={
+            "arrow_rs_decode_budget_bytes": 4 * 1024 * 1024,
+            "arrow_rs_k": 2,
+            "arrow_rs_split_threshold_bytes": 0,  # force the K-split path
+        },
+    )
+    assert native_decodes >= 1, "tuning kwargs must not force fallback"
+    assert rs.sort_by("id").equals(pa_tbl.sort_by("id"))
+    assert captured, "crate decode call was not captured"
+    for args in captured:
+        assert args[4] == 4 * 1024 * 1024  # decode_budget_bytes
+        assert args[5] == 2  # k
+        assert args[6] == 0  # split_threshold_bytes
+
+
+def test_arrow_rs_tuning_kwarg_typo_raises(tmp_path):
+    """A misspelled ``arrow_rs_*`` key must fail loudly at reader construction
+    (both readers share the check in ``ParquetFileReader.__init__``), not
+    surface as a baffling pyarrow TypeError or a silent native fallback."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+    from ray.data._internal.datasource_v2.readers.parquet_file_reader import (
+        ParquetFileReader,
+    )
+
+    for reader_cls in (ArrowRsParquetFileReader, ParquetFileReader):
+        with pytest.raises(ValueError, match="arrow_rs_decode_budget"):
+            reader_cls(
+                filesystem=LocalFileSystem(),
+                parquet_format_kwargs={"arrow_rs_decode_budget": 1},  # typo'd key
+            )
+
+
+@pytest.mark.parametrize("bad_value", [0, "four", True])
+def test_arrow_rs_tuning_kwarg_invalid_value_raises(tmp_path, monkeypatch, bad_value):
+    """An invalid tuning value (wrong type, below minimum, or a bool sneaking
+    in as int) must raise a ValueError naming the knob — a mis-set perf knob
+    silently clamped or ignored would corrupt benchmarks."""
+    path = tmp_path / "bad_tuning.parquet"
+    pq.write_table(
+        pa.table({"id": pa.array([1, 2], pa.int64())}), str(path), write_page_index=True
+    )
+    with pytest.raises(ValueError, match="arrow_rs_k"):
+        _read_both_in_process(
+            [path],
+            monkeypatch,
+            parquet_format_kwargs={"arrow_rs_k": bad_value},
+        )
+
+
+def test_arrow_rs_tuning_kwargs_end_to_end(tmp_path, restore_ctx):
+    """The knobs survive the full ``read_parquet(dataset_kwargs=...)`` plumbing
+    (read_api -> datasource -> scanner -> reader) under BOTH flag settings:
+    natively they tune the crate; on the PyArrow reader they're inert — the
+    same call is valid either way."""
+    path = tmp_path / "tuning_e2e.parquet"
+    table = _flat_table(5_000)
+    pq.write_table(table, str(path), write_page_index=True)
+
+    kwargs = {"dataset_kwargs": {"arrow_rs_decode_budget_bytes": 4 * 1024 * 1024}}
+    pa_tbl = _read_sorted(path, False, restore_ctx, **kwargs)
+    rs_tbl = _read_sorted(path, True, restore_ctx, **kwargs)
+    assert pa_tbl.equals(rs_tbl)
+    assert rs_tbl.num_rows == table.num_rows
+
+
 def test_unified_only_column_not_dropped_natively(tmp_path, monkeypatch):
     """A unified-schema column absent from EVERY file in the split must still
     surface (all-null), matching the base reader under a pinned schema — the

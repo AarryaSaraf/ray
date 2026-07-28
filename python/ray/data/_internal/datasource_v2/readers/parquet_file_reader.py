@@ -44,6 +44,29 @@ _PARQUET_FRAGMENT_BUFFER_SIZE = env_integer(
     "RAY_DATA_PARQUET_FRAGMENT_BUFFER_SIZE", 8 * MiB
 )
 
+# ``dataset_kwargs`` keys that tune the optional arrow-rs native reader
+# (``ArrowRsParquetFileReader``) rather than PyArrow. They ride the same
+# channel as PyArrow's own I/O-tuning kwargs (``pre_buffer``, ``buffer_size``,
+# ...) but must never reach ``pds.ParquetFileFormat``, so ``__init__`` pops
+# them out of ``parquet_format_kwargs`` before PyArrow can see them. The
+# PyArrow reader then ignores them entirely — the exact mirror image of the
+# native reader ignoring PyArrow's I/O-only kwargs — so a read_parquet call
+# carrying these keys stays valid whichever reader the
+# ``use_arrow_rs_parquet_reader`` flag selects. Knob semantics, defaults, and
+# tuning guidance live next to the resolution logic in
+# ``arrow_rs_parquet_file_reader.py`` (which cannot host this set: it imports
+# this module, and the default path must never import it).
+ARROW_RS_TUNING_KWARGS = frozenset(
+    {
+        "arrow_rs_decode_budget_bytes",
+        "arrow_rs_k",
+        "arrow_rs_split_threshold_bytes",
+        "arrow_rs_fetch_window_mb",
+        "arrow_rs_prefetch_windows",
+    }
+)
+_ARROW_RS_KWARG_PREFIX = "arrow_rs_"
+
 
 def _estimate_batch_size_from_metadata(
     fragment: pds.ParquetFileFragment,
@@ -189,7 +212,9 @@ class ParquetFileReader(FileReader):
                 :class:`pyarrow.dataset.ParquetFileFormat` (e.g.
                 ``coerce_int96_timestamp_unit``, ``pre_buffer``,
                 ``dictionary_columns``). Used to forward the deprecated
-                ``dataset_kwargs`` arg on the V2 path.
+                ``dataset_kwargs`` arg on the V2 path. ``arrow_rs_*`` keys
+                (:data:`ARROW_RS_TUNING_KWARGS`) are popped out for the
+                native reader and never reach PyArrow.
         """
         super().__init__(
             format=FileFormat.PARQUET,
@@ -209,7 +234,29 @@ class ParquetFileReader(FileReader):
             AUTOLOAD_PICKLE_OBJECT_SCALAR_ENV_VAR, False
         )
         self._target_block_size = target_block_size
-        self._parquet_format_kwargs: Dict[str, Any] = parquet_format_kwargs or {}
+        self._parquet_format_kwargs: Dict[str, Any] = dict(parquet_format_kwargs or {})
+        # Split out the arrow-rs tuning knobs (see ARROW_RS_TUNING_KWARGS):
+        # they must never be spread into ``pds.ParquetFileFormat``. This base
+        # reader ignores them; ``ArrowRsParquetFileReader`` resolves them in
+        # ``_tuning``. An unrecognized ``arrow_rs_*`` key can only be a typo'd
+        # tuning knob — fail loudly here rather than let PyArrow raise a
+        # baffling ``ParquetFileFormat`` TypeError (or, worse, let the native
+        # gate treat it as an unsupported format kwarg and silently fall back).
+        self._arrow_rs_tuning: Dict[str, Any] = {
+            key: self._parquet_format_kwargs.pop(key)
+            for key in ARROW_RS_TUNING_KWARGS
+            if key in self._parquet_format_kwargs
+        }
+        unknown_arrow_rs_keys = sorted(
+            key
+            for key in self._parquet_format_kwargs
+            if key.startswith(_ARROW_RS_KWARG_PREFIX)
+        )
+        if unknown_arrow_rs_keys:
+            raise ValueError(
+                f"Unknown arrow-rs tuning kwargs {unknown_arrow_rs_keys} in "
+                f"'dataset_kwargs'. Valid keys: {sorted(ARROW_RS_TUNING_KWARGS)}."
+            )
         self._sampled_batch_size: int | object = (
             _UNSET  # pyrefly: ignore[bad-assignment]
         )

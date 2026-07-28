@@ -15,6 +15,10 @@ real (Ray-integrated) benchmark numbers, the optimizations and fixes by phase, a
 most importantly — the open holes we want critiqued. It is self-contained: it assumes
 you know Ray Data and Parquet at a high level but nothing about this work.
 
+**Open work items live in [TODO.md](TODO.md)** (agreed next steps, decisions-needed with
+their blockers, and deferred items with revive-triggers). This doc records what's done
+and why; that file records what isn't.
+
 ---
 
 ## 0. The 60-second version
@@ -2089,6 +2093,25 @@ Pinned by `test_perf_only_format_kwargs_stay_native` (native + parity) and
 thrift limit → both paths raise identically). Suites: arrow-rs 63 + 13 skipped, v2 15, ruff+black
 clean.
 
+**Native tuning knobs via `dataset_kwargs` (2026-07-28, follow-up to the audit).** The audit's
+mirror image: if PyArrow's I/O-tuning kwargs (`pre_buffer`, ...) ride `dataset_kwargs`, the crate's
+knobs should too. All five are now settable per read under an `arrow_rs_` prefix —
+`arrow_rs_decode_budget_bytes`, `arrow_rs_k`, `arrow_rs_split_threshold_bytes`,
+`arrow_rs_fetch_window_mb`, `arrow_rs_prefetch_windows` — with precedence kwarg > `RAY_DATA_ARROW_RS_*`
+env var > default (env vars stay the cluster-wide/benchmark lever). Mechanics: the key set lives in
+`parquet_file_reader.py` (`ARROW_RS_TUNING_KWARGS`) because the base module can't import the arrow-rs
+module; base `__init__` pops the keys before `pds.ParquetFileFormat` can see them (so the PyArrow
+reader ignores them — symmetric with the native reader ignoring `pre_buffer`, and the same
+`read_parquet` call stays valid under either flag setting), and **rejects unknown `arrow_rs_*` keys
+with a ValueError** (a typo'd knob must not become a baffling pyarrow TypeError or a silent native
+fallback via the allowlist). The arrow-rs reader resolves+validates in a cached `_tuning` property
+(non-int / bool / below-minimum → loud ValueError naming the knob); per-knob semantics + tuning
+guidance are commented in the module's "Tuning knobs" section. Pinned by
+`test_arrow_rs_tuning_kwargs_reach_crate` (values arrive in the crate call, read stays native,
+PyArrow reader tolerates the keys), `_typo_raises`, `_invalid_value_raises`, and
+`_end_to_end` (full `read_parquet(dataset_kwargs=...)` plumbing, both flags). Suites: arrow-rs 69 +
+13 skipped, v2 15, ruff+black clean.
+
 **Separate base-V2 finding (NOT an arrow-rs divergence, not fixed here):** top-level
 `arrow_parquet_args` on `read_parquet` — the very thing the `dataset_kwargs` deprecation message
 tells users to use — are threaded into `ParquetDatasourceV2.__init__`, stored as
@@ -2118,7 +2141,12 @@ Both map to `DataContext` fields (`use_datasource_v2`, `use_arrow_rs_parquet_rea
 `context.py:820-821`); the env vars only set the *defaults* — code can override per-context.
 
 **Arrow-rs reader knobs** (defined in `arrow_rs_parquet_file_reader.py`; passed into the
-crate call per read):
+crate call per read). Since 2026-07-28 each is also settable **per read** via
+`dataset_kwargs` under an `arrow_rs_` prefix (e.g.
+`read_parquet(path, dataset_kwargs={"arrow_rs_fetch_window_mb": 64})`), with precedence
+kwarg > env var > default — the kwarg form doesn't have the set-before-worker-start caveat.
+`arrow_rs_split_threshold_bytes` exists only as a kwarg (no env var; defaults to the target
+block size):
 
 | Env var | Default | Path | Meaning / when to touch |
 |---|---|---|---|
@@ -2128,10 +2156,11 @@ crate call per read):
 | `RAY_DATA_ARROW_RS_PREFETCH_WINDOWS` | `2` | **S3 only** | Intra-unit look-ahead depth: how many fetch windows are fetched+decoded concurrently within one stream, drained in row order (§5.8/§5.9). Overlaps window N+1's GET with window N's decode — the memory-first analog of PyArrow's `pre_buffer`. Depth 2 = the pipeline minimum for steady-state throughput; deeper only smooths S3 tail jitter at **+1 window of compressed RAM per level**. Total in-flight compressed `≈ K × prefetch_windows × fetch_window`. |
 | `RAY_DATA_ARROW_RS_PATH_TRACE` | unset | both | **Benchmark instrumentation only** — inert unless set. When set to a dir, the reader appends `native`/`fallback` per fragment to `path_<pid>.log` so the harness can assert which path the support gate chose. Not a production knob. |
 
-Two arrow-rs limits are **internal constants, not env-exposed** (change requires an edit):
+One arrow-rs limit is an **internal constant** (change requires an edit):
 `_ARROW_RS_MIN_DECODE_BATCH_ROWS = 2048` (floor so a wide-string budget never yields a
-1-row batch) and `_ARROW_RS_DEFAULT_SPLIT_THRESHOLD_BYTES = 128 MiB` (the row-group size
-above which K-split is allowed to engage; passed to the crate as `split_threshold_bytes`).
+1-row batch). The K-split engagement threshold (`split_threshold_bytes`, default = target
+block size, else `_ARROW_RS_DEFAULT_SPLIT_THRESHOLD_BYTES = 128 MiB`) is kwarg-settable as
+`arrow_rs_split_threshold_bytes` (no env var).
 
 **Inherited base-reader knobs** (defined in the PyArrow `parquet_file_reader.py` /
 `file_reader.py`; they apply to the arrow-rs path too because it subclasses the base and

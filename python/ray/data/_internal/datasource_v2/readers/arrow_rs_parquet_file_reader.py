@@ -26,11 +26,15 @@ C-stream (consumed zero-copy via ``pa.RecordBatchReader.from_stream``):
   size. ``prefetch_windows`` pipelines consecutive windows (issue window N+1's GET
   while window N decodes) to hide S3 latency without staging the whole row group.
 
+All of the crate's performance knobs (decode budget, K-split, fetch window,
+prefetch depth) are settable per read through ``dataset_kwargs`` under an
+``arrow_rs_`` prefix — see the "Tuning knobs" section below the imports.
+
 Byte-budgeted decode (no reader-side accumulation)
 --------------------------------------------------
 The native reader sizes each decode batch *by bytes, not rows*: it reads each
 row group's uncompressed size / row count from the footer and picks a row count
-so ``rows × bytes_per_row ≈ decode_budget_bytes`` (~8 MiB,
+so ``rows × bytes_per_row ≈ decode_budget_bytes`` (2 MiB default,
 :data:`_ARROW_RS_DECODE_BUDGET_BYTES`). A wide-string group gets few rows/batch,
 a numeric group many — both land near the budget, so the decoded working set is
 flat across schemas (this is *why* arrow-rs memory doesn't scale with the data
@@ -127,6 +131,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Tuning knobs
+# ---------------------------------------------------------------------------
+# Every knob below is settable *per read* via ``dataset_kwargs`` — the same
+# channel PyArrow's own I/O-tuning kwargs (``pre_buffer``, ``buffer_size``,
+# ...) travel — under an ``arrow_rs_`` prefix:
+#
+#     ray.data.read_parquet(
+#         path, dataset_kwargs={"arrow_rs_fetch_window_mb": 64, "arrow_rs_k": 4}
+#     )
+#
+# Precedence: ``dataset_kwargs`` value > ``RAY_DATA_ARROW_RS_*`` env var >
+# built-in default. The env vars remain the cluster-wide lever (benchmark
+# sweeps set them per worker); the kwargs are the per-read override.
+#
+# The PyArrow reader ignores the ``arrow_rs_*`` keys — they're popped out of
+# the format kwargs in ``ParquetFileReader.__init__`` before PyArrow can see
+# them — exactly as this reader ignores PyArrow's I/O-only kwargs
+# (:data:`_FORMAT_KWARGS_PERF_ONLY`). So a call carrying either family of
+# perf knobs stays valid whichever reader ``use_arrow_rs_parquet_reader``
+# selects. Resolution + validation: :meth:`ArrowRsParquetFileReader._tuning`.
+
+# Knob ``arrow_rs_decode_budget_bytes`` — crate arg ``decode_budget_bytes``.
 # Byte budget for a single arrow-rs decode batch. Sizing decode batches by
 # bytes (not a fixed row count) keeps the transient working set flat across
 # schemas: a wide file gets few rows/batch, a narrow file gets many. Kept far
@@ -136,6 +163,9 @@ logger = logging.getLogger(__name__)
 # across its range; the S3 fetch window is the real lever), and 2 MiB is the lowest
 # that holds throughput — so we take the smaller working set. Swept on the Linux/S3
 # run to confirm it holds under real integration (Agents.md §7.1).
+# Tuning: raise toward 8–32 MiB only if per-batch overhead shows up on very
+# wide/stringy schemas; lowering below 2 MiB buys ~no memory (the fetch
+# window / block buffer dominate peak) and costs throughput.
 _ARROW_RS_DECODE_BUDGET_BYTES = env_integer(
     "RAY_DATA_ARROW_RS_DECODE_BUDGET_BYTES", 2 * MiB
 )
@@ -144,6 +174,7 @@ _ARROW_RS_DECODE_BUDGET_BYTES = env_integer(
 # collapse the batch to a handful of rows and starve throughput.
 _ARROW_RS_MIN_DECODE_BATCH_ROWS = 2048
 
+# Knob ``arrow_rs_k`` — crate arg ``k``.
 # Intra-fragment parallelism: when a fragment is a *single* row group larger than
 # the block-size target (the lone-big-fragment case Ray's thread pool can't split),
 # the native reader decodes it in ``K`` parallel row-range workers and merges them
@@ -153,22 +184,38 @@ _ARROW_RS_MIN_DECODE_BATCH_ROWS = 2048
 #
 # Default K=1: locally, K-split costs memory (each range holds its own decode
 # transient) for ~no speed, since there is no network latency to hide (benchmarks:
-# Agents.md §5.1, §6.3). K>1 is opt-in via the env var and is reserved for the S3
-# phase, where concurrent range GETs hide request latency.
+# Agents.md §5.1, §6.3). K>1 is opt-in and is reserved for the S3 phase, where
+# concurrent range GETs hide request latency.
+# Tuning: try 2–8 for big single-row-group files on S3 when read throughput is
+# latency-bound; expect per-task peak memory to scale ~linearly with K (each
+# range worker holds its own fetch window + decode transient). Keep 1 for
+# local reads and many-small-row-group layouts.
 _ARROW_RS_K = env_integer("RAY_DATA_ARROW_RS_K", 1)
 
-# Default single-row-group split threshold when the reader has no target block
-# size (a row group smaller than this is left to the sequential path).
+# Knob ``arrow_rs_split_threshold_bytes`` — crate arg ``split_threshold_bytes``.
+# A lone row group is only K-split when its uncompressed size exceeds this
+# threshold (smaller groups decode sequentially — splitting them buys nothing
+# and costs merge overhead). When the knob is unset the reader uses its
+# ``target_block_size`` (the Ray block-size target), falling back to the
+# default below when it has neither.
+# Tuning: rarely needed — lower it (e.g. to 0) only to force the K-split on
+# for testing, or raise it to keep K-splitting away from mid-size groups.
 _ARROW_RS_DEFAULT_SPLIT_THRESHOLD_BYTES = 128 * MiB
 
+# Knob ``arrow_rs_fetch_window_mb`` — crate arg ``fetch_window_mb``.
 # S3 fetch window (MiB of *compressed* bytes in flight per stream). This is the
 # memory knob for the S3 path: the native reader slices each row group's rows into
 # windows sized so only ~this many compressed bytes are fetched+buffered before
 # decode, so peak RSS is `≈ fetch_window + decode_budget` — flat regardless of
 # row-group size, instead of PyArrow's whole-row-group pre-buffer. 0 = no window
 # cap (fetch the whole range at once). Swept on the Linux/S3 run (Agents.md §7.1).
+# Tuning: this is the primary memory<->throughput trade on S3. Raise (64+) to
+# amortize request latency over fewer, larger GETs when memory is plentiful;
+# lower toward 4 to cap per-task RSS on memory-tight clusters. No effect on
+# local reads.
 _ARROW_RS_FETCH_WINDOW_MB = env_integer("RAY_DATA_ARROW_RS_FETCH_WINDOW_MB", 16)
 
+# Knob ``arrow_rs_prefetch_windows`` — crate arg ``prefetch_windows``.
 # S3 window prefetch depth: how many consecutive fetch windows the native reader
 # keeps in flight per stream. With depth 2 the GET for window N+1 is issued while
 # window N decodes, so S3 first-byte latency is hidden behind decode instead of
@@ -177,6 +224,10 @@ _ARROW_RS_FETCH_WINDOW_MB = env_integer("RAY_DATA_ARROW_RS_FETCH_WINDOW_MB", 16)
 # compressed in flight, not the whole row group). 1 = strictly serial windows
 # (no prefetch). Only affects the S3 path (local reads have no fetch latency to
 # hide); reserved for and swept on the Linux/S3 run (Agents.md §7.1).
+# Tuning: 2 already overlaps fetch with decode; depth >2 only helps when a
+# single window decodes faster than it fetches (very high-latency stores) and
+# multiplies the compressed bytes held in flight. Drop to 1 to minimize
+# memory at the cost of exposing S3 latency between windows.
 _ARROW_RS_PREFETCH_WINDOWS = env_integer("RAY_DATA_ARROW_RS_PREFETCH_WINDOWS", 2)
 
 # Parquet-format kwargs (``pds.ParquetFileFormat``) that tune PyArrow's I/O
@@ -193,6 +244,19 @@ _FORMAT_KWARGS_PERF_ONLY = frozenset(
 _FORMAT_KWARGS_ALIGNED = frozenset(
     {"coerce_int96_timestamp_unit", "dictionary_columns"}
 )
+
+
+class _ArrowRsTuning(NamedTuple):
+    """Resolved values of the tuning knobs above for one reader instance
+    (kwarg > env var > default; see :meth:`ArrowRsParquetFileReader._tuning`).
+    ``split_threshold_bytes=None`` means "derive from ``target_block_size``"
+    at the call site."""
+
+    decode_budget_bytes: int
+    k: int
+    split_threshold_bytes: Optional[int]
+    fetch_window_mb: int
+    prefetch_windows: int
 
 
 # There is deliberately NO per-type support gate: every type Parquet can store
@@ -531,7 +595,7 @@ class ArrowRsParquetFileReader(ParquetFileReader):
             return _ARROW_DEFAULT_BATCH_SIZE
 
         estimated = _estimate_batch_size_from_metadata(
-            first_fragment, self._columns, _ARROW_RS_DECODE_BUDGET_BYTES
+            first_fragment, self._columns, self._tuning.decode_budget_bytes
         )
         if estimated is None:
             return _ARROW_DEFAULT_BATCH_SIZE
@@ -792,6 +856,48 @@ class ArrowRsParquetFileReader(ParquetFileReader):
             )
             file_row_offset += row_group_num_rows[rg]
         return fragments
+
+    @cached_property
+    def _tuning(self) -> _ArrowRsTuning:
+        """Resolve the arrow-rs tuning knobs for this reader.
+
+        Each knob comes from the ``arrow_rs_*`` key in ``dataset_kwargs`` when
+        present (popped into ``self._arrow_rs_tuning`` by
+        ``ParquetFileReader.__init__``), else from its ``RAY_DATA_ARROW_RS_*``
+        env var, else the built-in default — see the "Tuning knobs" section at
+        the top of this module for what each knob does and how to tune it. A
+        ``None`` value means "use the default", consistent with the
+        format-kwarg convention. Invalid values raise loudly (a mis-set perf
+        knob must not silently degrade a benchmark or production read).
+        """
+
+        def resolve(key: str, default: Optional[int], minimum: int) -> Optional[int]:
+            value = self._arrow_rs_tuning.get(key)
+            if value is None:
+                return default
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"'{key}' in 'dataset_kwargs' must be an int, got {value!r}"
+                )
+            if value < minimum:
+                raise ValueError(
+                    f"'{key}' in 'dataset_kwargs' must be >= {minimum}, got {value}"
+                )
+            return value
+
+        return _ArrowRsTuning(
+            decode_budget_bytes=resolve(
+                "arrow_rs_decode_budget_bytes", _ARROW_RS_DECODE_BUDGET_BYTES, 1
+            ),
+            k=resolve("arrow_rs_k", _ARROW_RS_K, 1),
+            split_threshold_bytes=resolve("arrow_rs_split_threshold_bytes", None, 0),
+            fetch_window_mb=resolve(
+                "arrow_rs_fetch_window_mb", _ARROW_RS_FETCH_WINDOW_MB, 0
+            ),
+            prefetch_windows=resolve(
+                "arrow_rs_prefetch_windows", _ARROW_RS_PREFETCH_WINDOWS, 1
+            ),
+        )
 
     @cached_property
     def _pushdown_predicate_json(self) -> Optional[str]:
@@ -1147,11 +1253,14 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         read_columns = self._resolve_read_columns_for(scanner_kwargs)
         predicate_json = self._pushdown_predicate_json
 
-        split_threshold = (
-            self._target_block_size
-            if self._target_block_size is not None
-            else _ARROW_RS_DEFAULT_SPLIT_THRESHOLD_BYTES
-        )
+        tuning = self._tuning
+        split_threshold = tuning.split_threshold_bytes
+        if split_threshold is None:
+            split_threshold = (
+                self._target_block_size
+                if self._target_block_size is not None
+                else _ARROW_RS_DEFAULT_SPLIT_THRESHOLD_BYTES
+            )
 
         fs = self._filesystem
         if isinstance(fs, S3FileSystem):
@@ -1171,11 +1280,11 @@ class ArrowRsParquetFileReader(ParquetFileReader):
                 row_groups=row_groups,
                 columns=read_columns,
                 batch_size=batch_size,
-                decode_budget_bytes=_ARROW_RS_DECODE_BUDGET_BYTES,
-                fetch_window_mb=_ARROW_RS_FETCH_WINDOW_MB,
-                k=_ARROW_RS_K,
+                decode_budget_bytes=tuning.decode_budget_bytes,
+                fetch_window_mb=tuning.fetch_window_mb,
+                k=tuning.k,
                 split_threshold_bytes=split_threshold,
-                prefetch_windows=_ARROW_RS_PREFETCH_WINDOWS,
+                prefetch_windows=tuning.prefetch_windows,
                 predicate_json=predicate_json,
             )
         else:
@@ -1184,8 +1293,8 @@ class ArrowRsParquetFileReader(ParquetFileReader):
                 row_groups,
                 read_columns,
                 batch_size,
-                _ARROW_RS_DECODE_BUDGET_BYTES,
-                _ARROW_RS_K,
+                tuning.decode_budget_bytes,
+                tuning.k,
                 split_threshold,
                 predicate_json,
             )
