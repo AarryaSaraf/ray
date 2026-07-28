@@ -2105,7 +2105,7 @@ def test_unsupported_format_kwarg_falls_back(tmp_path, monkeypatch):
     """A format kwarg outside the native allowlist forces a PyArrow fallback
     (which honors it) instead of being silently ignored. Exercised with
     ``arrow_extensions_enabled`` — a pyarrow 21+ schema-shaping toggle the
-    native path doesn't reproduce (see TODO.md item 5)."""
+    native path doesn't reproduce (see TODO.md "arrow_extensions_enabled")."""
     path = tmp_path / "audit_kwargs.parquet"
     pq.write_table(
         pa.table({"id": pa.array([1, 2], pa.int64())}), str(path), write_page_index=True
@@ -2118,6 +2118,56 @@ def test_unsupported_format_kwarg_falls_back(tmp_path, monkeypatch):
     )
     assert native_decodes == 0, "unsupported format kwarg must force fallback"
     assert rs.equals(pa_tbl)
+
+
+def test_strict_mode_raises_on_fallback_and_passes_native(tmp_path, monkeypatch):
+    """``RAY_DATA_ARROW_RS_STRICT`` turns every decision to serve a read via
+    the PyArrow fallback into a hard error — so a large-scale validation run
+    can *guarantee* it exercised the native path — while leaving natively
+    supported reads untouched."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+
+    path = tmp_path / "strict.parquet"
+    pq.write_table(
+        pa.table({"id": pa.array([1, 2], pa.int64())}), str(path), write_page_index=True
+    )
+    monkeypatch.setenv("RAY_DATA_ARROW_RS_STRICT", "1")
+    manifest = _make_manifest([str(path)], [os.path.getsize(path)], [None])
+
+    # Native-supported read: strict mode is a no-op.
+    table = pa.concat_tables(
+        list(ArrowRsParquetFileReader(filesystem=LocalFileSystem()).read(manifest))
+    )
+    assert table["id"].to_pylist() == [1, 2]
+
+    # Fallback-forcing read (format kwarg outside the allowlist): raises
+    # instead of silently serving PyArrow-decoded bytes.
+    reader = ArrowRsParquetFileReader(
+        filesystem=LocalFileSystem(),
+        parquet_format_kwargs={"arrow_extensions_enabled": True},
+    )
+    with pytest.raises(RuntimeError, match="RAY_DATA_ARROW_RS_STRICT"):
+        list(reader.read(manifest))
+
+    # Per-file gate (no plannable alignment): a file whose read requires an
+    # unsupported read-time coercion also raises under strict mode.
+    reader = ArrowRsParquetFileReader(
+        filesystem=LocalFileSystem(),
+        parquet_format_kwargs={"dictionary_columns": ["id"]},
+        schema=pa.schema([("id", pa.dictionary(pa.int32(), pa.int64()))]),
+    )
+    try:
+        got = list(reader.read(manifest))
+    except RuntimeError as e:
+        assert "RAY_DATA_ARROW_RS_STRICT" in str(e)
+    else:
+        # If the alignment can plan this coercion it stays native — equally
+        # acceptable; the point is "never a silent fallback under strict".
+        assert got
 
 
 def test_thrift_limits_native_parity(tmp_path, monkeypatch):

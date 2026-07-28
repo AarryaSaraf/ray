@@ -320,6 +320,25 @@ def _pyarrow_fragment_int96_roots(fragment: "pds.ParquetFileFragment") -> set:
     return roots
 
 
+def _raise_if_strict_no_fallback(reason: str) -> None:
+    """Correctness-harness guard: when ``RAY_DATA_ARROW_RS_STRICT`` is set (to
+    anything but ``0``/``false``), any decision to serve part of a read through
+    the PyArrow fallback raises instead of proceeding. A large-scale validation
+    run flips this on to *guarantee* every byte it checked came off the native
+    arrow-rs path — a silent fallback would make the run validate PyArrow.
+    Read per call (not at import) so a harness can toggle it within a session.
+    Inert by default: production reads never set the variable.
+    """
+    if os.environ.get("RAY_DATA_ARROW_RS_STRICT", "").lower() in ("", "0", "false"):
+        return
+    raise RuntimeError(
+        "RAY_DATA_ARROW_RS_STRICT is set, but this read requires the PyArrow "
+        f"fallback: {reason}. Strict mode exists for validation harnesses that "
+        "must prove the native arrow-rs path ran; unset the env var to allow "
+        "the fallback."
+    )
+
+
 def _trace_reader_path(supported: bool) -> None:
     """Benchmark instrumentation (inert unless ``RAY_DATA_ARROW_RS_PATH_TRACE``
     names a directory): append ``native``/``fallback`` for each fragment to a
@@ -659,10 +678,17 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         blocked = self._blocking_format_kwargs(aligned_ok=True)
         if not self._filesystem_supported() or blocked:
             if blocked:
+                _raise_if_strict_no_fallback(
+                    f"unsupported parquet format kwargs {sorted(blocked)}"
+                )
                 logger.debug(
                     "arrow-rs read falling back to pyarrow: unsupported "
                     "parquet format kwargs %s",
                     sorted(blocked),
+                )
+            else:
+                _raise_if_strict_no_fallback(
+                    f"unsupported filesystem {type(self._filesystem).__name__}"
                 )
             yield from super().read(input_split)
             return
@@ -672,6 +698,9 @@ class ArrowRsParquetFileReader(ParquetFileReader):
             # A file's footer couldn't be read natively (corrupt / unsupported
             # footer); fall the whole split back to pyarrow rather than reason
             # about a partially-known layout.
+            _raise_if_strict_no_fallback(
+                "a file's footer could not be read via the native crate"
+            )
             yield from super().read(input_split)
             return
 
@@ -821,6 +850,12 @@ class ArrowRsParquetFileReader(ParquetFileReader):
                 alignment_by_path[path] = None if alignment.is_noop else alignment
         native_paths = set(alignment_by_path)
         fallback_paths = [p for p in unique_paths if p not in native_paths]
+        if fallback_paths:
+            _raise_if_strict_no_fallback(
+                "no native column-alignment plan for file(s) "
+                f"{fallback_paths} (unplannable schema drift or unsupported "
+                "read-time coercion)"
+            )
 
         # Build pyarrow fragments for the fallback files only (pyarrow never opens
         # native files). One dataset over the fallback paths; the per-file fan-out
@@ -1296,6 +1331,10 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         supported = self._arrow_rs_supported(fragment, read_columns)
         _trace_reader_path(supported)
         if not supported:
+            _raise_if_strict_no_fallback(
+                f"fragment {fragment.path!r} rejected by the per-fragment "
+                "support gate"
+            )
             yield from super()._iter_fragment_tables(fragment, scanner_kwargs)
             return
 
