@@ -131,6 +131,10 @@ RAY_ADDRESS=local RAY_DATA_USE_DATASOURCE_V2=1 RAY_DATA_USE_ARROW_RS_PARQUET_REA
   "$PY" - <<'PYEOF'
 import os, tempfile
 os.environ.pop("RAY_RUNTIME_ENV_HOOK", None)  # Anyscale platform hook not in this venv
+# Some workspace images inject the platform's cgroup plugin as an agent plugin
+# instead; the runtime-env agent dies importing it and the raylet fate-shares
+# (ray.init hangs forever waiting for the dead cluster):
+os.environ.pop("RAY_RUNTIME_ENV_PLUGINS", None)
 import numpy as np, pyarrow as pa, pyarrow.parquet as pq
 import ray_data_arrow_rs  # noqa: F401  -> import must succeed (crate built)
 import ray

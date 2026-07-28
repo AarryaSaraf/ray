@@ -48,6 +48,16 @@ time) hits three traps; none are arrow-rs-related:
 3. **`RAY_task_events_report_interval_ms=0`** dodged a core task-event-aggregator
    SIGSEGV on the 2026-07 master commit. Only set it if workers segfault in the
    event aggregator; it disables task-event reporting.
+4. **Unset the platform runtime-env extensions** (learned 2026-07-28, a different
+   workspace image): the image injects the platform's cgroup module either as a
+   driver hook (`RAY_RUNTIME_ENV_HOOK`) or as agent plugins
+   (`RAY_RUNTIME_ENV_PLUGINS`). The module isn't in our venv; with the *plugins*
+   variant the runtime-env agent dies on import
+   (`ModuleNotFoundError: cgroup_runtime_plugin` in `runtime_env_agent.err`), the
+   raylet fate-shares, and `ray.init()` hangs forever. `setup.sh`'s verify and
+   `bench_suite.py` now pop both env vars in-process; for ad-hoc scripts,
+   `unset RAY_RUNTIME_ENV_HOOK RAY_RUNTIME_ENV_PLUGINS` first. Diagnosis pattern
+   for any such hang: `cat /tmp/ray/session_latest/logs/runtime_env_agent.err`.
 
 ## 3. Building the crate manually
 

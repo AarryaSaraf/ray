@@ -70,11 +70,15 @@ def _fresh_session(
     extra_env=None,
 ):
     ray.shutdown()
-    # Anyscale workspaces inject RAY_RUNTIME_ENV_HOOK=cgroup_runtime_plugin..., a hook
-    # that ships with the platform's Ray build but NOT the OSS nightly wheel in this
-    # venv — so ray.init() would die importing it. We don't need it for a local bench;
-    # drop it in-process so the suite is self-contained regardless of shell env.
+    # Anyscale workspaces inject platform runtime-env extensions that ship with the
+    # managed Ray build but NOT the OSS nightly wheel in this venv — depending on the
+    # image version either as a driver-side hook (RAY_RUNTIME_ENV_HOOK) or as agent
+    # plugins (RAY_RUNTIME_ENV_PLUGINS=...cgroup_runtime_plugin...; the runtime-env
+    # agent dies importing it and the raylet fate-shares → ray.init() hangs forever).
+    # We don't need either for a local bench; drop both in-process (the raylet and
+    # agent inherit this env) so the suite is self-contained regardless of shell env.
     os.environ.pop("RAY_RUNTIME_ENV_HOOK", None)
+    os.environ.pop("RAY_RUNTIME_ENV_PLUGINS", None)
     # Let the allocator levers be flipped for the WHOLE suite from the environment,
     # so an axis that doesn't thread them through (e.g. layout) can still be A/B'd
     # against the uncapped system allocator without a code edit. Explicit args win.
