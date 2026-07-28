@@ -1,95 +1,167 @@
 # arrow-rs Parquet migration — TODO
 
-Companion to [Agents.md](Agents.md) (the design/critique doc). This file tracks the
-*open* work items and the decisions behind them; Agents.md records what's done and why.
-Statuses: **next** (agreed, do it), **decision-needed** (blocked on an API/scope choice),
-**deferred** (agreed to postpone, with the trigger that would revive it).
+**Context (so this file stands alone).** Ray Data's V2 Parquet reader decodes through
+PyArrow, whose decode working set is the whole row group — private worker heap that
+Ray's scheduler never accounts for, the cause of node OOMs on big-row-group files
+(ray#49158). We built a Rust reader — the `ray_data_arrow_rs` PyO3 crate +
+`ArrowRsParquetFileReader`, behind the `DataContext.use_arrow_rs_parquet_reader` flag
+(V2 only) — that streams byte-budgeted decode batches, so the working set is a knob we
+set instead of a property of the file. Where it stands today ([Agents.md](Agents.md) is
+the full design/results doc):
 
-## Format-kwarg gaps (from the 2026-07-28 audit — currently PyArrow-fallback)
+- **Functionality/parity is complete for local + S3**: supported files are read
+  PyArrow-free end to end (footer, statistics pruning, decode). Anything unsupported
+  falls back to PyArrow *by documented decision* — the per-case rationale is
+  Agents.md §7.11 — and a fallback is never a correctness risk, only a
+  no-memory-win-for-that-read.
+- **The deciding memory runs are in** (Linux + real S3, Agents.md §5.10): peak memory
+  at-or-below PyArrow in every paired config at wall parity-to-faster; 2.6–2.8× less
+  on the target layout (a lone big row group as one S3 object).
+- A **strict mode** exists for validation runs: `RAY_DATA_ARROW_RS_STRICT=1` makes any
+  fallback decision raise (naming the reason) instead of silently serving PyArrow
+  bytes — so a correctness harness can prove the native path produced what it checked.
 
-### 1. Native decryption (`decryption_properties`, `decryption_config`) — DECIDED 2026-07-28: keep the fallback
-The Rust `parquet` crate (v59, `encryption` feature) fully supports read-side decryption,
-but pyarrow's `FileDecryptionProperties` is an opaque Cython object (zero public attrs —
-keys cannot be extracted) and `decryption_config` is a live KMS callback flow inside
-Arrow C++, so config-faithful bridging is impossible. Decision: encrypted files keep the
-PyArrow fallback (correct, just no memory win). Revive trigger: a real encrypted-parquet
-user — then design a Ray-side key channel (`arrow_rs_decryption_keys` via
-`dataset_kwargs` + a KMS-unwrap hook) with a security review (raw keys would ride task
-args).
+**The plan (agreed 2026-07-28):** correctness at scale first → optimization → re-run
+the memory/timing bench → Ray release tests → present. Packaging and the default flip
+ride behind those.
 
-### 3. `page_checksum_verification` — DONE 2026-07-28
-Crate rebuilt with parquet's `crc` feature: page CRCs are now verified during decode on
-BOTH the sync/local and async/S3 paths (both funnel through `decode_page` in
-`serialized_reader.rs`; verified by corrupt-page test). The feature is compile-time
-(no runtime off-switch), so the gate is value-sensitive: `True` → native (semantics
-match, corrupt page raises from both readers — parity-of-error), explicit `False` →
-PyArrow fallback (the opt-out for reading *despite* corrupt checksums, which only
-PyArrow can honor). Unset → native, which now verifies where pyarrow wouldn't —
-divergence only on corrupt data, in the safe direction (reject instead of returning
-garbage). Pyarrow doesn't write page CRCs by default, so most files are unaffected.
-Pinned by `test_page_checksum_verification_true_native` / `_false_falls_back`.
-**Found & fixed a base-V2 bug along the way** (`_arrow_scanner_kwargs`): the reader's
-hardcoded `ParquetFragmentScanOptions` REPLACED the format's scan options wholesale,
-silently dropping every scan-level `dataset_kwargs` option (`page_checksum_verification`,
-user `pre_buffer`/`buffer_size`/`cache_options`, scan-time decryption). User values are
-now merged over Ray's tuned defaults (`_FRAGMENT_SCAN_OPTION_KEYS`).
+**Ratings.** *Ease*: how cheap to build (High = quick/low-risk). *Importance*: how much
+it moves "a real memory win users can turn on" (High = critical path). *Priority*: the
+agreed order; `Parked` = not now, revive-trigger in the detail.
 
-### 4. Option bags (`read_options`, `default_fragment_scan_options`) — deferred
-Opaque pyarrow objects that can carry any of the other options inside them, so the
-allowlist can't inspect what they'd change. Introspecting them is fragile
-(version-dependent attribute sets). Stay on fallback; revive only if a real workload
-passes them.
+| # | Item | Ease | Importance | Priority |
+|---|------|------|-----------|----------|
+| 1 | Large-scale correctness run (Linux, strict mode) | Med | **High** | **P0 — next** |
+| 2 | Optimization: in-decode `RowFilter` + late materialization | Low | Med | P1 |
+| 3 | Optimization: bloom-filter row-group pruning (`=`/`IN`) | Med | Med | P1 |
+| 4 | Optimization: wide-string decode kernel / K-split reorder | Med | Med | P1 |
+| 5 | Fix the `decode_budget=32MB` → 431 MB memory cliff | Med | Med | P1 |
+| 6 | Full bench re-run: memory + timing, incl. the `oom` axis | Med | **High** | P1 (after 2–5) |
+| 7 | Ray release tests + present the results | Med | **High** | P2 |
+| 8 | Packaging: ship the crate (wheel or optional dep) | Low–Med | **High** | P2 |
+| 9 | Default flip (`use_arrow_rs_parquet_reader=True`) | High | High | P3 (blocked on 7+8) |
+| 10 | GCS / Azure filesystems | Med | Low | Parked |
+| 11 | Base-V2 `arrow_parquet_args` bug (separate PR) | Med | Med | Parked (own PR) |
+| 12 | Allocator A/B on Linux | High | Low | Parked (theory disproven) |
+| 13 | Native support for the deliberate fallbacks | Low | Low | Parked (see §7.11) |
 
-### 5. Schema-shaping kwargs (`binary_type`, `list_type`, `arrow_extensions_enabled`) — binary/list DONE 2026-07-28
-- `binary_type` / `list_type`: implemented for the pinned-schema case (the only case
-  the V2 pipeline produces). Empirical finding that made it trivial: the pinned unified
-  schema — inferred by the listing via `pq.read_schema`, which is blind to these kwargs —
-  is the output-type authority, and the base reader's pinned-schema cast **silently
-  undoes** the kwargs (pyarrow 24, verified). So parity = "output the pinned schema",
-  which the alignment's existing drift casts already guarantee → the kwargs are simply
-  admitted when `self._file_dataset_schema is not None`, zero new cast machinery.
-  Without a pinned schema they genuinely change output types (`binary`→`large_binary`,
-  `string`→`large_string`, `list`→`large_list` on no-embedded-schema files) → still
-  fallback. Pinned by `test_schema_shaped_kwargs_native_with_pinned_schema` /
-  `_fall_back_without_schema`.
-- `arrow_extensions_enabled`: changes whether canonical extension types are
-  reconstructed at all — interacts with the extension-metadata passthrough the crate
-  already does. Deferred until someone needs it (now the fallback exemplar in
-  `test_unsupported_format_kwarg_falls_back`).
+## Details
 
-## Migration phases (from the 6-phase plan)
+### 1. Large-scale correctness run — P0 (user-driven)
+On a Linux machine, run the decoder-replacement correctness suite at scale with the
+flag on. The harness already exists: `release/nightly_tests/dataset/arrow_rs_memtrace/`
+axis `correctness` — a deterministic corpus (`corpus.py` → `corpus_v1/`: every scalar
+type with pinned extremes, deep nesting, exotic encodings/compressions, pathological
+layouts, int96 hint/no-hint, schema evolution, tensors, pickle) driven through 17
+scenarios per reader with differential + golden + stability oracles. Two additions for
+this run: set `RAY_DATA_ARROW_RS_STRICT=1` so any silent fallback **errors with its
+reason** ("the run passed" then means "the native path produced every byte checked"),
+and **re-check the one known open divergence** from the smoke run:
+`coerce_int96_timestamp_unit="ms"` — pyarrow coerces to ms, but the native path
+appeared to ignore the kwarg and honor the file's embedded per-column hints instead,
+contradicting the alignment's claim to reproduce that coercion. Everything downstream
+(optimization targets, the bench re-run, the release-test pitch) keys off this run.
 
-- **Phase 3 — GCS/Azure filesystems**: `object_store` already vendors `gcp`/`azure`
-  features; per backend ≈ one Cargo feature + a `_gcs_config`/`_azure_config` bridge via
-  `fs.__reduce__` + gate admission. Real risk is credentials (short-lived tokens/ADC
-  don't round-trip through `__reduce__`) — bridge must be fail-safe (unrecoverable
-  config → None → PyArrow fallback), emulator tests (fake-gcs-server / Azurite), then
-  real-bucket validation.
-- **Phase 5 — packaging/CI wheels**: the long pole for any default flip. The crate must
-  build in Ray's CI for manylinux/macos and ship in the wheel (or as an optional dep).
-  Nothing designed yet.
-- **Phase 6 — default flip**: `use_arrow_rs_parquet_reader=True` by default. Blocked on
-  phase 5 + the Linux/real-S3 deciding run (below).
+### 2. In-decode `RowFilter` + late materialization — P1
+Today a pushed filter prunes whole row groups by footer statistics (native), but inside
+a surviving group we still decode *every* row and drop non-matching ones in Python.
+The Rust parquet crate's `RowFilter` enables the two-phase decode a query engine does:
+decode only the predicate column(s), evaluate, build a `RowSelection`, then decode the
+remaining (wide) columns **only for surviving rows** — and skip whole pages via the
+page index where present. Full design, including how it reuses the K-split's existing
+`RowSelection` machinery and what it needs from the predicate IR: Agents.md §7.9.
+Ease is Low because it needs an expression-evaluation layer in Rust and careful
+no-over-drop testing; it pays only on selective filters (the memory win for filters
+already exists without it — this is the CPU/IO win).
 
-## Other open items
+### 3. Bloom-filter row-group pruning — P1
+Min/max statistics only prune *range* predicates on sorted/clustered data. Parquet
+**bloom filters** (optional, column-chunk level) prune equality/`IN` predicates on
+*unclustered* high-cardinality columns — "is `x` definitely not in this row group?"
+regardless of sort order. The Rust crate already reads them (`parquet::bloom_filter`,
+the same path DataFusion uses), so this extends the existing native pruning step; the
+IR already carries `in`. Smaller and more self-contained than #2 — a good first
+optimization PR. Caveat: writers rarely emit bloom filters by default, so gate the
+bench claim on fixtures that have them.
 
-- **Linux + real-S3 deciding run**: `bench_suite.py s3` on Linux against real S3 — the
-  authoritative memory measurement (macOS numbers are directional; USS is
-  Linux-only). Sweeps fetch_window × MALLOC_ARENA_MAX; validates the windowed-async
-  port and the jemalloc feature.
-- **In-decode `RowFilter`**: crate currently prunes row groups by stats and filters
-  rows post-decode in Python; a native RowFilter would skip decoding non-matching rows.
-  Deferred: it's a speed win we don't currently need — memory is the goal, and the
-  post-decode filter is the correctness authority either way.
-- **Base-V2 `arrow_parquet_args` dead-end (separate PR, not arrow-rs)**: top-level
-  parquet args on `read_parquet` — exactly what the `dataset_kwargs` deprecation message
-  tells users to pass — are stored in `ParquetDatasourceV2.__init__` and never read
-  again; V2 silently drops them for BOTH readers. Fix (honor or reject loudly) needs its
-  own PR against the V2 datasource.
-- **Bench anomaly**: `decode_budget=32MB` → 431 MB per-worker peak (non-linear cliff
-  from 39 MB at 8 MB budget) in the reader-settings axis. Suspect oversized byte-budget
-  batch over a 30-group chunk, or fetch_window/K interaction. Investigate before quoting
-  budget-sweep numbers above 8 MB.
-- **Allocator retention (§7.8)**: jemalloc crate feature + `MALLOC_ARENA_MAX=2` worker
-  env are built but unvalidated on Linux (mimalloc segfaulted and was removed). Validate
-  in the deciding run.
+### 4. Wide-string decode kernel / K-split reorder — P1
+The one real speed deficit (Agents.md §5.7): at the 1 thread a Ray worker gets, the
+crate decodes moderate strings at parity but wide strings ~1.5× slower than PyArrow.
+Two attack angles: profile/optimize the wide-string kernel itself, and/or redesign the
+K-split's strictly-ordered depth-2 channels into a **bounded reorder buffer** so K
+ranges make real concurrent progress while still emitting in row order (today they
+serialize — that's why best-tuned K wins at 2 M rows but not 8 M). Rust-only work,
+benchmarkable Ray-free via `standalone_decode_bench.py`.
+
+### 5. The 32 MB budget cliff — P1
+In the reader-settings sweep, `decode_budget=32 MiB` produced a 431 MB per-worker peak
+— non-linear vs 39 MB at 8 MiB (Agents.md §5.12). Suspects: the byte-budget batcher
+emitting an oversized batch over a many-group chunk, or a `fetch_window`/K interaction.
+Must be understood before any budget-sweep number above 8 MB is quoted, and before
+tuning guidance says "raise the budget for speed."
+
+### 6. Full bench re-run (memory + timing) — P1, after 2–5
+Re-run `arrow_rs_memtrace/bench_suite.py` (all axes, Linux + real S3) once the
+optimizations land, so the presented numbers include them. Two additions over the last
+run: the **`oom` axis** — a memory-ceilinged node where PyArrow's hidden decode heap
+gets the read OOM-killed and arrow-rs finishes — the end-to-end demonstration of the
+failure mode this project removes; and cross-checking each per-task USS line against
+Ray's own `TaskExecWorkerStats.max_uss_bytes` to make the metric indisputable.
+Optionally fold in the parked allocator A/B (#12) as one sweep axis.
+
+### 7. Ray release tests + presentation — P2
+Wire the reader into Ray's existing release/nightly Parquet benchmarks (the harness in
+`release/nightly_tests/dataset/` already models this) and assemble the presentation:
+the mechanism (Agents.md §3), the deciding numbers (§5.10 + the re-run), and the
+honest caveats (§5.7 decode gap, deliberate fallbacks §7.11).
+
+### 8. Packaging — P2
+The crate must reach users somehow; today it's built locally with `maturin`. Two routes:
+
+| Route | What it takes | Trade-off |
+|---|---|---|
+| **In Ray's wheel** | Rust toolchain in every CI build image; cargo wired into Ray's Bazel/wheel pipeline (`rules_rust` or a bolt-on maturin step); artifacts for each platform; dependency/license review; build-infra team ownership | One wheel, nothing extra to install; heaviest org lift — cross-team infra, long review latency |
+| **Separate optional package** (`ray-data-arrow-rs` on PyPI) | Own repo/CI with `maturin generate-ci` (multi-platform wheels nearly free; PyO3 abi3 = one wheel per platform, all Python versions); Ray imports it when the flag is on (already fail-loud if missing) | Days of work, no Ray-CI coupling; but the default flip then needs the package as a `ray[data]` dependency (or the flip stays opt-in) |
+
+Recommended default: **start with the optional package** — it unblocks real users and
+the release tests immediately — and treat in-wheel as the eventual default-flip
+requirement, negotiated with the build-infra owners in parallel. (This is why the table
+says Low–Med, not Low: the *hard* part is only the in-wheel route.)
+
+### 9. Default flip — P3 (blocked)
+Flip `use_arrow_rs_parquet_reader` to True. Trivial code; blocked on #7 (field
+evidence) and #8 (the crate actually installable everywhere Ray runs). Keep the flag
+one release as the escape hatch.
+
+### 10. GCS / Azure — Parked
+Feasible (the crate's `object_store` dependency ships both backends; per backend ≈ one
+Cargo feature + one `_s3_config`-style config bridge), but the credential bridge is the
+risk: short-lived tokens / ambient application-default credentials often don't survive
+`fs.__reduce__`, and a naive bridge fails the read rather than falling back. Full
+analysis: Agents.md §7.10 + §7.11. **Revive trigger:** a user with GCS/Azure OOMs;
+then build fail-safe (unbridgeable config → PyArrow fallback), test on
+fake-gcs-server/Azurite, validate on a real bucket.
+
+### 11. Base-V2 `arrow_parquet_args` dead-end — Parked (separate PR)
+Not an arrow-rs item; tracked so it isn't lost. Top-level `arrow_parquet_args` on
+`read_parquet(...)` — the exact thing the `dataset_kwargs` deprecation message tells
+users to migrate to — are stored by `ParquetDatasourceV2.__init__` and **never read
+again**: V2 silently ignores them for *both* readers (V1 honors them). The fix (honor
+them, or reject loudly) belongs in its own PR against the V2 datasource.
+
+### 12. Allocator A/B — Parked (theory disproven)
+The old hypothesis — that the Rust system allocator retaining freed pages explained a
+many-tiny-groups loss — was **disproven by direct measurement** (Agents.md §5.10/§7.8):
+`LD_PRELOAD` jemalloc moved nothing, `MALLOC_ARENA_MAX=2` was inert on the S3 sweep,
+and the "loss" was an artifact of a since-retired metric. The crate's allocator build
+features were removed (§6.9 — a `#[global_allocator]` in the cdylib segfaulted Ray
+workers; don't reintroduce one). What remains is a cheap optional check: an
+`LD_PRELOAD` A/B as one axis of the #6 re-run, no crate changes. Do it later, if at all.
+
+### 13. Native support for the deliberate fallbacks — Parked
+Encryption, `page_checksum_verification=False`, option bags,
+`arrow_extensions_enabled`: each stays on the PyArrow fallback by decision, with the
+full per-case rationale in Agents.md §7.11 (in one line: the fallback is correct and
+identical to today's behavior; native support would buy no memory that matters and
+costs real engineering/security risk). **Revive trigger per case:** a real workload
+that hits it *and* suffers memory pressure on it.
