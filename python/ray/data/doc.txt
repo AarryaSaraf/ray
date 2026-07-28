@@ -1,0 +1,183 @@
+Replacing PyArrow with arrow-rs for Parquet Reads in Ray Data
+Aarrya Saraf
+
+
+1. INTRODUCTION
+
+For this document, we restrict ourselves to the Ray Data Parquet Reader in
+Datasource v2. All the numbers and testing were done on an 8CPU-32GB node running
+linux on the Anyscale workspace.
+
+Consider the GitHub issue ray-project/ray#49158
+(https://github.com/ray-project/ray/issues/49158), which highlights a known memory
+leak (I use the word leak loosely here. Testing, at least in the modern version of
+Ray, shows more of a transient peak. There seems to be no memory retention or
+constant increase) in pyarrow which, by extension, causes leaks in Ray Data when
+reading certain parquet files. Currently, when scheduling read tasks, we do not take
+this memory into account. Instead we pass CPU constraints onto core. For such cases,
+the scheduler, unaware of this leak, can keep on adding read tasks on the same machine
+causing OOMs. This prototype explores whether switching to arrow-rs (the rust
+equivalent) can resolve this issue.
+
+1.1 Background: Parquet
+
+Parquet files store tables with one schema at the file level. Inside a file, the table
+is divided into horizontal slices called row groups and inside each row group, we store
+the data in a columnar format (which is stored in data pages). There are some optional
+statistics like min, max, bloom filters, and more for each column chunk and for pages.
+The page sizes are user controlled but generally 1 MiB in size.
+
+1.2 PyArrow vs Arrow-rs
+
+In the current datasource v2 implementation, we use the scan_batches function for
+multiple reasons like schema unification, filter pushdown and prefetching that
+iter_batches does not offer out of the box. This function decodes the entire row-group
+in memory so it holds the decoded row group in memory. iter_batches is slightly better
+holding the compressed row group in memory and would be a python only improvement
+without external dependencies. However, this isn't free either. This win is seen only
+for large row groups but the overhead of iter_batches actually makes memory worse for a
+small row group. Arrow-rs on the other hand has a bounded window. It does not have all
+the in built benefits of scan_batches but those can be wrapped around it. Below we show
+an evaluation of all 3 against one another.
+
+The mechanism, briefly. PyArrow's decode unit is a whole row group, so a worker's peak
+private heap grows with the group the file dictates. arrow-rs sizes each decode batch by
+bytes -- from the footer it picks a row count so rows x bytes/row ~= budget (a few MiB),
+dropping each batch as the next is pulled -- turning the O(row group) term into
+O(budget): a working set we set, not one the file dictates.
+
+
+2. EXPERIMENTAL METHODOLOGY
+
+Setup. We compare three readers on identical fixtures with per-column hash parity, so
+any memory gap is a pure decoder effect: the PyArrow scanner (Ray's V2 default,
+pre_buffer=True), PyArrow iter_batches, and arrow-rs. We swept a wide matrix, one
+variable at a time: storage (local vs. real S3), row-group size, decode batch size,
+schema (ints, floats, strings, and rich types -- Ray tensors and the canonical
+fixed_shape_tensor extension), file length, file count / concurrency, and mixed-schema
+multi-file datasets -- each under scan, sum, and filter workloads.
+
+Metric. Node OOM is driven by resident private memory the scheduler never sees: it
+admits tasks on CPU slots and expected output-block size only, not the decode heap. So
+the metric of record is worker USS (pages private to a process, excluding shared
+libraries and plasma), plotted as USS vs. seconds since task start. Across every
+ablation (row-group size, batch size, file count, ...) arrow-rs holds a consistently
+smaller slope -- a flat plateau where PyArrow climbs to the whole decoded group --
+which is the finding, not a single peak.
+
+Decomposing USS. A read task's private memory is roughly
+
+    USS  ~=  S_in  +  W_decode  +  S_out  +  M_uncontrolled
+
+where S_in is the input bytes read, W_decode the decode working set, S_out the output
+block(s) handed to plasma, and M_uncontrolled memory we do not manage (e.g. freed pages
+the allocator keeps cached). Give both readers the SAME large input and output, and only
+W_decode differs: arrow-rs holds ~= one page (its byte budget, a few MiB), whereas
+PyArrow holds the whole row group -- encoded under iter_batches, decoded under the
+scan_batches default. That single term is the entire memory story.
+
+
+3. RESULTS
+
+The table below spans the matrix. Memory (peak worker USS) is lower in every case; wall
+time is faster on large fixtures and within a few percent on small ones. Node:
+8 vCPU / 32 GB Linux, warm cache.
+
+  Workload (rows, RGs, schema)            USS saved    Wall delta
+  ----------------------------------------------------------------
+  4M, 1 RG, int (scan)                       55%          -9%
+    same, filter (9 int cols)                75%         +15%
+    same, sum                                20%          +8%
+  500k, 5 RG, fixed_shape_tensor              6%         -0.2%
+  500k, 5 RG, float                          15%          +9%
+  500k, 5 RG, string / Ray tensor            15%          +5%
+  Big RG on S3                               62%          ~0
+  Mixed 6-file (1 struct fallback)           35%         -45%
+
+  USS saved = 1 - arrow-rs/PyArrow peak private heap.
+  Wall delta: + slower, - faster. Rich types decode byte-identically;
+  memory wins everywhere (6-75%).
+
+Row-group size is the lever. At 4M rows in one row group arrow-rs uses 55% less peak USS
+and is faster, and the gap grows with row-group size -- exactly where PyArrow must
+materialize one large indivisible unit. When a file already has many small groups, Ray's
+read pool splits it across workers so no worker holds a big group, and the two readers
+converge to parity: the correct "not worse" outcome.
+
+Rich types are not a barrier. Extension and tensor columns (fixed_shape_tensor, Ray's
+tensor types), strings, and floats all decode byte-identically and still cut memory
+6-15%. On the small 500k-row fixtures arrow-rs is a few percent slower (5-9% -- fixed
+per-call overhead that a small decode can't amortize), always paired with the memory win.
+
+Workloads and S3. A filter (4M rows, 9 int cols) uses 75% less memory for +15% time, and
+a sum 20% less for +8% -- both decode fully today but never accumulate the group. The
+target OOM case, a lone big row group as one S3 object, is 62% less memory at speed
+parity: arrow-rs's fetch window caps compressed bytes in flight while PyArrow pulls the
+whole object. A heterogeneous 6-file dataset (one member falling back to PyArrow) still
+ran 1.8x faster at 35% less memory.
+
+
+4. LIMITATIONS
+
+The main real cost is Ray Data owning a cross-platform Rust build in CI. On small
+fixtures the fixed per-call overhead makes arrow-rs a few percent slower (it is faster
+once the decode is large or output is materialized). We prune whole row groups by footer
+statistics at parity with PyArrow, but still decode surviving rows before filtering them.
+And the clearest win is the "one big row group" layout -- worth confirming how often real
+customer files hit it.
+
+
+5. FUTURE WORK
+
+Beyond the row-group pruning both readers do today, Parquet often carries finer
+statistics we do not yet exploit: a page index (per-page min/max plus byte offsets) and,
+for equality/IN predicates, bloom filters. When present, these let a reader skip
+individual pages and seek directly to the survivors. arrow-rs is well-suited to this --
+it already loads the page index and skips pages via RowSelection for its range-split
+path, and parquet-rs supports bloom-filter reads -- so the same machinery can be driven
+by a pushed-down filter. Combined with late materialization (decode only the predicate
+column, evaluate the filter, then decode the wide columns for surviving rows only), this
+turns today's "decode everything, keep a few" into "touch a few pages, decode a few
+rows." It also composes with Ray's planned page-index chunker, where the reader must
+consume sub-row-group page ranges -- something arrow-rs's RowSelection already does.
+
+
+6. CONCLUSION
+
+PyArrow decodes a whole row group into a worker's private heap -- memory the scheduler
+never accounts for -- so on large row groups it keeps admitting read tasks until the node
+OOM-kills. arrow-rs bounds the decode by bytes, making that working set a knob we set
+rather than a property of the file. Across our sweep -- storage (local and S3), row-group
+and batch sizes, rich types (including tensors and extensions), file counts, mixed
+schemas, and scan/filter/sum workloads -- peak worker USS is 6-75% lower, at parity only
+when the file already has many small groups that Ray's pool spreads across workers (the
+correct "not worse" outcome). Speed is faster on large or materialized workloads and
+within a few percent on small fixtures, where fixed per-call overhead dominates. The net
+is a large, consistent memory win at little-to-no speed cost -- which is what removing the
+#49158 OOMs requires.
+
+
+APPENDIX A. SUPPLEMENTARY FIGURES
+
+The figures below are from runs on macOS, not the Linux workspace used for the tables in
+Section 3, so the absolute numbers differ slightly -- the shapes and ratios are the point.
+Each plot is worker USS (MB) during the read task vs. seconds since task start:
+red = PyArrow V2 scanner, orange = PyArrow iter_batches, blue = arrow-rs. The table
+embedded in each figure repeats wall time and peak USS with deltas vs. the scanner.
+
+[Insert image: paper_figs/sweep_1_4gb.png]
+Figure A1. One lone big row group -- the target case. 20M rows, 1 file, 1 row group
+(1376 MB decoded / 999 MB on-disk snappy), 9 int columns. arrow-rs holds a flat ~410 MB
+while the PyArrow scanner climbs to ~2.6 GB (-84% USS) and iter_batches plateaus at
+~1.4 GB.
+
+[Insert image: paper_figs/filter.png]
+Figure A2. Filter workload. 4M rows, 1 file, 1 row group (277 MB decoded / 202 MB on-disk
+snappy), 9 int columns. All rows are decoded and then filtered; arrow-rs's decode
+transient never accumulates, so its peak USS stays far below PyArrow's.
+
+[Insert image: paper_figs/mixed_grp.png]
+Figure A3. Mixed row-group sizes. 2M rows in 7 row groups (~62 MB decoded / 54 MB on-disk
+snappy per group), schema = int id + 6 string columns so per-group size varies;
+iter_batches consume. The per-group fan-out keeps every reader bounded, and arrow-rs stays
+at or below PyArrow.
