@@ -1172,6 +1172,216 @@ def axis_scaling():
     return results
 
 
+def axis_closure():
+    """Confirm the USS decomposition  USS ≈ S_in + W_decode + S_out + M_uncontrolled
+    is ACCURATE rather than tautological.
+
+    The trap: if M is *defined* as "USS minus the other three", any closure check is
+    vacuous. So this axis drives all three controllable terms with ONE knob — the row
+    count N of a single row group, fixed 9×int64 schema (fixtures._ints), so decoded
+    bytes = N × 72 EXACTLY — and regresses the MEASURED per-worker read-caused USS on a
+    PREDICTED value assembled only from independently-known quantities:
+
+        pred(pyarrow scanner) = decoded_RG + compressed_RG(footer) + one output block
+        pred(arrow-rs)        = decode_budget            + one output block
+
+    M is deliberately absent from `pred`; it is the residual we test. Fit measured vs
+    pred across BOTH readers and ALL N:
+        slope ≈ 1, small constant intercept, high R²  ⇒  M is a bounded constant, the
+                                                          model closes.
+        slope > 1  ⇒  M grows with data size — the equation is incomplete (the OOM fear).
+    The intercept IS the measured M_uncontrolled; the per-point residual must be flat in
+    N (M does not scale) — that is exactly the "increases at most slope-1" condition.
+
+    CRITICAL — output blocks are shrunk to 8 MiB (``ctx.target_max_block_size``), same
+    as the leak_* axes. With the default 128 MiB block a whole small dataset fits in ONE
+    output block, so the worker holds the whole decoded output and that O(N) output term
+    SWAMPS the decode transient — both readers then look ∝N and W_decode is invisible
+    (the retained-output-block confound, plan §6.1). Shrinking the block makes S_out a
+    size-independent constant so W_decode is what varies with N.
+
+    Two consume modes per (N, reader), kept as a consistency cross-check (with small
+    blocks they should agree within noise):
+      * decode_drop  → map to row counts, output dropped downstream.
+      * iter_batches → the real consumer streams every batch to the driver.
+
+    By-product headline: on the lone big row group PyArrow's W_decode is the whole
+    decoded group (∝ N) while arrow-rs's is the flat budget — so a per-reader fit of
+    USS vs decoded_MB gives slope≈1 (really ≈1 + compression, since pre_buffer also
+    holds the compressed group) for PyArrow and slope≈0 for arrow-rs.
+
+    macOS caveat: worker USS is RSS-based here (directional only). Run on Linux for the
+    authoritative closure. Override the sweep with RAY_DATA_CLOSURE_ROWS_M (e.g. "0.5,1"
+    millions) for a quick local smoke test."""
+    BYTES_PER_ROW = 72  # id + i0..i7 = 9 × int64, the fixtures._ints schema
+    SMALL_BLOCK = 8 * MB  # shrink output blocks so S_out is a constant, not O(N)
+    env_rows = os.environ.get("RAY_DATA_CLOSURE_ROWS_M")
+    if env_rows:
+        row_sweep = [int(float(x) * 1_000_000) for x in env_rows.split(",")]
+    else:
+        row_sweep = [1_000_000, 2_000_000, 4_000_000, 8_000_000]
+    results = []
+    for rows in row_sweep:
+        spec = {"rows": rows, "num_files": 1, "row_group_size": rows, "schema": "int"}
+        path = fx.make_fixture(f"closure_{rows}", spec)
+        for reader in ["pyarrow", "arrow_rs"]:
+            for mode in ["decode_drop", "iter_batches"]:
+                label = f"closure__{rows}__{reader}__{mode}"
+                d = _run_dir(label)
+                ctx = _fresh_session(reader, d)  # default budget 8 MB
+                ctx.target_max_block_size = SMALL_BLOCK  # expose W_decode (see docstring)
+                _warm(reader, d)
+                _note_fixture(d, path)
+                t0 = time.time()
+                nrows = consume(ray.data.read_parquet(path), mode)
+                t1 = time.time()
+                wall = t1 - t0
+                ray.shutdown()
+                time.sleep(0.3)
+                peak = _node_sum_peak_mb(d, t0, t1)
+                incr = _node_sum_incr_peak_mb(d, t0, t1)
+                wk = _worker_breakdown(d, t0, t1)
+                nat, fb = _count_paths(d)
+                results.append(
+                    _R(
+                        d,
+                        {
+                            "rows": rows,
+                            "reader": reader,
+                            "mode": mode,
+                            "wall_s": wall,
+                            # independently-known inputs to the predicted USS
+                            "decoded_mb": round(rows * BYTES_PER_ROW / MB, 2),
+                            "budget_mb": ctx_budget_mb(d),
+                            "target_block_mb": round(ctx.target_max_block_size / MB, 2),
+                            # measured outputs (per-worker read-caused growth = the y)
+                            "max_worker_incr_mb": wk["max_worker_incr_mb"],
+                            "max_worker_minmax_mb": wk["max_worker_minmax_mb"],
+                            "node_sum_peak_mb": peak,
+                            "node_sum_incr_mb": incr,
+                            "native": nat,
+                            "fallback": fb,
+                            "rows_read": nrows,
+                        },
+                    )
+                )
+                _report(
+                    f"closure {rows // 1_000_000}M {reader} ({mode})",
+                    wall, peak, incr, nat, fb,
+                    extra={
+                        "decoded": f"{rows * BYTES_PER_ROW / MB:.0f} MB",
+                        "max task": f"{wk['max_worker_incr_mb']:.0f} MB "
+                        f"(minmax {wk['max_worker_minmax_mb']:.0f})",
+                    },
+                )
+    json.dump(results, open(os.path.join(OUT, "results_closure.json"), "w"), indent=2)
+    return results
+
+
+def ctx_budget_mb(trace_dir):
+    """Read the decode budget (MB) this run was configured with from its meta.json
+    (written by _fresh_session), so the analysis uses the real knob, not a guess."""
+    p = os.path.join(trace_dir, "meta.json")
+    try:
+        return round(float(json.load(open(p)).get("budget_mb", 8.0)), 2)
+    except Exception:
+        return 8.0
+
+
+def axis_terms():
+    """Confirm per-worker USS is linear (UNIT slope) in EACH controllable term
+    SEPARATELY — not just in the aggregate (which axis_closure showed). The closure
+    fit co-varies S_in and W_decode via one knob (N) and pins S_out, so it cannot
+    attribute a slope to any single term. Here each term is swept one at a time with
+    the others held fixed:
+
+      A. S_out  — arrow-rs (so W_decode is a negligible ~budget constant), fixed 2M
+                  fixture, sweep the output-block cap {8,16,32,64,128} MiB. The worker
+                  holds ~one block in flight, so USS must rise ~1:1 with the cap
+                  (slope ≈ number of in-flight blocks, a constant ⇒ linear in S_out).
+      B. S_in   — pyarrow, sweep rows with pre_buffer ON vs OFF (block pinned 8 MiB).
+                  pre_buffer holds the whole compressed row group (S_in ∝ N); OFF
+                  removes it, so the USS-vs-decoded slope must fall by the compression
+                  ratio (≈1.75 → ≈1.0). The DROP is S_in's coefficient; the residual
+                  1.0 is pure W_decode (so this also confirms W_decode's coefficient).
+
+    macOS caveat: USS is RSS-based (directional). Run on Linux for authoritative slopes.
+    """
+    import numpy as np
+
+    def _incr(reader, path, block_mb, pre_buffer=None):
+        d = _run_dir(f"terms__{reader}__blk{block_mb}__pb{pre_buffer}")
+        ctx = _fresh_session(reader, d, pre_buffer=pre_buffer)  # default 8 MB budget
+        ctx.target_max_block_size = int(block_mb * MB)
+        _warm(reader, d)
+        _note_fixture(d, path)
+        t0 = time.time()
+        consume(ray.data.read_parquet(path), "iter_batches")
+        t1 = time.time()
+        ray.shutdown()
+        time.sleep(0.3)
+        return _worker_breakdown(d, t0, t1)["max_worker_incr_mb"]
+
+    results = []
+
+    # --- A. S_out: sweep the output-block cap on a FIXED fixture (W_decode constant) ---
+    fixed = fx.make_fixture(
+        "terms_fixed_2M",
+        {"rows": 2_000_000, "num_files": 1, "row_group_size": 2_000_000, "schema": "int"},
+    )
+    print("\n--- A. S_out: arrow-rs, fixed 2M fixture, sweep output-block cap ---")
+    A = []
+    for blk in [8, 16, 32, 64, 128]:
+        val = _incr("arrow_rs", fixed, blk)
+        A.append((blk, val))
+        results.append(
+            {"part": "S_out", "reader": "arrow_rs", "block_mb": blk,
+             "max_worker_incr_mb": val}
+        )
+        print(f"  block cap = {blk:>4} MiB  ->  USS incr = {val:6.1f} MB")
+    if len(A) >= 2:
+        m, b = np.polyfit([x for x, _ in A], [y for _, y in A], 1)
+        print(f"  => slope = {m:.2f} MB USS per MB block  "
+              f"({'linear in S_out ✓' if 0.5 <= m <= 3 else 'NONLINEAR ✗'}; "
+              f"coefficient ≈ in-flight blocks)")
+
+    # --- B. S_in: pyarrow, pre_buffer ON vs OFF, sweep rows (block pinned 8 MiB) ---
+    env_rows = os.environ.get("RAY_DATA_CLOSURE_ROWS_M")
+    if env_rows:
+        row_sweep = [int(float(x) * 1_000_000) for x in env_rows.split(",")]
+    else:
+        row_sweep = [1_000_000, 2_000_000, 4_000_000]
+    print("\n--- B. S_in: pyarrow, pre_buffer ON vs OFF, sweep rows (block=8 MiB) ---")
+    slopes = {}
+    for pb in [True, False]:
+        pts = []
+        for rows in row_sweep:
+            path = fx.make_fixture(
+                f"closure_{rows}",
+                {"rows": rows, "num_files": 1, "row_group_size": rows, "schema": "int"},
+            )
+            decoded = rows * 72 / MB
+            val = _incr("pyarrow", path, 8, pre_buffer=pb)
+            pts.append((decoded, val))
+            results.append(
+                {"part": "S_in", "reader": "pyarrow", "pre_buffer": pb,
+                 "decoded_mb": round(decoded, 1), "max_worker_incr_mb": val}
+            )
+            print(f"  pre_buffer={str(pb):5} decoded={decoded:6.0f} MB  ->  "
+                  f"USS incr = {val:6.1f} MB")
+        if len(pts) >= 2:
+            m, b = np.polyfit([x for x, _ in pts], [y for _, y in pts], 1)
+            slopes[pb] = m
+            print(f"  => pre_buffer={str(pb):5}: slope = {m:.3f} MB USS / MB decoded")
+    if True in slopes and False in slopes:
+        drop = slopes[True] - slopes[False]
+        print(f"\n  S_in coefficient = slope drop = {drop:.3f} (≈ compression ratio ⇒ "
+              f"S_in enters at unit coefficient); residual {slopes[False]:.3f} ≈ 1.0 = "
+              f"pure W_decode")
+    json.dump(results, open(os.path.join(OUT, "results_terms.json"), "w"), indent=2)
+    return results
+
+
 def axis_concurrency():
     """The real single-node distributed test: N files each with ONE big row group,
     read concurrently across `num_cpus` workers. This is the scenario the OOM thesis
@@ -1998,6 +2208,8 @@ AXES = {
     "reader_settings": axis_reader_settings,
     "mixed": axis_mixed,
     "scaling": axis_scaling,
+    "closure": axis_closure,
+    "terms": axis_terms,
     "concurrency": axis_concurrency,
     "showcase": axis_showcase,
     "sweep_size": sweep_size,
