@@ -2104,8 +2104,8 @@ def test_perf_only_format_kwargs_stay_native(tmp_path, monkeypatch):
 def test_unsupported_format_kwarg_falls_back(tmp_path, monkeypatch):
     """A format kwarg outside the native allowlist forces a PyArrow fallback
     (which honors it) instead of being silently ignored. Exercised with
-    ``page_checksum_verification`` — a real pyarrow behavior toggle the crate
-    build doesn't reproduce yet (see TODO.md item 3)."""
+    ``arrow_extensions_enabled`` — a pyarrow 21+ schema-shaping toggle the
+    native path doesn't reproduce (see TODO.md item 5)."""
     path = tmp_path / "audit_kwargs.parquet"
     pq.write_table(
         pa.table({"id": pa.array([1, 2], pa.int64())}), str(path), write_page_index=True
@@ -2114,7 +2114,7 @@ def test_unsupported_format_kwarg_falls_back(tmp_path, monkeypatch):
     rs, pa_tbl, native_decodes = _read_both_in_process(
         [path],
         monkeypatch,
-        parquet_format_kwargs={"page_checksum_verification": True},
+        parquet_format_kwargs={"arrow_extensions_enabled": True},
     )
     assert native_decodes == 0, "unsupported format kwarg must force fallback"
     assert rs.equals(pa_tbl)
@@ -2164,6 +2164,153 @@ def test_thrift_limits_native_parity(tmp_path, monkeypatch):
                 filesystem=LocalFileSystem(), parquet_format_kwargs=dict(tiny)
             ).read(manifest)
         )
+
+
+def _write_crc_file(path, corrupt=False):
+    """Write an uncompressed file with page checksums; optionally flip one
+    byte inside a data page (detectable only via CRC verification)."""
+    table = pa.table(
+        {
+            "id": pa.array(range(100), pa.int64()),
+            "s": pa.array([f"crc_sentinel_{i:04d}" for i in range(100)]),
+        }
+    )
+    pq.write_table(
+        table,
+        str(path),
+        write_page_index=True,
+        compression="NONE",
+        write_page_checksum=True,
+    )
+    if corrupt:
+        data = bytearray(path.read_bytes())
+        idx = data.find(b"crc_sentinel_0050")
+        assert idx > 0
+        data[idx] = ord("X")
+        path.write_bytes(bytes(data))
+    return table
+
+
+def test_page_checksum_verification_true_native(tmp_path, monkeypatch):
+    """``page_checksum_verification=True`` decodes natively: the crate is
+    built with parquet's ``crc`` feature and always verifies stored page
+    CRCs, so True *is* the native behavior — clean files match byte-for-byte,
+    and a corrupt page raises from BOTH readers (parity-of-error)."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+    from ray.data._internal.datasource_v2.readers.parquet_file_reader import (
+        ParquetFileReader,
+    )
+
+    clean = tmp_path / "crc_clean.parquet"
+    _write_crc_file(clean)
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [clean],
+        monkeypatch,
+        parquet_format_kwargs={"page_checksum_verification": True},
+    )
+    assert native_decodes >= 1, "page_checksum_verification=True must stay native"
+    assert rs.equals(pa_tbl)
+
+    corrupt = tmp_path / "crc_corrupt.parquet"
+    _write_crc_file(corrupt, corrupt=True)
+    manifest = _make_manifest([str(corrupt)], [os.path.getsize(corrupt)], [None])
+    kwargs = {"page_checksum_verification": True}
+    for reader_cls in (ArrowRsParquetFileReader, ParquetFileReader):
+        with pytest.raises((OSError, pa.lib.ArrowInvalid), match="CRC"):
+            list(
+                reader_cls(
+                    filesystem=LocalFileSystem(), parquet_format_kwargs=dict(kwargs)
+                ).read(manifest)
+            )
+
+
+def test_page_checksum_verification_false_falls_back(tmp_path, monkeypatch):
+    """An explicit ``page_checksum_verification=False`` is the opt-out for
+    reading a file *despite* corrupt checksums. The crate build always
+    verifies (compile-time ``crc`` feature, no off-switch), so only PyArrow
+    can honor the opt-out — the read must fall back and succeed, returning
+    the same (corrupted) bytes from both paths."""
+    path = tmp_path / "crc_optout.parquet"
+    _write_crc_file(path, corrupt=True)
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path],
+        monkeypatch,
+        parquet_format_kwargs={"page_checksum_verification": False},
+    )
+    assert native_decodes == 0, "explicit False must force the PyArrow fallback"
+    assert rs.equals(pa_tbl)
+    # The corruption is really there — the flipped byte comes through.
+    assert rs["s"][50].as_py() == "Xrc_sentinel_0050"
+
+
+def _schema_shaped_fixture(tmp_path):
+    """A file WITHOUT an embedded arrow schema (``store_schema=False``), so
+    ``binary_type`` / ``list_type`` genuinely change pyarrow's decoded types
+    (with an embedded schema they are inert)."""
+    path = tmp_path / "schema_shaped.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2], pa.int64()),
+                "b": pa.array([b"x", b"y"], pa.binary()),
+                "l": pa.array([[1, 2], [3]], pa.list_(pa.int64())),
+                "s": pa.array(["a", "bb"], pa.string()),
+            }
+        ),
+        str(path),
+        write_page_index=True,
+        store_schema=False,
+    )
+    return path
+
+
+def test_schema_shaped_kwargs_native_with_pinned_schema(tmp_path, monkeypatch):
+    """``binary_type`` / ``list_type`` with a pinned dataset schema decode
+    natively: the pin is the output-type authority — on the base path the
+    pinned-schema cast silently *undoes* these kwargs (the V2 listing infers
+    the schema via ``pq.read_schema``, which is blind to them), and the
+    native path's alignment produces the pinned types identically."""
+    path = _schema_shaped_fixture(tmp_path)
+    unified = pq.read_schema(str(path))
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path],
+        monkeypatch,
+        schema=unified,
+        parquet_format_kwargs={
+            "binary_type": pa.large_binary(),
+            "list_type": pa.LargeListType,
+        },
+    )
+    assert native_decodes >= 1, "pinned-schema read must stay native"
+    assert rs.equals(pa_tbl)
+    # The pin wins: output types are the plain (non-large) footer types.
+    assert rs.schema.field("b").type == pa.binary()
+    assert rs.schema.field("s").type == pa.string()
+
+
+def test_schema_shaped_kwargs_fall_back_without_schema(tmp_path, monkeypatch):
+    """Without a pinned schema, ``binary_type`` / ``list_type`` genuinely
+    change the decoded types (large_binary / large_string / large_list on a
+    no-embedded-schema file) — the crate doesn't reproduce that, so the read
+    falls back to PyArrow and both paths agree on the large types."""
+    path = _schema_shaped_fixture(tmp_path)
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path],
+        monkeypatch,
+        parquet_format_kwargs={
+            "binary_type": pa.large_binary(),
+            "list_type": pa.LargeListType,
+        },
+    )
+    assert native_decodes == 0, "schema-shaping kwargs without a pin must fall back"
+    assert rs.equals(pa_tbl)
+    assert rs.schema.field("b").type == pa.large_binary()
+    assert rs.schema.field("s").type == pa.large_string()
+    assert rs.schema.field("l").type == pa.large_list(pa.int64())
 
 
 def test_arrow_rs_tuning_kwargs_reach_crate(tmp_path, monkeypatch):

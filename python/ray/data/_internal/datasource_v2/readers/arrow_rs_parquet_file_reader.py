@@ -79,7 +79,9 @@ Prototype limitations (documented, not hidden)
   counts answer it (:class:`_NativeCountFragment`).
 - Still gated to PyArrow: non-local/S3 filesystems, Parquet-format kwargs
   outside the native allowlist (anything not I/O-only, not reproduced by the
-  alignment, and not footer-verified — e.g. decryption, ``binary_type``; see
+  alignment, and not footer-verified — e.g. decryption, an explicit
+  ``page_checksum_verification=False``, or ``binary_type`` / ``list_type``
+  without a pinned dataset schema; see
   :meth:`ArrowRsParquetFileReader._blocking_format_kwargs`; the thrift footer
   limits stay native via a metadata-only pyarrow probe,
   :meth:`_verify_footer_limits`), extension-typed
@@ -255,6 +257,20 @@ _FORMAT_KWARGS_ALIGNED = frozenset(
 _FORMAT_KWARGS_FOOTER_VERIFIED = frozenset(
     {"thrift_string_size_limit", "thrift_container_size_limit"}
 )
+# Schema-shaping kwargs (pyarrow 21+): on a file *without* an embedded arrow
+# schema they change decoded types (``binary_type=large_binary`` flips
+# binary→large_binary AND string→large_string; ``list_type=LargeListType``
+# flips list→large_list); on embedded-schema files (all Ray-written files)
+# they are inert. On the V2 pipeline the pinned unified schema — computed by
+# the listing via ``pq.read_schema``, which is blind to these kwargs — is the
+# final authority: the base reader's pinned-schema cast silently *undoes*
+# them (verified empirically, pyarrow 24). So with a pinned schema, parity is
+# simply "output the pinned schema", which the native path's per-file
+# :class:`_ColumnAlignment` drift casts already guarantee — admit natively.
+# WITHOUT a pinned schema the kwargs do change the output and the crate
+# doesn't reproduce them — fall back. See
+# :meth:`ArrowRsParquetFileReader._blocking_format_kwargs`.
+_FORMAT_KWARGS_SCHEMA_SHAPED = frozenset({"binary_type", "list_type"})
 
 
 class _ArrowRsTuning(NamedTuple):
@@ -991,6 +1007,18 @@ class ArrowRsParquetFileReader(ParquetFileReader):
           ``aligned_ok=True``. The per-fragment re-gate can plan neither an
           alignment nor a probe (see :meth:`_reader_level_supported`), so
           there they block (``aligned_ok=False``).
+        - :data:`_FORMAT_KWARGS_SCHEMA_SHAPED` (``binary_type``,
+          ``list_type``) are admitted on the planned path only when a unified
+          dataset schema is pinned: the pin is the output-type authority (it
+          silently *undoes* these kwargs on the base path too), and the
+          alignment's drift casts already produce the pinned types. Without a
+          pinned schema the kwargs genuinely change output types — fall back.
+        - ``page_checksum_verification=True`` is admitted everywhere: the
+          crate is built with parquet's ``crc`` feature and always verifies
+          stored page CRCs, so ``True`` *is* the native behavior. An explicit
+          ``False`` — the opt-out for reading a file despite corrupt
+          checksums — is something the crate build cannot honor, so it falls
+          back to PyArrow (the only reader that can skip the check).
         - A ``None`` value means "pyarrow default" for every format kwarg, so
           ``None``-valued keys never block.
         """
@@ -999,11 +1027,16 @@ class ArrowRsParquetFileReader(ParquetFileReader):
             if aligned_ok
             else frozenset()
         )
-        return {
-            key: value
-            for key, value in self._parquet_format_kwargs.items()
-            if key not in allowed and value is not None
-        }
+        if aligned_ok and self._file_dataset_schema is not None:
+            allowed |= _FORMAT_KWARGS_SCHEMA_SHAPED
+        blocked: Dict[str, Any] = {}
+        for key, value in self._parquet_format_kwargs.items():
+            if value is None or key in allowed:
+                continue
+            if key == "page_checksum_verification" and value is True:
+                continue
+            blocked[key] = value
+        return blocked
 
     def _reader_level_supported(self) -> bool:
         """Reader-wide half of the *per-fragment* re-gate (the pyarrow-fragment

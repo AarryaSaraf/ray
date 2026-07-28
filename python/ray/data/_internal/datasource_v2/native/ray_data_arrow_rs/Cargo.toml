@@ -14,7 +14,14 @@ crate-type = ["cdylib", "rlib"]
 # Pin to the same major the surviving standalone benchmark used, so behavior
 # matches the numbers in Agents.md. object_store MUST match the version parquet
 # pins (0.13.x) or ParquetObjectReader's API won't line up.
-parquet = { version = "59", features = ["arrow", "async", "object_store"] }
+# `crc`: verify each data page's stored CRC32 during decode (decode_page in
+# parquet's serialized_reader, used by BOTH the sync/local and async/S3 paths).
+# Compile-time only — there is no runtime toggle — and a no-op for pages that
+# don't store a CRC (pyarrow doesn't write them by default). Enables native
+# support for `page_checksum_verification=True`; an explicit `False` (read
+# *despite* bad checksums) still falls back to PyArrow, the only reader that
+# can skip the check.
+parquet = { version = "59", features = ["arrow", "async", "object_store", "crc"] }
 # Only the `ffi` feature — we hand batches to Python via the Arrow C-stream
 # (FFI_ArrowArrayStream + PyCapsule), NOT arrow's `pyarrow` conversions. Pulling
 # `pyarrow` would drag in arrow-pyarrow → pyo3 0.28, conflicting with our pyo3 0.22.

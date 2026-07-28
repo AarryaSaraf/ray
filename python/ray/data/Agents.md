@@ -2087,14 +2087,39 @@ two and silently ignore the rest while the fallback honored them all. Now an exp
   (`_verify_footer_limits` — same C++ thrift parser → identical accept/reject + identical
   `OSError`), then decodes natively. The one deliberate exception to "pyarrow never opens a
   supported file", and only when a limit is actually set.
+- checksum-verified (`page_checksum_verification=True`; added 2026-07-28): the crate is
+  built with parquet's `crc` feature — page CRCs are verified during decode on both the
+  local and S3 paths (both funnel through `decode_page`), so `True` *is* native behavior
+  (corrupt page → error from both readers, parity-of-error pinned by a flip-one-byte
+  test). The feature is compile-time with no off-switch, so an explicit `False` — the
+  opt-out for reading despite corrupt checksums — still falls back to PyArrow. Unset →
+  native, which now rejects corrupt pages pyarrow would silently return (divergence only
+  on corrupt data, in the safe direction).
+- schema-shaped (`binary_type` / `list_type`; added 2026-07-28): admitted natively when a
+  unified dataset schema is pinned — which the V2 pipeline always does. Empirical
+  finding: the pin (inferred via kwarg-blind `pq.read_schema`) is the output-type
+  authority, and the base reader's pinned-schema cast **silently undoes** these kwargs,
+  so parity is just "output the pinned schema", which the alignment's drift casts already
+  guarantee. Without a pin they genuinely change output types (`binary`→`large_binary`,
+  `string`→`large_string`, `list`→`large_list` on files lacking an embedded arrow
+  schema) → fallback.
 - everything else blocks → whole-read PyArrow fallback (with a debug log naming the keys):
-  decryption (pyarrow's `FileDecryptionProperties` is opaque — keys can't be bridged; see
-  TODO.md #1), `page_checksum_verification` (crate `crc` feature exists but is compile-time
-  always-on; TODO.md #3), nested option bags (`read_options`,
-  `default_fragment_scan_options`), and pyarrow 21+'s schema-shaping `binary_type` / `list_type` /
-  `arrow_extensions_enabled` (latent silent-divergence bug fixed by the audit — though note
-  `binary_type` is inert on files with an embedded arrow schema, which Ray-written files have;
-  plannable via alignment casts if ever needed, TODO.md #5).
+  decryption (pyarrow's `FileDecryptionProperties` is opaque — keys can't be bridged;
+  DECIDED: keep fallback, see TODO.md #1), an explicit `page_checksum_verification=False`,
+  nested option bags (`read_options`, `default_fragment_scan_options`), and
+  `arrow_extensions_enabled` (TODO.md #5).
+
+**Second base-V2 bug found & FIXED (2026-07-28, while wiring the crc gate):** the base
+reader's `_arrow_scanner_kwargs` passed a hardcoded `ParquetFragmentScanOptions` to the
+scanner — which REPLACES the format's `default_fragment_scan_options` wholesale — so every
+scan-level option a user set via `dataset_kwargs` (`page_checksum_verification`, their own
+`pre_buffer`/`buffer_size`/`cache_options`, scan-time decryption) was silently dropped on
+the base path (footer-time options like the thrift limits survived, because fragment
+creation still uses the format). Discovered because the CRC parity-of-error test refused
+to pass: the corrupt file raised natively but the base reader read it happily. Fix:
+user-set scan-option keys (`_FRAGMENT_SCAN_OPTION_KEYS`) are merged over Ray's tuned
+defaults. This also makes the perf-only kwargs (`pre_buffer` etc.) actually honored by
+the base V2 reader for the first time.
 
 Pinned by `test_perf_only_format_kwargs_stay_native` (native + parity) and
 `test_unsupported_format_kwarg_falls_back` (generous thrift limit → fallback + equality; tiny

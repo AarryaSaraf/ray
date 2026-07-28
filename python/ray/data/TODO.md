@@ -7,50 +7,32 @@ Statuses: **next** (agreed, do it), **decision-needed** (blocked on an API/scope
 
 ## Format-kwarg gaps (from the 2026-07-28 audit — currently PyArrow-fallback)
 
-### 1. Native decryption (`decryption_properties`, `decryption_config`) — decision-needed
-The Rust `parquet` crate (v59, `encryption` feature, via `ring`) fully supports read-side
-Parquet modular encryption: `FileDecryptionProperties::builder().with_footer_key(...)
-.with_column_key(...)`, plugged into both sync and async arrow readers. The crate half is
-straightforward.
+### 1. Native decryption (`decryption_properties`, `decryption_config`) — DECIDED 2026-07-28: keep the fallback
+The Rust `parquet` crate (v59, `encryption` feature) fully supports read-side decryption,
+but pyarrow's `FileDecryptionProperties` is an opaque Cython object (zero public attrs —
+keys cannot be extracted) and `decryption_config` is a live KMS callback flow inside
+Arrow C++, so config-faithful bridging is impossible. Decision: encrypted files keep the
+PyArrow fallback (correct, just no memory win). Revive trigger: a real encrypted-parquet
+user — then design a Ray-side key channel (`arrow_rs_decryption_keys` via
+`dataset_kwargs` + a KMS-unwrap hook) with a security review (raw keys would ride task
+args).
 
-**Blocker:** pyarrow's `FileDecryptionProperties` is an opaque Cython object — `dir()`
-shows zero public attributes, so the keys a user hands to `read_parquet` **cannot be
-extracted** and re-passed to the crate. `decryption_config` is worse: it's a live KMS
-flow (`CryptoFactory` + user `KmsClient` callbacks) that unwraps keys inside Arrow C++.
-Config-faithful bridging (the standard we held for S3 creds) is impossible here.
-
-Options:
-- (a) Keep the fallback (today's state): encrypted files read correctly via PyArrow,
-  they just don't get the memory win. Zero new API.
-- (b) Add a Ray-side key channel (e.g. `arrow_rs_decryption_keys={"footer": b"...",
-  "columns": {...}}` via `dataset_kwargs`): native decrypt works, but it's a NEW API
-  that diverges from pyarrow's, and raw keys ride task args (pyarrow's object at least
-  keeps them opaque). Security review needed before building this.
-- Recommendation: (a) until a real encrypted-parquet user shows up; revisit with (b) + a
-  KMS-unwrap hook then.
-
-### 2. Thrift footer limits (`thrift_string_size_limit`, `thrift_container_size_limit`) — DONE 2026-07-28
-Implemented natively rather than fall back. These limits only affect *metadata
-deserialization* (accept vs reject the footer), never decoded bytes. When they're set,
-the planned native read does a metadata-only footer probe through
-`pq.ParquetFile(f, **limits)` per file (`_verify_footer_limits`) — the exact same C++
-thrift parser the scanner would use, so accept/reject behavior (and the raised
-`OSError`) is identical by construction — then decodes natively. Cost: one footer read
-per file, only when the limits are actually set. Deliberately relaxes "pyarrow never
-opens a supported file" for this one kwarg (probe is metadata-only; decode stays
-native). Pinned by `test_thrift_limits_native_parity`.
-
-### 3. `page_checksum_verification` — feasible, small caveats
-The `parquet` crate has a `crc` feature (crc32fast) that verifies page checksums during
-decode. Caveats found reading parquet-59.1.0 source: (a) it's **compile-time** — once the
-feature is on, the sync reader always verifies (no runtime toggle), so
-`page_checksum_verification=False` (the pyarrow default) would still verify natively —
-stricter, diverging only on corrupt files that pyarrow would happily read; (b) the
-`#[cfg(feature = "crc")]` sites checked live in the *sync* `serialized_reader.rs` — the
-async (S3) path's coverage must be verified before claiming parity. Plan: enable the
-feature, keep `page_checksum_verification=True` native (semantics match), decide whether
-always-verify-under-False is acceptable (probably yes — it only rejects corrupt data) or
-keep False→fallback out of caution.
+### 3. `page_checksum_verification` — DONE 2026-07-28
+Crate rebuilt with parquet's `crc` feature: page CRCs are now verified during decode on
+BOTH the sync/local and async/S3 paths (both funnel through `decode_page` in
+`serialized_reader.rs`; verified by corrupt-page test). The feature is compile-time
+(no runtime off-switch), so the gate is value-sensitive: `True` → native (semantics
+match, corrupt page raises from both readers — parity-of-error), explicit `False` →
+PyArrow fallback (the opt-out for reading *despite* corrupt checksums, which only
+PyArrow can honor). Unset → native, which now verifies where pyarrow wouldn't —
+divergence only on corrupt data, in the safe direction (reject instead of returning
+garbage). Pyarrow doesn't write page CRCs by default, so most files are unaffected.
+Pinned by `test_page_checksum_verification_true_native` / `_false_falls_back`.
+**Found & fixed a base-V2 bug along the way** (`_arrow_scanner_kwargs`): the reader's
+hardcoded `ParquetFragmentScanOptions` REPLACED the format's scan options wholesale,
+silently dropping every scan-level `dataset_kwargs` option (`page_checksum_verification`,
+user `pre_buffer`/`buffer_size`/`cache_options`, scan-time decryption). User values are
+now merged over Ray's tuned defaults (`_FRAGMENT_SCAN_OPTION_KEYS`).
 
 ### 4. Option bags (`read_options`, `default_fragment_scan_options`) — deferred
 Opaque pyarrow objects that can carry any of the other options inside them, so the
@@ -58,16 +40,22 @@ allowlist can't inspect what they'd change. Introspecting them is fragile
 (version-dependent attribute sets). Stay on fallback; revive only if a real workload
 passes them.
 
-### 5. Schema-shaping kwargs (`binary_type`, `list_type`, `arrow_extensions_enabled`) — partially easy
-- `binary_type` / `list_type` (pyarrow 21+): map cleanly onto the existing
-  `_ColumnAlignment` cast machinery (e.g. `binary` → `large_binary` is a safe cast).
-  One precedence trap to mirror exactly: when a file embeds an arrow schema (all
-  Ray-written files do), pyarrow **ignores** these kwargs — the alignment must apply
-  them only when the file lacks an embedded schema, or it would diverge in the
-  opposite direction. Moderate effort, test-heavy.
+### 5. Schema-shaping kwargs (`binary_type`, `list_type`, `arrow_extensions_enabled`) — binary/list DONE 2026-07-28
+- `binary_type` / `list_type`: implemented for the pinned-schema case (the only case
+  the V2 pipeline produces). Empirical finding that made it trivial: the pinned unified
+  schema — inferred by the listing via `pq.read_schema`, which is blind to these kwargs —
+  is the output-type authority, and the base reader's pinned-schema cast **silently
+  undoes** the kwargs (pyarrow 24, verified). So parity = "output the pinned schema",
+  which the alignment's existing drift casts already guarantee → the kwargs are simply
+  admitted when `self._file_dataset_schema is not None`, zero new cast machinery.
+  Without a pinned schema they genuinely change output types (`binary`→`large_binary`,
+  `string`→`large_string`, `list`→`large_list` on no-embedded-schema files) → still
+  fallback. Pinned by `test_schema_shaped_kwargs_native_with_pinned_schema` /
+  `_fall_back_without_schema`.
 - `arrow_extensions_enabled`: changes whether canonical extension types are
   reconstructed at all — interacts with the extension-metadata passthrough the crate
-  already does. Deferred until someone needs it.
+  already does. Deferred until someone needs it (now the fallback exemplar in
+  `test_unsupported_format_kwarg_falls_back`).
 
 ## Migration phases (from the 6-phase plan)
 

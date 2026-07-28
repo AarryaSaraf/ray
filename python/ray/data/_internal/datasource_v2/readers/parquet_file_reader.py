@@ -67,6 +67,26 @@ ARROW_RS_TUNING_KWARGS = frozenset(
 )
 _ARROW_RS_KWARG_PREFIX = "arrow_rs_"
 
+# ``pds.ParquetFileFormat`` kwargs that only apply at SCAN time, i.e. the
+# constructor keys of ``pds.ParquetFragmentScanOptions`` (pyarrow 24). The
+# format stores them as ``default_fragment_scan_options``, but the scanner
+# call in ``_arrow_scanner_kwargs`` passes its own ``fragment_scan_options``
+# — which REPLACES the format's defaults wholesale — so any of these the
+# user set via ``dataset_kwargs`` must be re-applied there or they are
+# silently dropped at scan time.
+_FRAGMENT_SCAN_OPTION_KEYS = (
+    "use_buffered_stream",
+    "buffer_size",
+    "pre_buffer",
+    "cache_options",
+    "thrift_string_size_limit",
+    "thrift_container_size_limit",
+    "decryption_config",
+    "decryption_properties",
+    "page_checksum_verification",
+    "arrow_extensions_enabled",
+)
+
 
 def _estimate_batch_size_from_metadata(
     fragment: pds.ParquetFileFragment,
@@ -579,11 +599,27 @@ class ParquetFileReader(FileReader):
         # measure its memory cost: with it on, the whole fragment's compressed
         # column chunks are held in memory alongside the decoded output; with it
         # off, they are streamed. The same env knob drives the iter_batches path.
+        #
+        # Passing ``fragment_scan_options`` to the scanner REPLACES the
+        # format's ``default_fragment_scan_options`` wholesale — so any
+        # scan-level option the user set via ``dataset_kwargs`` (it lands in
+        # ``ParquetFileFormat`` but only applies at scan time) must be
+        # re-applied on top of Ray's tuned defaults here, or it is silently
+        # dropped (this happened to e.g. ``page_checksum_verification=True``
+        # and a user-set ``pre_buffer``/``buffer_size`` before 2026-07-28).
+        # User-set values win over Ray's defaults for the keys they set.
+        scan_option_kwargs: Dict[str, Any] = {
+            "use_buffered_stream": True,
+            "buffer_size": _PARQUET_FRAGMENT_BUFFER_SIZE,
+            "pre_buffer": env_bool("RAY_DATA_PARQUET_PRE_BUFFER", True),
+        }
+        for key in _FRAGMENT_SCAN_OPTION_KEYS:
+            value = self._parquet_format_kwargs.get(key)
+            if value is not None:
+                scan_option_kwargs[key] = value
         kwargs: dict = {
             "fragment_scan_options": pds.ParquetFragmentScanOptions(
-                use_buffered_stream=True,
-                buffer_size=_PARQUET_FRAGMENT_BUFFER_SIZE,
-                pre_buffer=env_bool("RAY_DATA_PARQUET_PRE_BUFFER", True),
+                **scan_option_kwargs
             ),
             # How many fragments pyarrow scans ahead. Only bites when a read task
             # spans multiple fragments; 1 keeps the in-flight set to the current
