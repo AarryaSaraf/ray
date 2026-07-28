@@ -14,6 +14,10 @@ is only directional on macOS because USS excludes shared pages). Those are:
                   Shows the scanner's per-task working set tier above iter/arrow-rs
   mixed    — #9  5 files, each a different native schema (narrow ints ... fat
                   strings) in one dataset — does the per-group byte budget adapt
+  correctness — the decoder-replacement corpus (corpus.py): every intake type +
+                  edge case (INT96 hints, dotted names, schema evolution,
+                  encodings, tensors, pickle) differentially compared pyarrow vs
+                  arrow-rs, with golden rows and per-scenario USS graphs
 
 Concurrency (#7) and authoritative memory are deferred to the Linux/S3 box.
 
@@ -476,7 +480,12 @@ def axis_layout():
                     )
                 )
                 _report(
-                    f"layout {name} {reader} ({mode})", wall, peak, incr, nat, fb,
+                    f"layout {name} {reader} ({mode})",
+                    wall,
+                    peak,
+                    incr,
+                    nat,
+                    fb,
                     extra={
                         "rows": rows,
                         "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
@@ -721,7 +730,12 @@ def axis_leak_multigrp():
                 )
             )
             _report(
-                f"leakmg {chunk_mode} {reader} pb={pb}", t1 - t0, peak, incr, nat, fb,
+                f"leakmg {chunk_mode} {reader} pb={pb}",
+                t1 - t0,
+                peak,
+                incr,
+                nat,
+                fb,
                 extra={
                     "rows": rows,
                     "grown": f"{wk['n_grown']}/{wk['n_workers']}",
@@ -767,15 +781,50 @@ def axis_reader_settings():
     # (reader, setting-label, extra worker env, arrow_rs budget MB or None)
     configs = [
         ("pyarrow", "scanner_default", {}, None),
-        ("pyarrow", "batch_readahead=1", {"RAY_DATA_ARROW_SCANNER_BATCH_READAHEAD": 1}, None),  # noqa: E501
-        ("pyarrow", "batch_readahead=2", {"RAY_DATA_ARROW_SCANNER_BATCH_READAHEAD": 2}, None),  # noqa: E501
-        ("pyarrow", "batch_readahead=32", {"RAY_DATA_ARROW_SCANNER_BATCH_READAHEAD": 32}, None),  # noqa: E501
+        (
+            "pyarrow",
+            "batch_readahead=1",
+            {"RAY_DATA_ARROW_SCANNER_BATCH_READAHEAD": 1},
+            None,
+        ),  # noqa: E501
+        (
+            "pyarrow",
+            "batch_readahead=2",
+            {"RAY_DATA_ARROW_SCANNER_BATCH_READAHEAD": 2},
+            None,
+        ),  # noqa: E501
+        (
+            "pyarrow",
+            "batch_readahead=32",
+            {"RAY_DATA_ARROW_SCANNER_BATCH_READAHEAD": 32},
+            None,
+        ),  # noqa: E501
         ("pyarrow", "pre_buffer=off", {"RAY_DATA_PARQUET_PRE_BUFFER": 0}, None),
-        ("pyarrow", "buffer_size=1MB", {"RAY_DATA_PARQUET_FRAGMENT_BUFFER_SIZE": 1 * MB}, None),  # noqa: E501
-        ("pyarrow", "buffer_size=64MB", {"RAY_DATA_PARQUET_FRAGMENT_BUFFER_SIZE": 64 * MB}, None),  # noqa: E501
+        (
+            "pyarrow",
+            "buffer_size=1MB",
+            {"RAY_DATA_PARQUET_FRAGMENT_BUFFER_SIZE": 1 * MB},
+            None,
+        ),  # noqa: E501
+        (
+            "pyarrow",
+            "buffer_size=64MB",
+            {"RAY_DATA_PARQUET_FRAGMENT_BUFFER_SIZE": 64 * MB},
+            None,
+        ),  # noqa: E501
         ("pyarrow_iter", "iter_default", {}, None),
-        ("pyarrow_iter", "iter_pre_buffer=on", {"RAY_DATA_PARQUET_PRE_BUFFER": 1}, None),
-        ("pyarrow_iter", "iter_use_threads=on", {"RAY_DATA_PARQUET_ITER_USE_THREADS": 1}, None),  # noqa: E501
+        (
+            "pyarrow_iter",
+            "iter_pre_buffer=on",
+            {"RAY_DATA_PARQUET_PRE_BUFFER": 1},
+            None,
+        ),
+        (
+            "pyarrow_iter",
+            "iter_use_threads=on",
+            {"RAY_DATA_PARQUET_ITER_USE_THREADS": 1},
+            None,
+        ),  # noqa: E501
         ("arrow_rs", "budget=2MB", {}, 2),
         ("arrow_rs", "budget=8MB", {}, 8),
         ("arrow_rs", "budget=32MB", {}, 32),
@@ -821,7 +870,12 @@ def axis_reader_settings():
             )
         )
         _report(
-            f"rknob {reader} {setting}", t1 - t0, peak, incr, nat, fb,
+            f"rknob {reader} {setting}",
+            t1 - t0,
+            peak,
+            incr,
+            nat,
+            fb,
             extra={"rows": rows, "max task": f"{wk['max_worker_incr_mb']:.0f} MB"},
         )
     json.dump(
@@ -912,7 +966,12 @@ def axis_leak_rgsize():
                 )
             )
             _report(
-                f"leakrg {geom} {reader}", t1 - t0, peak, incr, nat, fb,
+                f"leakrg {geom} {reader}",
+                t1 - t0,
+                peak,
+                incr,
+                nat,
+                fb,
                 extra={
                     "rows": rows,
                     "grown": f"{wk['n_grown']}/{wk['n_workers']}",
@@ -967,7 +1026,12 @@ def axis_mixed():
             )
         )
         _report(
-            f"mixed {reader}", wall, peak, incr, nat, fb,
+            f"mixed {reader}",
+            wall,
+            peak,
+            incr,
+            nat,
+            fb,
             extra={
                 "rows": rows,
                 "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
@@ -975,6 +1039,154 @@ def axis_mixed():
             },
         )
     json.dump(results, open(os.path.join(OUT, "results_mixed.json"), "w"), indent=2)
+    return results
+
+
+def axis_correctness():
+    """Decoder-replacement correctness: the corpus.py edge-case corpus (every
+    scalar type, deep nesting, dotted-name ambiguity, INT96 ± embedded non-ns
+    hint, dictionary/delta/BSS encodings, ~200 row groups incl. zero-row,
+    schema evolution under hive dirs, mixed-shape tensors, pickled objects)
+    read through a scenario list with BOTH readers and compared value-by-value.
+
+    Three verification layers per scenario:
+      * differential — pyarrow vs arrow_rs payloads (count, schema string, and
+        every row normalized via corpus.norm, sorted by the corpus-wide unique
+        ``id``) must match; when both error, the error CLASS must match.
+      * golden — scenarios flagged ``golden`` also compare the read rows
+        against golden.json (recomputed from the deterministic builders), so a
+        bug shared by BOTH readers is still caught.
+      * stability — corpus.STABILITY_PAIRS: e.g. hive_chunked (one row group
+        per read task) must reproduce hive_full byte-for-byte per reader
+        (chunker row-offset / row_hash bookkeeping).
+
+    Every scenario × reader runs in its own ``corr__<scenario>__<reader>`` run
+    dir, so the standard artifacts (uss_*.csv, tasks_*.csv, path_*.log,
+    meta.json) land there and task_mem.py renders the per-task USS-over-time
+    figure for each scenario with no new plotting code; wall/peak rows flow
+    into summary.csv like every other axis. Subset with
+    ``RAY_DATA_CORR_SCENARIOS=name1,name2``.
+    """
+    import corpus as cx
+
+    print("  building/refreshing corpus + golden.json ...")
+    _, golden = cx.build_corpus()
+    only = os.environ.get("RAY_DATA_CORR_SCENARIOS")
+    scenarios = [s for s in cx.SCENARIOS if not only or s["name"] in only.split(",")]
+    readers = ["pyarrow", "arrow_rs"]
+    payloads = {}
+    results = []
+    for sc in scenarios:
+        for reader in readers:
+            d = _run_dir(f"corr__{sc['name']}__{reader}")
+            ctx = _fresh_session(reader, d, extra_env=sc.get("extra_env"))
+            _warm(reader, d)
+            path = cx.scenario_path(sc)
+            _note_fixture(d, path)
+            if sc.get("chunk_per_group"):
+                # one row group per read task — the chunked-stability variant
+                ctx.parquet_chunker_target_chunk_size = 0
+            t0 = time.time()
+            payload = cx.run_scenario(sc, path)
+            t1 = time.time()
+            ray.shutdown()
+            time.sleep(0.3)
+            payloads[(sc["name"], reader)] = payload
+            peak = _node_sum_peak_mb(d, t0, t1)
+            incr = _node_sum_incr_peak_mb(d, t0, t1)
+            nat, fb = _count_paths(d)
+            wk = _worker_breakdown(d, t0, t1)
+            row = {
+                "config": sc["name"],
+                "scenario": sc["name"],
+                "reader": reader,
+                "wall_s": t1 - t0,
+                "t0": t0,
+                "t1": t1,
+                "count": payload.get("count"),
+                "error": payload.get("error"),
+                "node_sum_peak_mb": peak,
+                "node_sum_incr_mb": incr,
+                "native": nat,
+                "fallback": fb,
+                "workers": wk,
+            }
+            if sc.get("expect_error"):
+                err = payload.get("error") or ""
+                row["expected_error_hit"] = sc["expect_error"].lower() in err.lower()
+            results.append(_R(d, row))
+            _report(
+                f"corr {sc['name']} {reader}",
+                t1 - t0,
+                peak,
+                incr,
+                nat,
+                fb,
+                extra={
+                    "rows": payload.get("count"),
+                    "error": payload.get("error") or "-",
+                    "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
+                    f"(max task {wk['max_worker_incr_mb']:.0f} MB)",
+                },
+            )
+    # Cross-reader parity + golden per scenario (filled onto both result rows,
+    # mirroring axis_schema's post-hoc parity fill).
+    for sc in scenarios:
+        a = payloads.get((sc["name"], "pyarrow"))
+        b = payloads.get((sc["name"], "arrow_rs"))
+        if a is None or b is None:
+            continue
+        verdict, detail = cx.compare_payloads(a, b)
+        gold = {}
+        if sc.get("golden"):
+            for reader, p in (("pyarrow", a), ("arrow_rs", b)):
+                if "rows" in p:
+                    nch, bad = cx.check_golden(p["rows"], golden)
+                    gold[reader] = {"checked": nch, "bad": bad[:5], "ok": not bad}
+        for r in results:
+            if r["scenario"] != sc["name"]:
+                continue
+            r["parity"] = verdict
+            if detail:
+                r["parity_detail"] = detail[:400]
+            g = gold.get(r["reader"])
+            if g is not None:
+                r["golden_ok"] = g["ok"]
+                r["golden_checked"] = g["checked"]
+                if g["bad"]:
+                    r["golden_bad"] = g["bad"]
+        print(
+            f"  PARITY {sc['name']}: {verdict}"
+            + (f"  ({detail[:200]})" if detail else "")
+        )
+        for reader, g in gold.items():
+            print(
+                f"  GOLDEN {sc['name']} {reader}: "
+                f"{'OK' if g['ok'] else 'FAIL'} ({g['checked']} values)"
+                + (f" first bad: {g['bad'][0]}" if g["bad"] else "")
+            )
+    # Within-reader stability pairs (chunked read must equal whole read).
+    scen_names = {s["name"] for s in scenarios}
+    for a_name, b_name in cx.STABILITY_PAIRS:
+        if a_name not in scen_names or b_name not in scen_names:
+            continue
+        for reader in readers:
+            pa_, pb_ = payloads.get((a_name, reader)), payloads.get((b_name, reader))
+            if pa_ is None or pb_ is None:
+                continue
+            verdict, detail = cx.compare_payloads(pa_, pb_)
+            for r in results:
+                if r["scenario"] == b_name and r["reader"] == reader:
+                    r[f"stable_vs_{a_name}"] = verdict
+                    if detail:
+                        r["stability_detail"] = detail[:200]
+            print(
+                f"  STABILITY {reader} {b_name} vs {a_name}: {verdict}"
+                + (f" ({detail[:150]})" if detail else "")
+            )
+    json.dump(
+        results, open(os.path.join(OUT, "results_correctness.json"), "w"), indent=2
+    )
     return results
 
 
@@ -1117,9 +1329,13 @@ def _report(label, wall, peak=None, incr=None, native=None, fallback=None, extra
     print(f"\n===== {label} =====")
     print(f"wall           : {wall:6.3f}s")
     if peak is not None:
-        print(f"node-sum peak  : {peak:7.0f} MB   (absolute -- OOM killer / summary.csv)")
+        print(
+            f"node-sum peak  : {peak:7.0f} MB   (absolute -- OOM killer / summary.csv)"
+        )
     if incr is not None:
-        print(f"node-sum incr  : {incr:7.0f} MB   (read-caused delta -- diagnostic only)")
+        print(
+            f"node-sum incr  : {incr:7.0f} MB   (read-caused delta -- diagnostic only)"
+        )
     if native or fallback:
         n, fb = native or 0, fallback or 0
         verdict = "ARROW-RS" if n and not fb else "MIXED/FALLBACK"
@@ -1229,7 +1445,9 @@ def axis_closure():
                 label = f"closure__{rows}__{reader}__{mode}"
                 d = _run_dir(label)
                 ctx = _fresh_session(reader, d)  # default budget 8 MB
-                ctx.target_max_block_size = SMALL_BLOCK  # expose W_decode (see docstring)
+                ctx.target_max_block_size = (
+                    SMALL_BLOCK  # expose W_decode (see docstring)
+                )
                 _warm(reader, d)
                 _note_fixture(d, path)
                 t0 = time.time()
@@ -1267,7 +1485,11 @@ def axis_closure():
                 )
                 _report(
                     f"closure {rows // 1_000_000}M {reader} ({mode})",
-                    wall, peak, incr, nat, fb,
+                    wall,
+                    peak,
+                    incr,
+                    nat,
+                    fb,
                     extra={
                         "decoded": f"{rows * BYTES_PER_ROW / MB:.0f} MB",
                         "max task": f"{wk['max_worker_incr_mb']:.0f} MB "
@@ -1327,7 +1549,12 @@ def axis_terms():
     # --- A. S_out: sweep the output-block cap on a FIXED fixture (W_decode constant) ---
     fixed = fx.make_fixture(
         "terms_fixed_2M",
-        {"rows": 2_000_000, "num_files": 1, "row_group_size": 2_000_000, "schema": "int"},
+        {
+            "rows": 2_000_000,
+            "num_files": 1,
+            "row_group_size": 2_000_000,
+            "schema": "int",
+        },
     )
     print("\n--- A. S_out: arrow-rs, fixed 2M fixture, sweep output-block cap ---")
     A = []
@@ -1335,15 +1562,21 @@ def axis_terms():
         val = _incr("arrow_rs", fixed, blk)
         A.append((blk, val))
         results.append(
-            {"part": "S_out", "reader": "arrow_rs", "block_mb": blk,
-             "max_worker_incr_mb": val}
+            {
+                "part": "S_out",
+                "reader": "arrow_rs",
+                "block_mb": blk,
+                "max_worker_incr_mb": val,
+            }
         )
         print(f"  block cap = {blk:>4} MiB  ->  USS incr = {val:6.1f} MB")
     if len(A) >= 2:
         m, b = np.polyfit([x for x, _ in A], [y for _, y in A], 1)
-        print(f"  => slope = {m:.2f} MB USS per MB block  "
-              f"({'linear in S_out ✓' if 0.5 <= m <= 3 else 'NONLINEAR ✗'}; "
-              f"coefficient ≈ in-flight blocks)")
+        print(
+            f"  => slope = {m:.2f} MB USS per MB block  "
+            f"({'linear in S_out ✓' if 0.5 <= m <= 3 else 'NONLINEAR ✗'}; "
+            f"coefficient ≈ in-flight blocks)"
+        )
 
     # --- B. S_in: pyarrow, pre_buffer ON vs OFF, sweep rows (block pinned 8 MiB) ---
     env_rows = os.environ.get("RAY_DATA_CLOSURE_ROWS_M")
@@ -1364,20 +1597,29 @@ def axis_terms():
             val = _incr("pyarrow", path, 8, pre_buffer=pb)
             pts.append((decoded, val))
             results.append(
-                {"part": "S_in", "reader": "pyarrow", "pre_buffer": pb,
-                 "decoded_mb": round(decoded, 1), "max_worker_incr_mb": val}
+                {
+                    "part": "S_in",
+                    "reader": "pyarrow",
+                    "pre_buffer": pb,
+                    "decoded_mb": round(decoded, 1),
+                    "max_worker_incr_mb": val,
+                }
             )
-            print(f"  pre_buffer={str(pb):5} decoded={decoded:6.0f} MB  ->  "
-                  f"USS incr = {val:6.1f} MB")
+            print(
+                f"  pre_buffer={str(pb):5} decoded={decoded:6.0f} MB  ->  "
+                f"USS incr = {val:6.1f} MB"
+            )
         if len(pts) >= 2:
             m, b = np.polyfit([x for x, _ in pts], [y for _, y in pts], 1)
             slopes[pb] = m
             print(f"  => pre_buffer={str(pb):5}: slope = {m:.3f} MB USS / MB decoded")
     if True in slopes and False in slopes:
         drop = slopes[True] - slopes[False]
-        print(f"\n  S_in coefficient = slope drop = {drop:.3f} (≈ compression ratio ⇒ "
-              f"S_in enters at unit coefficient); residual {slopes[False]:.3f} ≈ 1.0 = "
-              f"pure W_decode")
+        print(
+            f"\n  S_in coefficient = slope drop = {drop:.3f} (≈ compression ratio ⇒ "
+            f"S_in enters at unit coefficient); residual {slopes[False]:.3f} ≈ 1.0 = "
+            f"pure W_decode"
+        )
     json.dump(results, open(os.path.join(OUT, "results_terms.json"), "w"), indent=2)
     return results
 
@@ -1441,7 +1683,12 @@ def axis_concurrency():
                     )
                 )
                 _report(
-                    f"conc {fxname} {reader} cpu={ncpu}", t1 - t0, peak, incr, nat, fb,
+                    f"conc {fxname} {reader} cpu={ncpu}",
+                    t1 - t0,
+                    peak,
+                    incr,
+                    nat,
+                    fb,
                     extra={"rows": rows},
                 )
     json.dump(
@@ -1525,7 +1772,12 @@ def axis_showcase():
                 )
             )
             _report(
-                f"showcase {name} {reader}", t1 - t0, peak, incr, nat, fb,
+                f"showcase {name} {reader}",
+                t1 - t0,
+                peak,
+                incr,
+                nat,
+                fb,
                 extra={"rows": rows},
             )
     json.dump(results, open(os.path.join(OUT, "results_showcase.json"), "w"), indent=2)
@@ -1583,7 +1835,12 @@ def _run_sweep(name, levels, mode="iter_batches", num_cpus=4):
                 )
             )
             _report(
-                f"sweep[{name}] {lv['label']} {reader}", t1 - t0, peak, incr, nat, fb,
+                f"sweep[{name}] {lv['label']} {reader}",
+                t1 - t0,
+                peak,
+                incr,
+                nat,
+                fb,
                 extra={
                     "rows": rows,
                     "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
@@ -1810,7 +2067,12 @@ def axis_workloads():
             )
         )
         _report(
-            f"workload sum(i0) {reader}", t1 - t0, peak, incr, nat, fb,
+            f"workload sum(i0) {reader}",
+            t1 - t0,
+            peak,
+            incr,
+            nat,
+            fb,
             extra={
                 "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
                 f"(max task {wk['max_worker_incr_mb']:.0f} MB)",
@@ -1852,7 +2114,12 @@ def axis_workloads():
             )
         )
         _report(
-            f"workload filter(i0>hi) {reader}", t1 - t0, peak, incr, nat, fb,
+            f"workload filter(i0>hi) {reader}",
+            t1 - t0,
+            peak,
+            incr,
+            nat,
+            fb,
             extra={
                 "kept rows": kept,
                 "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
@@ -1923,7 +2190,12 @@ def axis_kfan():
             )
         )
         _report(
-            f"kfan K={k} {reader}", t1 - t0, peak, incr, nat, fb,
+            f"kfan K={k} {reader}",
+            t1 - t0,
+            peak,
+            incr,
+            nat,
+            fb,
             extra={
                 "rows": rows,
                 "workers": f"{wk['n_grown']}/{wk['n_workers']} grown  "
@@ -2081,7 +2353,12 @@ def axis_s3():
             )
         )
         _report(
-            f"s3 {tag}", t1 - t0, peak, incr, nat, fb,
+            f"s3 {tag}",
+            t1 - t0,
+            peak,
+            incr,
+            nat,
+            fb,
             extra={"rows": rows},
         )
     json.dump(results, open(os.path.join(OUT, "results_s3.json"), "w"), indent=2)
@@ -2189,7 +2466,12 @@ def axis_s3_geom():
                     )
                 )
                 _report(
-                    f"s3geom {name} {reader}", t1 - t0, peak, incr, nat, fb,
+                    f"s3geom {name} {reader}",
+                    t1 - t0,
+                    peak,
+                    incr,
+                    nat,
+                    fb,
                     extra={"rows": rows},
                 )
     finally:
@@ -2199,6 +2481,7 @@ def axis_s3_geom():
 
 
 AXES = {
+    "correctness": axis_correctness,
     "layout": axis_layout,
     "schema": axis_schema,
     "tuning": axis_tuning,

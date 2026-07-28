@@ -116,8 +116,11 @@ else
 fi
 
 # --- 5. harness Python deps ---
-say "installing harness deps (psutil, matplotlib, numpy)"
-PIP psutil matplotlib numpy
+# aiohttp: NOT pulled in by the ray[data] extra, but the runtime-env agent imports
+# it; without it the agent crashes and the raylet fate-shares (`ray start` hangs
+# indefinitely) — cost a day on the 2026-07-27 workspace run.
+say "installing harness deps (psutil, matplotlib, numpy, aiohttp)"
+PIP psutil matplotlib numpy aiohttp
 
 # --- 6. verify the arrow-rs path actually engages ---
 say "verifying arrow-rs read path end to end"
@@ -149,3 +152,5 @@ say "DONE. Activate with:  source $RAY_VENV/bin/activate"
 echo "Then, from $SCRIPT_DIR, run the suite with a private local cluster:"
 echo "  export RAY_ADDRESS=local"
 echo "  python bench_suite.py leak_rgsize && python summarize.py"
+echo "If workers SIGSEGV in the core task-event aggregator (seen on 2026-07 master),"
+echo "set RAY_task_events_report_interval_ms=0 as a workaround."

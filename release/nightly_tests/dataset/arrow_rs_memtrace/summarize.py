@@ -54,6 +54,64 @@ def _load(axis):
     return json.load(open(p)) if os.path.exists(p) else None
 
 
+def table_correctness(rows):
+    """Scenario × reader digest of the decoder-replacement correctness axis:
+    parity verdict (pyarrow vs arrow-rs, value-level), golden-row check,
+    chunked-read stability, decode path taken, wall, and peak USS. Mismatch
+    details print below the table so a FAIL is immediately actionable."""
+    print("\n## CORRECTNESS (differential + golden, corpus.py scenarios)")
+    by = {}
+    for r in rows:
+        by.setdefault(r["scenario"], {})[r["reader"]] = r
+    print(
+        f"{'scenario':20s} {'parity':7s} {'golden':7s} {'stable':7s} "
+        f"{'path(rs)':14s} {'pa_wall':>8s} {'rs_wall':>8s} {'rs_peakMB':>9s}"
+    )
+    n_ok = 0
+    details = []
+    for name, d in by.items():
+        rs = d.get("arrow_rs", {})
+        pa_ = d.get("pyarrow", {})
+        parity = rs.get("parity", pa_.get("parity", "?"))
+        golden = rs.get("golden_ok")
+        golden_s = "-" if golden is None else ("OK" if golden else "FAIL")
+        stable = next((v for k, v in rs.items() if k.startswith("stable_vs_")), None)
+        stable_s = "-" if stable is None else stable
+        nat, fb = rs.get("native", 0) or 0, rs.get("fallback", 0) or 0
+        path_s = (
+            "native"
+            if nat and not fb
+            else "fallback"
+            if fb and not nat
+            else f"mix({nat}/{fb})"
+            if (nat or fb)
+            else "-"
+        )
+        exp_hit = rs.get("expected_error_hit")
+        if exp_hit is not None:
+            path_s = f"err_gate:{'OK' if exp_hit else 'MISS'}"
+        ok = parity == "OK" and golden is not False and stable in (None, "OK")
+        n_ok += ok
+        flag = "" if ok else "  <-- CHECK"
+        print(
+            f"{name:20s} {parity:7s} {golden_s:7s} {stable_s:7s} {path_s:14s} "
+            f"{pa_.get('wall_s', 0):8.3f} {rs.get('wall_s', 0):8.3f} "
+            f"{rs.get('node_sum_peak_mb', 0):9.0f}{flag}"
+        )
+        for r in (rs, pa_):
+            for k in ("parity_detail", "golden_bad", "stability_detail", "error"):
+                if r.get(k):
+                    details.append(f"  {name} [{r['reader']}] {k}: {r[k]}")
+    print(f"scenarios clean: {n_ok}/{len(by)}")
+    if details:
+        print("\n  -- details --")
+        seen = set()
+        for line in details:
+            if line not in seen:
+                seen.add(line)
+                print(line)
+
+
 def table_layout(rows):
     print("\n## LAYOUT (wall time, iter_batches)")
     by = {}
@@ -1141,6 +1199,7 @@ def plot_s3():
 
 def _run():
     for axis, fn in [
+        ("correctness", table_correctness),
         ("layout", table_layout),
         ("schema", table_schema),
         ("tuning", table_tuning),
