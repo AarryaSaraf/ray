@@ -78,9 +78,11 @@ Prototype limitations (documented, not hidden)
   with no predicate (count-style scan) decodes nothing at all — footer row
   counts answer it (:class:`_NativeCountFragment`).
 - Still gated to PyArrow: non-local/S3 filesystems, Parquet-format kwargs
-  outside the native allowlist (anything not I/O-only and not reproduced by
-  the alignment — e.g. decryption, thrift limits, ``binary_type``; see
-  :meth:`ArrowRsParquetFileReader._blocking_format_kwargs`), extension-typed
+  outside the native allowlist (anything not I/O-only, not reproduced by the
+  alignment, and not footer-verified — e.g. decryption, ``binary_type``; see
+  :meth:`ArrowRsParquetFileReader._blocking_format_kwargs`; the thrift footer
+  limits stay native via a metadata-only pyarrow probe,
+  :meth:`_verify_footer_limits`), extension-typed
   schema drift, and tz-carrying / nested INT96 oddities. There is no per-type
   gate: every type Parquet can encode decodes byte-identically through the
   crate, and Arrow's in-memory-only types (``union``, ``list_view``, …) cannot
@@ -243,6 +245,15 @@ _FORMAT_KWARGS_PERF_ONLY = frozenset(
 # reproduces post-decode via ``_ColumnAlignment`` casts.
 _FORMAT_KWARGS_ALIGNED = frozenset(
     {"coerce_int96_timestamp_unit", "dictionary_columns"}
+)
+# Parquet-format kwargs the planned native read enforces via a metadata-only
+# pyarrow footer probe (:meth:`ArrowRsParquetFileReader._verify_footer_limits`):
+# the thrift limits only decide whether a file's *footer* is accepted or
+# rejected — they can never change decoded bytes — so running pyarrow's own
+# footer parse with the limits applied reproduces the accept/reject behavior
+# (and the raised ``OSError``) exactly, after which the decode stays native.
+_FORMAT_KWARGS_FOOTER_VERIFIED = frozenset(
+    {"thrift_string_size_limit", "thrift_container_size_limit"}
 )
 
 
@@ -625,10 +636,10 @@ class ArrowRsParquetFileReader(ParquetFileReader):
             return
 
         # Reader-wide ineligibility: unsupported filesystem, or a Parquet-format
-        # kwarg outside the native allowlist (anything not perf-only and not
-        # reproduced by the per-file :class:`_ColumnAlignment` — e.g. thrift
-        # limits, decryption, ``binary_type``) — use the base pyarrow read()
-        # unchanged, which honors every format kwarg.
+        # kwarg outside the native allowlist (anything not perf-only, not
+        # reproduced by the per-file :class:`_ColumnAlignment`, and not
+        # footer-verified — e.g. decryption, ``binary_type``) — use the base
+        # pyarrow read() unchanged, which honors every format kwarg.
         blocked = self._blocking_format_kwargs(aligned_ok=True)
         if not self._filesystem_supported() or blocked:
             if blocked:
@@ -651,6 +662,36 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         fragments_with_offsets, columns_to_synthesize, scanner_kwargs = plan
         triples = self._dispatch_fragment_reads(fragments_with_offsets, scanner_kwargs)
         yield from self._postprocess(triples, columns_to_synthesize)
+
+    def _verify_footer_limits(self, paths: List[str]) -> None:
+        """Enforce ``thrift_string_size_limit`` / ``thrift_container_size_limit``
+        on the planned native read with a metadata-only pyarrow footer parse.
+
+        The limits guard *footer deserialization* (accept vs reject a file's
+        metadata) and can never change decoded bytes, so running pyarrow's own
+        thrift parser with the limits applied reproduces the base path's
+        accept/reject behavior — and the exact ``OSError`` it raises — while
+        the data decode stays native. This is the one deliberate exception to
+        "pyarrow never opens a supported file": a footer-only read (a few KB),
+        and only when the user actually set a limit. A raised error is the
+        *correct* outcome, not a fallback trigger — the base path would raise
+        the same error, so we let it propagate."""
+        limits = {
+            key: self._parquet_format_kwargs[key]
+            for key in _FORMAT_KWARGS_FOOTER_VERIFIED
+            if self._parquet_format_kwargs.get(key) is not None
+        }
+        if not limits:
+            return
+        import pyarrow.parquet as pq
+        from pyarrow.fs import LocalFileSystem
+
+        fs = self._filesystem or LocalFileSystem()
+        for path in paths:
+            with fs.open_input_file(path) as source:
+                # Constructing ParquetFile parses the footer under the limits;
+                # a violation raises pyarrow's usual thrift OSError.
+                pq.ParquetFile(source, **limits)
 
     def _read_native_metadata(
         self, path: str
@@ -687,6 +728,13 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         )
 
         unique_paths = list(dict.fromkeys(list(manifest.paths)))
+
+        # Thrift footer limits, when set, decide whether each file is accepted
+        # or REJECTED — enforce them first with pyarrow's own parser so a
+        # too-large footer raises the identical OSError the base path would
+        # raise (parity-of-error), before any native work happens.
+        self._verify_footer_limits(unique_paths)
+
         native_md: Dict[str, Tuple[pa.Schema, List[int], List[str]]] = {}
         for path in unique_paths:
             md = self._read_native_metadata(path)
@@ -936,15 +984,20 @@ class ArrowRsParquetFileReader(ParquetFileReader):
           safely ignorable natively.
         - :data:`_FORMAT_KWARGS_ALIGNED` (``coerce_int96_timestamp_unit``,
           ``dictionary_columns``) are reproduced by the *planned* path via
-          :class:`_ColumnAlignment` (``aligned_ok=True``); the per-fragment
-          re-gate can't plan an alignment (see
-          :meth:`_reader_level_supported`), so there they block too
-          (``aligned_ok=False``).
+          :class:`_ColumnAlignment`, and
+          :data:`_FORMAT_KWARGS_FOOTER_VERIFIED` (the thrift limits) are
+          enforced by the planned path's pyarrow footer probe
+          (:meth:`_verify_footer_limits`) — both admitted only with
+          ``aligned_ok=True``. The per-fragment re-gate can plan neither an
+          alignment nor a probe (see :meth:`_reader_level_supported`), so
+          there they block (``aligned_ok=False``).
         - A ``None`` value means "pyarrow default" for every format kwarg, so
           ``None``-valued keys never block.
         """
         allowed = _FORMAT_KWARGS_PERF_ONLY | (
-            _FORMAT_KWARGS_ALIGNED if aligned_ok else frozenset()
+            (_FORMAT_KWARGS_ALIGNED | _FORMAT_KWARGS_FOOTER_VERIFIED)
+            if aligned_ok
+            else frozenset()
         )
         return {
             key: value

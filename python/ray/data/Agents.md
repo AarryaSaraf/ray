@@ -2081,12 +2081,20 @@ two and silently ignore the rest while the fallback honored them all. Now an exp
 - aligned (`coerce_int96_timestamp_unit`, `dictionary_columns`): reproduced per file by
   `_ColumnAlignment` on the planned path; still block the per-fragment re-gate (no crate footer to
   plan from).
+- footer-verified (`thrift_string_size_limit`, `thrift_container_size_limit`; added
+  2026-07-28 after the audit): the limits only decide whether a *footer* is accepted or
+  rejected, so the planned read enforces them with a metadata-only pyarrow footer probe
+  (`_verify_footer_limits` — same C++ thrift parser → identical accept/reject + identical
+  `OSError`), then decodes natively. The one deliberate exception to "pyarrow never opens a
+  supported file", and only when a limit is actually set.
 - everything else blocks → whole-read PyArrow fallback (with a debug log naming the keys):
-  decryption, thrift limits (change which files are *rejected* — parity-of-error requires the
-  fallback), `page_checksum_verification`, nested option bags (`read_options`,
+  decryption (pyarrow's `FileDecryptionProperties` is opaque — keys can't be bridged; see
+  TODO.md #1), `page_checksum_verification` (crate `crc` feature exists but is compile-time
+  always-on; TODO.md #3), nested option bags (`read_options`,
   `default_fragment_scan_options`), and pyarrow 21+'s schema-shaping `binary_type` / `list_type` /
   `arrow_extensions_enabled` (latent silent-divergence bug fixed by the audit — though note
-  `binary_type` is inert on files with an embedded arrow schema, which Ray-written files have).
+  `binary_type` is inert on files with an embedded arrow schema, which Ray-written files have;
+  plannable via alignment casts if ever needed, TODO.md #5).
 
 Pinned by `test_perf_only_format_kwargs_stay_native` (native + parity) and
 `test_unsupported_format_kwarg_falls_back` (generous thrift limit → fallback + equality; tiny

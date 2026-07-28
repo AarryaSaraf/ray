@@ -2104,31 +2104,65 @@ def test_perf_only_format_kwargs_stay_native(tmp_path, monkeypatch):
 def test_unsupported_format_kwarg_falls_back(tmp_path, monkeypatch):
     """A format kwarg outside the native allowlist forces a PyArrow fallback
     (which honors it) instead of being silently ignored. Exercised with
-    ``thrift_string_size_limit`` because it visibly changes behavior: a
-    generous limit reads fine (but must NOT take the native path), and a tiny
-    limit makes PyArrow reject the footer — the fallback keeps that
-    parity-of-error, where a native read would wrongly succeed."""
+    ``page_checksum_verification`` — a real pyarrow behavior toggle the crate
+    build doesn't reproduce yet (see TODO.md item 3)."""
     path = tmp_path / "audit_kwargs.parquet"
     pq.write_table(
         pa.table({"id": pa.array([1, 2], pa.int64())}), str(path), write_page_index=True
     )
 
-    # Generous limit: reads succeed and match, but via the PyArrow path.
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path],
+        monkeypatch,
+        parquet_format_kwargs={"page_checksum_verification": True},
+    )
+    assert native_decodes == 0, "unsupported format kwarg must force fallback"
+    assert rs.equals(pa_tbl)
+
+
+def test_thrift_limits_native_parity(tmp_path, monkeypatch):
+    """The thrift footer limits stay NATIVE via the metadata-only pyarrow
+    footer probe: a generous limit decodes natively with identical output,
+    and a tiny limit raises the same ``OSError`` the base path raises
+    (parity-of-error) — from both readers, not just the fallback."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.parquet_file_reader import (
+        ParquetFileReader,
+    )
+
+    path = tmp_path / "thrift_limits.parquet"
+    pq.write_table(
+        pa.table({"id": pa.array([1, 2], pa.int64())}), str(path), write_page_index=True
+    )
+
+    # Generous limit: the probe passes and the decode is native.
     rs, pa_tbl, native_decodes = _read_both_in_process(
         [path],
         monkeypatch,
         parquet_format_kwargs={"thrift_string_size_limit": 1 << 20},
     )
-    assert native_decodes == 0, "unsupported format kwarg must force fallback"
+    assert native_decodes >= 1, "thrift limits must not force fallback anymore"
     assert rs.equals(pa_tbl)
 
-    # Tiny limit: PyArrow rejects the footer; the arrow-rs reader must raise
-    # identically (parity-of-error), not decode the file natively anyway.
+    # Tiny limit: both readers must reject the footer with the same error.
+    tiny = {"thrift_string_size_limit": 10}
+    manifest = _make_manifest([str(path)], [os.path.getsize(path)], [None])
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+
     with pytest.raises(OSError):
-        _read_both_in_process(
-            [path],
-            monkeypatch,
-            parquet_format_kwargs={"thrift_string_size_limit": 10},
+        list(
+            ArrowRsParquetFileReader(
+                filesystem=LocalFileSystem(), parquet_format_kwargs=dict(tiny)
+            ).read(manifest)
+        )
+    with pytest.raises(OSError):
+        list(
+            ParquetFileReader(
+                filesystem=LocalFileSystem(), parquet_format_kwargs=dict(tiny)
+            ).read(manifest)
         )
 
 

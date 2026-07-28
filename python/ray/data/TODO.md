@@ -29,16 +29,16 @@ Options:
 - Recommendation: (a) until a real encrypted-parquet user shows up; revisit with (b) + a
   KMS-unwrap hook then.
 
-### 2. Thrift footer limits (`thrift_string_size_limit`, `thrift_container_size_limit`) — next
-Agreed 2026-07-28: implement natively rather than fall back. Approach: these limits only
-affect *metadata deserialization* (accept vs reject the footer), never decoded bytes. So
-when they're set, the planned native read does a metadata-only footer probe through
-`pq.ParquetFile(f, thrift_string_size_limit=..., thrift_container_size_limit=...)` per
-file — the exact same C++ thrift parser the scanner would use, so accept/reject behavior
-(and the raised `OSError`) is identical by construction — then decodes natively. Cost:
-one footer read per file, only when the limits are actually set. Note this deliberately
-relaxes "pyarrow never opens a supported file" for this one kwarg (probe is
-metadata-only; decode stays native).
+### 2. Thrift footer limits (`thrift_string_size_limit`, `thrift_container_size_limit`) — DONE 2026-07-28
+Implemented natively rather than fall back. These limits only affect *metadata
+deserialization* (accept vs reject the footer), never decoded bytes. When they're set,
+the planned native read does a metadata-only footer probe through
+`pq.ParquetFile(f, **limits)` per file (`_verify_footer_limits`) — the exact same C++
+thrift parser the scanner would use, so accept/reject behavior (and the raised
+`OSError`) is identical by construction — then decodes natively. Cost: one footer read
+per file, only when the limits are actually set. Deliberately relaxes "pyarrow never
+opens a supported file" for this one kwarg (probe is metadata-only; decode stays
+native). Pinned by `test_thrift_limits_native_parity`.
 
 ### 3. `page_checksum_verification` — feasible, small caveats
 The `parquet` crate has a `crc` feature (crc32fast) that verifies page checksums during
