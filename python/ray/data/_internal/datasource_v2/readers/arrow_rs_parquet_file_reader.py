@@ -59,17 +59,32 @@ Prototype limitations (documented, not hidden)
   applied post-decode in Python via PyArrow (the final authority) — the crate
   has no in-decode ``RowFilter`` yet, so rows inside a surviving row group are
   decoded before being dropped.
-- :meth:`_arrow_rs_supported` restricts the native path to local **and S3**
-  files whose columns the crate decodes byte-identically to PyArrow: flat
-  types, ``dictionary``, ``map``, and ``extension`` types (registered like
-  Ray's tensor types or not — the crate passes the embedded arrow-schema field
-  metadata straight through FFI, so pyarrow reconstructs them exactly as it
-  would on its own read path), plus struct / list / map nesting of all those to
-  any depth. Still gated: ``union`` / ``list_view`` and other exotic nesting
-  (untested against the crate), ``int96`` coercion, forced ``dictionary_columns``
-  reads, and nested-column *projection* (dotted names). Everything gated
-  transparently falls back to the PyArrow reader, so correctness is never at
-  risk — but benchmarks must confirm the arrow-rs path actually ran (see the
+- The native path covers local **and S3** files whose columns the crate
+  decodes byte-identically to PyArrow: flat types, ``dictionary``, ``map``,
+  and ``extension`` types (registered like Ray's tensor types or not — the
+  crate passes the embedded arrow-schema field metadata straight through FFI,
+  so pyarrow reconstructs them exactly as it would on its own read path), plus
+  struct / list / map nesting of all those to any depth. Where the crate's
+  decode *differs* from what the pyarrow scanner would output but the
+  difference is mechanical, the planned ``read()`` stays native and realigns
+  post-decode via a per-file :class:`_ColumnAlignment`: schema-evolution
+  columns are null-filled, per-file type drift is cast to the unified schema,
+  INT96 units are realigned (including ``coerce_int96_timestamp_unit``), and
+  forced ``dictionary_columns`` reads are dictionary-cast. An empty projection
+  with no predicate (count-style scan) decodes nothing at all — footer row
+  counts answer it (:class:`_NativeCountFragment`).
+- Still gated to PyArrow: non-local/S3 filesystems, extension-typed
+  schema drift, and tz-carrying / nested INT96 oddities. There is no per-type
+  gate: every type Parquet can encode decodes byte-identically through the
+  crate, and Arrow's in-memory-only types (``union``, ``list_view``, …) cannot
+  appear in a Parquet footer at all. (Nested-column
+  *projection* via dotted names is NOT a gate: V2 discards dotted names in
+  ``FileReader._split_columns`` before any reader sees them — both paths
+  silently drop the column, and a flat column literally named ``"a.b"``
+  decodes natively; see ``test_dotted_nested_projection_native_parity``.)
+  Everything gated transparently falls back to the
+  PyArrow reader, so correctness is never at risk — but benchmarks must
+  confirm the arrow-rs path actually ran (see the
   ``RAY_DATA_USE_ARROW_RS_PARQUET_READER`` verification).
 """
 
@@ -162,74 +177,17 @@ _ARROW_RS_FETCH_WINDOW_MB = env_integer("RAY_DATA_ARROW_RS_FETCH_WINDOW_MB", 16)
 _ARROW_RS_PREFETCH_WINDOWS = env_integer("RAY_DATA_ARROW_RS_PREFETCH_WINDOWS", 2)
 
 
-def _arrow_rs_type_supported(t: pa.DataType) -> bool:
-    """True if the native path decodes this column type byte-identically to
-    PyArrow: flat types, ``dictionary``, ``map``, and ``extension`` types, plus
-    struct / list / map nesting of all those to any depth.
-
-    Extension types are admitted (including Ray's ``ArrowTensorType`` /
-    ``ArrowVariableShapedTensorType`` and pyarrow's canonical
-    ``fixed_shape_tensor``): the crate carries the embedded arrow-schema field
-    metadata (``ARROW:extension:name`` / ``:metadata``) straight through the C
-    data interface, so pyarrow reconstructs a *registered* extension identically
-    and surfaces an *unregistered* one as its storage type + metadata — exactly
-    as PyArrow's own reader does. We recurse into the storage type so an
-    extension over an unsupported nesting still falls back. (This is why a plain
-    ``isinstance(pa.ExtensionType)`` rejection was dropped — empirically every
-    extension case round-trips; see ``test_extension_types_native_parity``.)
-
-    The remaining ``is_nested`` rejection (``union``, ``list_view`` /
-    ``large_list_view``, ``run_end_encoded``, interval, …) is an unreachable
-    safety net rather than a real limitation: those are Arrow *in-memory-only*
-    types with no Parquet encoding — PyArrow itself refuses to write them
-    ("Unhandled type for Arrow to Parquet schema conversion"), so a column read
-    from a Parquet file can never have one. Every type Parquet *can* store
-    (flat / dictionary / map / extension / list / struct / map nesting to any
-    depth) is admitted above and decodes byte-identically to PyArrow (verified in
-    ``test_extension_types_native_parity`` and the type probes behind it). The
-    branch stays as defense in depth in case a future Arrow/Parquet version adds
-    an encoding for one of them before the crate is verified against it.
-
-    Note a *forced* dictionary read (the ``dictionary_columns`` read kwarg) is
-    still gated separately in :meth:`_reader_level_supported` — the crate doesn't
-    honor it; a *naturally* dictionary-typed column (embedded arrow dictionary
-    type) is what this admits.
-    """
-    if isinstance(t, pa.ExtensionType):
-        return _arrow_rs_type_supported(t.storage_type)
-    # Canonical pyarrow extensions (e.g. ``fixed_shape_tensor``) are not always
-    # ``isinstance(pa.ExtensionType)`` across pyarrow versions; catch them via
-    # ``extension_name`` and recurse into their storage type just the same.
-    if getattr(t, "extension_name", None) is not None:
-        storage = getattr(t, "storage_type", None)
-        return storage is not None and _arrow_rs_type_supported(storage)
-    if pa.types.is_dictionary(t):
-        return _arrow_rs_type_supported(t.value_type)
-    if pa.types.is_struct(t):
-        return all(_arrow_rs_type_supported(f.type) for f in t)
-    if pa.types.is_map(t):
-        return _arrow_rs_type_supported(t.key_type) and _arrow_rs_type_supported(
-            t.item_type
-        )
-    if (
-        pa.types.is_list(t)
-        or pa.types.is_large_list(t)
-        or pa.types.is_fixed_size_list(t)
-    ):
-        return _arrow_rs_type_supported(t.value_type)
-    if pa.types.is_nested(t):
-        return False  # union, list_view, ... — untested against the crate
-    return True
-
-
-def _is_pyarrow_int96_decode_type(t: pa.DataType) -> bool:
-    """Whether ``t`` is the arrow type PyArrow produces for an INT96 timestamp
-    column by default: ``timestamp[ns]`` with no timezone. parquet-rs matches
-    this for a file with no embedded Arrow-schema hint, but honors a non-ns hint
-    when present — so an INT96 column is only safe on the native path when the
-    crate also lands on ns/no-tz (otherwise it would diverge from PyArrow, which
-    always forces ns)."""
-    return pa.types.is_timestamp(t) and t.unit == "ns" and t.tz is None
+# There is deliberately NO per-type support gate: every type Parquet can store
+# (flat types, ``dictionary``, ``map``, ``extension`` — registered like Ray's
+# tensor types or not — plus struct / list / map nesting of all those to any
+# depth) decodes byte-identically to PyArrow through the crate's C-data
+# interface (verified in ``test_extension_types_native_parity`` and the type
+# probes behind it). The Arrow types the crate has NOT been verified against
+# (``union``, ``list_view`` / ``large_list_view``, ``run_end_encoded``, …) are
+# in-memory-only types with no Parquet encoding — PyArrow itself refuses to
+# write them ("Unhandled type for Arrow to Parquet schema conversion") — so a
+# schema read from a Parquet footer can never contain one, and a gate on them
+# was unreachable dead code (removed 2026-07-28).
 
 
 def _pyarrow_fragment_int96_roots(fragment: "pds.ParquetFileFragment") -> set:
@@ -418,6 +376,81 @@ def _predicate_json(predicate: "Optional[Expr]") -> Optional[str]:
     return json.dumps(ir)
 
 
+def _is_extension_type(t: pa.DataType) -> bool:
+    """Two-way extension detection: ``isinstance`` for registered extensions,
+    ``extension_name`` for canonical pyarrow extensions (e.g.
+    ``fixed_shape_tensor``) that aren't ``pa.ExtensionType`` instances on every
+    pyarrow version."""
+    return isinstance(t, pa.ExtensionType) or (
+        getattr(t, "extension_name", None) is not None
+    )
+
+
+class _ColumnAlignment(NamedTuple):
+    """Per-file post-decode fixups that make a native decode byte-match what the
+    pyarrow scanner would have produced for the same file against the unified
+    dataset schema. Built once per file at plan time
+    (:meth:`ArrowRsParquetFileReader._plan_column_alignment`), applied to every
+    decoded batch (:func:`_apply_column_alignment`) *before* the post-decode
+    filter, so the predicate evaluates against the same types pyarrow's scanner
+    filters on.
+
+    - ``null_fill``: columns absent from this file (schema evolution) appended
+      as typed all-null columns — exactly pyarrow's null-fill under a pinned
+      dataset schema.
+    - ``casts``: columns whose crate-decoded type differs from the expected
+      output type (per-file type drift vs the unified schema, INT96 unit
+      realignment, forced ``dictionary_columns`` decode). The bool is
+      ``allow_time_truncate``, set only for INT96 unit coercion where pyarrow
+      itself truncates (``coerce_int96_timestamp_unit``); every other cast is
+      safe, so lossy data errors loudly — the same outcome pyarrow's own
+      scanner cast produces.
+    - ``order``: final column order, or ``None`` to keep the crate's order.
+      Set only when ``null_fill`` is non-empty (appended columns must land in
+      read order, matching the scanner's projected-column order).
+    """
+
+    null_fill: Tuple[Tuple[str, pa.DataType], ...]
+    casts: Tuple[Tuple[str, pa.DataType, bool], ...]
+    order: Optional[Tuple[str, ...]]
+
+    @property
+    def is_noop(self) -> bool:
+        return not self.null_fill and not self.casts
+
+
+_NOOP_ALIGNMENT = _ColumnAlignment(null_fill=(), casts=(), order=None)
+
+
+def _apply_column_alignment(
+    table: pa.Table, alignment: Optional[_ColumnAlignment]
+) -> pa.Table:
+    """Apply a plan-time :class:`_ColumnAlignment` to one decoded batch."""
+    if alignment is None or alignment.is_noop:
+        return table
+    import pyarrow.compute as pc
+
+    for name, target, allow_time_truncate in alignment.casts:
+        idx = table.schema.get_field_index(name)
+        if idx == -1:
+            continue
+        column = table.column(idx)
+        if allow_time_truncate:
+            column = column.cast(
+                options=pc.CastOptions(target, allow_time_truncate=True)
+            )
+        else:
+            column = column.cast(target)  # safe: lossy values raise, like pyarrow
+        table = table.set_column(idx, pa.field(name, target), column)
+    for name, fill_type in alignment.null_fill:
+        table = table.append_column(
+            pa.field(name, fill_type), pa.nulls(table.num_rows, type=fill_type)
+        )
+    if alignment.order is not None:
+        table = table.select([c for c in alignment.order if c in table.column_names])
+    return table
+
+
 class _NativeParquetFragment(NamedTuple):
     """A native (pyarrow-free) unit of work for one file's row-group slice.
 
@@ -427,11 +460,26 @@ class _NativeParquetFragment(NamedTuple):
     (whole-file read). Exposes ``.path`` so it flows through the same
     :meth:`FileReader._dispatch_fragment_reads` threading/retry machinery as a
     pyarrow fragment; :meth:`ArrowRsParquetFileReader._iter_fragment_tables`
-    dispatches on the type.
+    dispatches on the type. ``alignment`` carries this file's post-decode
+    fixups (:class:`_ColumnAlignment`), ``None`` when the decode already
+    matches the expected output.
     """
 
     path: str
     row_groups: Optional[List[int]]
+    alignment: Optional[_ColumnAlignment] = None
+
+
+class _NativeCountFragment(NamedTuple):
+    """A zero-decode work unit for an empty projection (count-style scan) with
+    no predicate: the footer row counts are exact, so the read yields a
+    zero-column table with the right ``num_rows`` and never touches a data
+    page. The base pyarrow path instead scans a stub column;
+    :meth:`FileReader._postprocess`'s stub guard re-adds the row-preserving
+    stub downstream, identically for both paths."""
+
+    path: str
+    num_rows: int
 
 
 @DeveloperAPI
@@ -494,9 +542,12 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         if len(input_split) == 0:
             return
 
-        # Reader-wide ineligibility (unsupported filesystem or format kwargs):
-        # nothing native to do — use the base pyarrow read() unchanged.
-        if not self._reader_level_supported():
+        # Reader-wide ineligibility (unsupported filesystem): nothing native to
+        # do — use the base pyarrow read() unchanged. Format kwargs
+        # (``coerce_int96_timestamp_unit`` / ``dictionary_columns``) are *not*
+        # gated here: the planned path realigns for them per file via
+        # :meth:`_plan_column_alignment`.
+        if not self._filesystem_supported():
             yield from super().read(input_split)
             return
 
@@ -519,8 +570,8 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         row counts, int96 root columns)``, or ``None`` if the native footer read
         fails (caller then falls the whole split back to pyarrow). Does *not*
         swallow a missing extension — :meth:`_import_extension` raises that
-        loudly. The int96 list lets the gate check that the crate's decoded unit
-        for those columns matches PyArrow (see :func:`_is_pyarrow_int96_decode_type`)."""
+        loudly. The int96 list lets :meth:`_plan_column_alignment` realign the
+        crate's decoded unit for those columns to what PyArrow produces."""
         # Surfaces a missing extension loudly (import inside the crate call);
         # any *footer-read* failure below becomes a whole-split pyarrow fallback.
         self._import_extension()
@@ -554,12 +605,20 @@ class ArrowRsParquetFileReader(ParquetFileReader):
                 return None  # whole-split pyarrow fallback
             native_md[path] = md
 
-        # Column split from the union of on-disk names across files (matches the
-        # base reader's ``dataset.schema.names``); partition / path / row_hash
-        # columns aren't on disk anywhere and so land in the synthesize set.
-        on_disk_names: set = set()
-        for schema, _, _ in native_md.values():
-            on_disk_names.update(schema.names)
+        # Column split, mirroring the base reader's ``dataset.schema.names``:
+        # with a pinned unified schema, ``pds.dataset(schema=...)`` reports
+        # exactly that schema — so a unified column absent from every file in
+        # this split still counts as on-disk (and gets null-filled per file by
+        # the alignment), instead of being silently dropped. Without a unified
+        # schema, fall back to the union of the files' footer schemas.
+        # Partition / path / row_hash columns aren't on disk anywhere and so
+        # land in the synthesize set either way.
+        if self._file_dataset_schema is not None:
+            on_disk_names = set(self._file_dataset_schema.names)
+        else:
+            on_disk_names = set()
+            for schema, _, _ in native_md.values():
+                on_disk_names.update(schema.names)
         columns_to_read_from_file, columns_to_synthesize = self._split_columns(
             on_disk_names
         )
@@ -579,12 +638,35 @@ class ArrowRsParquetFileReader(ParquetFileReader):
 
         read_columns = self._resolve_read_columns_for(scanner_kwargs)
 
-        # Per-file verdict: native decode vs pyarrow fallback.
-        native_paths = {
-            path
-            for path, (schema, _, int96_cols) in native_md.items()
-            if self._columns_supported(schema, read_columns, int96_cols)
-        }
+        # Empty projection with no predicate (count-style scan): zero decode —
+        # the footer row counts already read above are exact, so emit
+        # count fragments for every file and never touch a data page. (With a
+        # predicate the count depends on the data; that case falls through to
+        # the per-file verdict below, which rejects empty projections.)
+        if (
+            read_columns is not None
+            and len(read_columns) == 0
+            and scanner_kwargs["filter"] is None
+        ):
+            count_fragments: List[Tuple[Any, int]] = []
+            for path, chunk_metadata in zip(
+                manifest.paths, manifest.file_chunk_metadatas
+            ):
+                count_fragments.extend(
+                    self._native_count_fragments(
+                        path, chunk_metadata, native_md[path][1]
+                    )
+                )
+            return count_fragments, columns_to_synthesize, scanner_kwargs
+
+        # Per-file verdict: native decode (with an optional post-decode
+        # alignment plan) vs pyarrow fallback.
+        alignment_by_path: Dict[str, Optional[_ColumnAlignment]] = {}
+        for path, (schema, _, int96_cols) in native_md.items():
+            alignment = self._plan_column_alignment(schema, read_columns, int96_cols)
+            if alignment is not None:
+                alignment_by_path[path] = None if alignment.is_noop else alignment
+        native_paths = set(alignment_by_path)
         fallback_paths = [p for p in unique_paths if p not in native_paths]
 
         # Build pyarrow fragments for the fallback files only (pyarrow never opens
@@ -609,7 +691,10 @@ class ArrowRsParquetFileReader(ParquetFileReader):
             if path in native_paths:
                 fragments_with_offsets.extend(
                     self._native_fragments_for_file(
-                        path, chunk_metadata, native_md[path][1]
+                        path,
+                        chunk_metadata,
+                        native_md[path][1],
+                        alignment_by_path[path],
                     )
                 )
             else:
@@ -628,6 +713,7 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         path: str,
         chunk_metadata: Optional[dict],
         row_group_num_rows: List[int],
+        alignment: Optional[_ColumnAlignment] = None,
     ) -> List[Tuple[_NativeParquetFragment, int]]:
         """Build native fragments for one file, matching the base reader's
         granularity so ``row_hash`` offsets are identical:
@@ -638,9 +724,12 @@ class ArrowRsParquetFileReader(ParquetFileReader):
           with the pre-filter file row offset of that group's first row (mirrors
           :func:`_fragments_from_chunk_metadata`), so post-filter accumulation
           within a group starts from the right position.
+
+        ``alignment`` is the file's post-decode fixup plan, embedded in every
+        fragment so it survives the threaded fragment dispatch.
         """
         if chunk_metadata is None:
-            return [(_NativeParquetFragment(path, None), 0)]
+            return [(_NativeParquetFragment(path, None, alignment), 0)]
 
         total = len(row_group_num_rows)
         start = min(chunk_metadata["row_group_start"], total)
@@ -648,7 +737,34 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         fragments: List[Tuple[_NativeParquetFragment, int]] = []
         file_row_offset = sum(row_group_num_rows[:start])
         for rg in range(start, end):
-            fragments.append((_NativeParquetFragment(path, [rg]), file_row_offset))
+            fragments.append(
+                (_NativeParquetFragment(path, [rg], alignment), file_row_offset)
+            )
+            file_row_offset += row_group_num_rows[rg]
+        return fragments
+
+    @staticmethod
+    def _native_count_fragments(
+        path: str,
+        chunk_metadata: Optional[dict],
+        row_group_num_rows: List[int],
+    ) -> List[Tuple[_NativeCountFragment, int]]:
+        """Build zero-decode count fragments for one file (empty projection, no
+        predicate), at the same granularity/offsets as
+        :meth:`_native_fragments_for_file` so ``limit`` slicing and any
+        synthesized columns (``path``, partitions) behave identically."""
+        if chunk_metadata is None:
+            return [(_NativeCountFragment(path, sum(row_group_num_rows)), 0)]
+
+        total = len(row_group_num_rows)
+        start = min(chunk_metadata["row_group_start"], total)
+        end = min(chunk_metadata["row_group_end"], total)
+        fragments: List[Tuple[_NativeCountFragment, int]] = []
+        file_row_offset = sum(row_group_num_rows[:start])
+        for rg in range(start, end):
+            fragments.append(
+                (_NativeCountFragment(path, row_group_num_rows[rg]), file_row_offset)
+            )
             file_row_offset += row_group_num_rows[rg]
         return fragments
 
@@ -661,22 +777,27 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         lowering and the soundness argument."""
         return _predicate_json(self._predicate)
 
-    def _reader_level_supported(self) -> bool:
-        """Reader-wide (fragment-independent) half of the support gate:
-        filesystem + Parquet-format kwargs. Checked once per ``read()`` before
-        touching any file, so an unsupported filesystem / int96 coercion /
-        forced dictionary decode short-circuits the whole native path.
-        """
+    def _filesystem_supported(self) -> bool:
+        """Whether the native crate can read from this filesystem at all.
+        Local and S3 are wired in `_iter_fragment_tables` / the native `read()`
+        (S3 uses the windowed, byte-budgeted native path). Any other
+        filesystem (GCS, ABFS, HTTP, …) falls back to PyArrow."""
         from pyarrow.fs import LocalFileSystem, S3FileSystem
 
-        # Local and S3 are wired in `_iter_fragment_tables` / the native `read()`
-        # (S3 uses the windowed, byte-budgeted native path). Any other
-        # filesystem (GCS, ABFS, HTTP, …) falls back to PyArrow.
-        if not isinstance(self._filesystem, (LocalFileSystem, S3FileSystem)):
-            return False
+        return isinstance(self._filesystem, (LocalFileSystem, S3FileSystem))
 
-        # int96 coercion and forced dictionary decoding aren't mirrored by the
-        # native reader.
+    def _reader_level_supported(self) -> bool:
+        """Reader-wide half of the *per-fragment* re-gate (the pyarrow-fragment
+        path in :meth:`_iter_fragment_tables`): filesystem + Parquet-format
+        kwargs. The kwarg checks stay here — not in the planned native
+        ``read()`` — because the per-fragment path has no crate footer metadata
+        to plan a :class:`_ColumnAlignment` from (a pyarrow
+        ``physical_schema`` already reflects ``coerce_int96_timestamp_unit`` /
+        ``dictionary_columns``, so an alignment computed from it would be a
+        false no-op). The planned path handles both kwargs natively via
+        :meth:`_plan_column_alignment`."""
+        if not self._filesystem_supported():
+            return False
         if self._parquet_format_kwargs.get("coerce_int96_timestamp_unit") is not None:
             return False
         if self._parquet_format_kwargs.get("dictionary_columns"):
@@ -689,63 +810,138 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         read_columns: Optional[List[str]],
         int96_columns: Optional[List[str]] = None,
     ) -> bool:
-        """Per-file half of the support gate: does the native reader handle the
-        columns we'd read from *this* file's physical schema?
+        """Per-fragment re-gate verdict: native only when the decode needs *no*
+        post-decode fixups. Used by the pyarrow-fragment path, where the
+        alignment can't be trusted (see :meth:`_reader_level_supported`); the
+        planned ``read()`` instead admits any file with a plannable
+        :class:`_ColumnAlignment`."""
+        alignment = self._plan_column_alignment(
+            physical_schema, read_columns, int96_columns
+        )
+        return alignment is not None and alignment.is_noop
+
+    def _plan_column_alignment(
+        self,
+        physical_schema: pa.Schema,
+        read_columns: Optional[List[str]],
+        int96_columns: Optional[List[str]] = None,
+    ) -> Optional[_ColumnAlignment]:
+        """Per-file half of the support gate, upgraded from a yes/no verdict to
+        a *plan*: how to make this file's native decode match what the pyarrow
+        scanner would produce. Returns ``None`` for a pyarrow fallback, a no-op
+        alignment for a byte-identical native decode, or a fixup plan
+        (null-fill / cast / reorder) the decode path applies per batch.
 
         Takes a ``pa.Schema`` (the crate's ``read_metadata`` schema — i.e. what
         the crate will actually decode) plus, optionally, the root column names
-        the crate reports as INT96-physical. Conservative — anything not covered
-        here falls back to PyArrow, so correctness is never at risk:
+        the crate reports as INT96-physical. Still conservative — anything not
+        covered falls back to PyArrow, so correctness is never at risk:
 
-        - empty projection (count scan) → PyArrow handles the stub-column dance;
-        - dotted (nested-column) projection → unsupported;
-        - a column absent from this file (schema evolution) → PyArrow null-fill;
-        - a type the crate can't decode (:func:`_arrow_rs_type_supported`);
-        - a per-file type that differs from the unified schema (needs a cast the
-          native reader doesn't do);
-        - an INT96 column the crate would decode to a non-ns unit (PyArrow always
-          forces ns; see :func:`_is_pyarrow_int96_decode_type`).
+        - empty projection (count scan) → handled upstream by the zero-decode
+          count path (:class:`_NativeCountFragment`) when there's no predicate;
+          ``None`` here so the per-fragment re-gate keeps PyArrow's stub dance;
+        - a column absent from this file (schema evolution) → **null-fill**
+          with the unified type (``None`` when there's no unified schema to
+          take the type from, or the fill type is an extension);
+        - an INT96 column → **cast** to the type PyArrow produces
+          (``timestamp[coerce_int96_timestamp_unit or ns]``, truncation allowed
+          exactly like PyArrow's coercion); non-timestamp / tz-carrying INT96
+          oddities stay on PyArrow;
+        - a forced ``dictionary_columns`` read → **cast** to
+          ``dictionary<int32, type>`` (what PyArrow's forced-dict decode
+          yields); non-string/binary targets stay on PyArrow;
+        - a per-file type that differs from the unified schema → **cast** to
+          the unified type (the scanner's implicit cast under a pinned
+          schema); extension-typed drift stays on PyArrow.
         """
         unified_schema = self._file_dataset_schema
         int96 = set(int96_columns or ())
-        names = (
-            read_columns if read_columns is not None else list(physical_schema.names)
+        # The expected output columns: the explicit read set when projected;
+        # otherwise the *unified* schema's columns (the scanner outputs the
+        # pinned dataset schema, null-filling what a file lacks — using the
+        # file's own names here would silently drop evolved columns); the
+        # file's names only when there is no unified schema to pin.
+        if read_columns is not None:
+            names = read_columns
+        elif unified_schema is not None:
+            names = list(unified_schema.names)
+        else:
+            names = list(physical_schema.names)
+
+        if read_columns is not None and len(read_columns) == 0:
+            return None
+
+        coerce_unit = self._parquet_format_kwargs.get("coerce_int96_timestamp_unit")
+        dictionary_columns = set(
+            self._parquet_format_kwargs.get("dictionary_columns") or ()
         )
 
-        # Empty projection (count-style scan) — let PyArrow handle the
-        # stub-column dance.
-        if read_columns is not None and len(read_columns) == 0:
-            return False
-
-        # A dotted name means a nested-column projection, which the native
-        # reader doesn't support.
-        if any("." in name for name in names):
-            return False
-
+        null_fill: List[Tuple[str, pa.DataType]] = []
+        casts: List[Tuple[str, pa.DataType, bool]] = []
         for name in names:
             idx = physical_schema.get_field_index(name)
             if idx == -1:
-                # Column absent from this file (schema evolution) — defer to
-                # PyArrow's null-fill path.
-                return False
+                # Column absent from this file (schema evolution): null-fill
+                # with the unified type — exactly pyarrow's behavior under a
+                # pinned dataset schema. Without a unified schema the fill type
+                # is unknowable — defer to PyArrow.
+                if unified_schema is None:
+                    return None
+                unified_idx = unified_schema.get_field_index(name)
+                if unified_idx == -1:
+                    return None
+                fill_type = unified_schema.field(unified_idx).type
+                if _is_extension_type(fill_type):
+                    return None
+                null_fill.append((name, fill_type))
+                continue
+
             field_type = physical_schema.field(idx).type
-            if not _arrow_rs_type_supported(field_type):
-                return False
-            # INT96 column: only safe natively when the crate lands on the same
-            # type PyArrow produces (ns / no tz). A file embedding a non-ns hint
-            # decodes to us/ms/s here but ns in PyArrow — fall it back.
-            if name in int96 and not _is_pyarrow_int96_decode_type(field_type):
-                return False
-            if unified_schema is None:
-                continue
-            unified_idx = unified_schema.get_field_index(name)
-            if unified_idx == -1:
-                continue
-            # A per-file type that differs from the unified type needs a
-            # cast the native reader doesn't do — fall back.
-            if unified_schema.field(unified_idx).type != field_type:
-                return False
-        return True
+            target = field_type
+            allow_time_truncate = False
+            if name in int96:
+                # PyArrow decodes INT96 to timestamp[coerce_unit or ns, no tz];
+                # the crate instead honors an embedded non-ns arrow-schema hint.
+                # Realign by casting to PyArrow's target. Truncation is allowed
+                # because that is precisely what PyArrow's own
+                # ``coerce_int96_timestamp_unit`` does (ns → coarser unit).
+                if not (pa.types.is_timestamp(target) and target.tz is None):
+                    return None  # nested/tz-carrying INT96 oddity — stay safe
+                target = pa.timestamp(coerce_unit or "ns")
+                allow_time_truncate = True
+            if name in dictionary_columns:
+                # PyArrow's forced dictionary decode yields
+                # dictionary<values=type, indices=int32>. Only string/binary
+                # columns are dictionary-read by pyarrow's parquet layer.
+                if not (pa.types.is_string(target) or pa.types.is_binary(target)):
+                    return None
+                target = pa.dictionary(pa.int32(), target)
+            if unified_schema is not None:
+                unified_idx = unified_schema.get_field_index(name)
+                if unified_idx != -1:
+                    unified_type = unified_schema.field(unified_idx).type
+                    if unified_type != target:
+                        # Per-file drift vs the pinned unified schema: the
+                        # scanner casts implicitly; mirror it. Extension-typed
+                        # drift (e.g. per-file tensor shapes) must not be cast.
+                        if _is_extension_type(unified_type) or _is_extension_type(
+                            target
+                        ):
+                            return None
+                        target = unified_type
+
+            if target != field_type:
+                casts.append((name, target, allow_time_truncate))
+
+        if not null_fill and not casts:
+            return _NOOP_ALIGNMENT
+        # Appended null-fill columns must land in read order (the scanner's
+        # projected-column order); reordering is only needed when a column was
+        # appended.
+        order = tuple(names) if null_fill else None
+        return _ColumnAlignment(
+            null_fill=tuple(null_fill), casts=tuple(casts), order=order
+        )
 
     def _arrow_rs_supported(
         self,
@@ -823,10 +1019,22 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         scanner_kwargs: dict,
     ) -> "Iterator[pa.Table]":
         # Native front-end (arrow-rs ``read()``) hands us pyarrow-free work units.
+        if isinstance(fragment, _NativeCountFragment):
+            # Empty projection, no predicate: the footer count is exact — yield
+            # a zero-column table with the right num_rows and decode nothing.
+            # (``Table.select([])`` preserves ``num_rows``; the base path's
+            # zero-column tables flow through ``_postprocess`` identically.)
+            _trace_reader_path(True)
+            if fragment.num_rows > 0:
+                yield pa.table({"__num_rows": pa.nulls(fragment.num_rows)}).select([])
+            return
         if isinstance(fragment, _NativeParquetFragment):
             _trace_reader_path(True)
             yield from self._iter_native_tables(
-                fragment.path, fragment.row_groups, scanner_kwargs
+                fragment.path,
+                fragment.row_groups,
+                scanner_kwargs,
+                alignment=fragment.alignment,
             )
             return
 
@@ -853,9 +1061,13 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         path: str,
         row_groups: Optional[List[int]],
         scanner_kwargs: dict,
+        alignment: Optional[_ColumnAlignment] = None,
     ) -> "Iterator[pa.Table]":
         """Decode ``row_groups`` of ``path`` via the native crate and yield
-        ``pa.Table`` batches.
+        ``pa.Table`` batches, applying the file's :class:`_ColumnAlignment`
+        (null-fill / cast / reorder) to each batch *before* the post-decode
+        filter so the predicate sees the same types pyarrow's scanner filters
+        on.
 
         Row-group pruning is native (``predicate.rs``), replacing PyArrow's
         ``fragment.subset(filter=...)``: we hand the crate the row-group ids plus
@@ -928,6 +1140,7 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         # stack a second block-sized buffer on top of it. See module docstring.
         for batch in record_batch_reader:
             table = pa.Table.from_batches([batch], schema=record_batch_reader.schema)
+            table = _apply_column_alignment(table, alignment)
             if filter_expr is not None:
                 table = table.filter(filter_expr)
                 if table.num_rows == 0:

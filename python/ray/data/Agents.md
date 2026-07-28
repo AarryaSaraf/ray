@@ -1190,6 +1190,65 @@ The honest speed framing: parity-to-modestly-faster everywhere, **not** the stan
 (that was the S3 K-split, dormant except on a lone big row group, and K=1 by default). The
 pitch is *removing the OOMs at no speed cost*, which the deciding run confirms.
 
+**The `leak_rgsize` axis on the metric of record (2026-07-27, first run on the current
+Anyscale Python workspace).** Getting a from-source master cluster to boot on a 2.56.1-image
+workspace was itself the pole: a private head on a non-default port (the managed 2.56.1
+cluster owns 6379 and is a different Ray version, so attaching fails a version check),
+`aiohttp` installed into the venv (the `ray[data]` extra omits it, so the runtime-env agent
+crashed on import and the raylet fate-shared with it — an indefinite `ray start` hang), and
+`RAY_task_events_report_interval_ms=0` to dodge a core task-event-aggregator SIGSEGV on this
+commit. None of it arrow-rs-related — all harness/environment — but recorded so the next run
+skips the day of debugging. This axis decomposes the #49158 surge by **row-group size** using
+the #49158 shape itself (3200 rows of ~256 KiB binary cells, ~800 MB, written two ways):
+`many_tiny` (`row_group_size=16` ⇒ ~200 tiny groups, the churn case) and `few_large`
+(4 × ~200 MB groups, the decode-floor case). Four readers, `num_cpus=4`, `decode_drop` with
+`target_max_block_size=8 MiB`; `max_task` = the busiest worker's windowed USS growth = the
+reader's working set (the metric of record), with node-sum incr/peak kept only as a sanity
+overlay:
+
+| geom | reader | max_task | incr_USS | peak_USS | nat/fb | wall |
+|---|---|---|---|---|---|---|
+| many_tiny | pyarrow_v1 (legacy scanner) | **1866** | 2129 | 2572 | 0/0 | 5.71 |
+| many_tiny | pyarrow (V2 scanner) | 82 | 263 | 663 | 0/0 | 5.18 |
+| many_tiny | pyarrow_iter | 79 | 325 | 733 | 0/0 | 5.07 |
+| many_tiny | arrow-rs | **64** | 208 | 573 | **200/0** | 4.62 |
+| few_large | pyarrow_v1 (legacy scanner) | **2477** | 2659 | 3020 | 0/0 | 5.39 |
+| few_large | pyarrow (V2 scanner) | 958 | 1891 | 2094 | 0/0 | 1.61 |
+| few_large | pyarrow_iter | 616 | 616 | 820 | 0/0 | 1.14 |
+| few_large | arrow-rs | **403** | 801 | 1001 | **4/0** | 2.74 |
+
+1. **V2 kills the v1 surge in both geometries.** The legacy whole-file scanner (the actual
+   #49158 path) holds 1866 / 2477 MB per task; every V2 reader cuts that 3–30×. Orthogonal to
+   arrow-rs (it's the per-group fan-out) but it frames the axis.
+2. **arrow-rs has the smallest per-task working set of any reader in both geometries** —
+   64 vs 79–82 (many_tiny) and 403 vs 616–958 (few_large) — the byte-budget/streaming-decode
+   mechanism, on authoritative Linux USS, on the exact leak shape. `nat/fb = 200/0` and `4/0`
+   confirm the native path ran on every fragment: zero silent PyArrow fallback, so these rows
+   really measure arrow-rs.
+3. **The one caveat — few_large's node-sum — is concurrency, not a reader loss.** arrow-rs's
+   node-sum incr/peak (801/1001) reads *above* pyarrow_iter's (616/820) despite a *lower*
+   per-task working set (403 vs 616). The gap is instantaneous overlap: node-sum ÷ per-task
+   ≈ **2 for arrow-rs** (801/403) vs **≈ 1 for iter** (616/616) — arrow-rs had ~2 heavy decodes
+   live at the peak, iter ~1. The Rust decode path **releases the GIL** and genuinely
+   parallelizes the 4 groups across the V2 read-thread pool where `pq.iter_batches`
+   (pure-Python batch loop) serializes on it; more overlap ⇒ higher *instantaneous* node-sum
+   for the same total work. A secondary contributor is glibc `ptmalloc` retaining freed pages
+   where PyArrow's jemalloc returns them (§7.8). Per worker — the metric that drives OOM —
+   arrow-rs holds the least.
+4. **This axis is K=1**, so it never exercises the K-split byte-range mechanism (the S3
+   flat-peak lever): with K=1 arrow-rs still resident-holds the whole ~200 MB compressed
+   column chunk per big group (the budget caps *decoded output*, not compressed input).
+   few_large tests streaming-decode-only, and arrow-rs still wins per-task.
+
+A `num_cpus=1` variant was run to serialize the decodes and cross-check reading (3); it is
+**rejected as a test**. arrow-rs came back `nat/fb = 0/0` (its native instrumentation didn't
+register) and all four readers collapsed to identical numbers — because forcing every group
+through one long-lived worker swaps the concurrency variable for single-process
+allocator-retention accumulation (a *different* confound) and broke the per-task tracing. The
+concurrency reading stands on the arithmetic above and the per-task overlap graph
+(`figs/task_mem/leakrg__few_large.png`), not on serialization. Lesson for the harness: isolate
+concurrency by reading the per-task overlap graph, never by dropping to one core.
+
 **Pending:** the planned `oom` axis — a memory-ceilinged node where PyArrow's hidden decode
 heap OOM-kills the read and arrow-rs finishes — the end-to-end demonstration of §3.2's failure
 mode and its removal.
@@ -1824,8 +1883,11 @@ in-decode **`RowFilter`** (§7 — we prune row groups but still decode survivin
 `table.filter` drops them), and **filesystem breadth (GCS/Azure)** — the last real routing
 axis, gated only because `object_store` is compiled `aws`-only, so it needs new crate
 connectors + config bridging in both the listing and reader gates, not because storage
-location matters to the data. The remaining non-filesystem fallbacks (schema-evolution
-cast/null-fill, empty/dotted projection) are small Python-side reconciliation steps (§1).
+location matters to the data. ~~The remaining non-filesystem fallbacks (schema-evolution
+cast/null-fill, empty/dotted projection) are small Python-side reconciliation steps (§1).~~
+**Done 2026-07-28 — see §7.10.2:** all four Python-closable gates are closed via the
+`_ColumnAlignment` mechanism + zero-decode count path; dotted projection turned out to be
+a platform non-feature, not a reader gap.
 
 Two reorderings vs the list above, both forced by the pruning analysis:
 
@@ -1883,9 +1945,11 @@ Two reorderings vs the list above, both forced by the pruning analysis:
   listing metadata — it never invokes the reader (verified: `reader.read` call count 0), so it is
   correct under the flag by construction and there is nothing to decode natively (a count scan reads
   no data columns → no working set to shrink → zero memory to win). A *genuinely* column-less read
-  (empty projection) is deliberately fallen back to PyArrow's stub-column path (one `__bsp_stub`
-  column, right row count). Pinned by `test_count_is_metadata_only_under_arrow_rs` and
-  `test_empty_projection_falls_back_to_pyarrow_stub`.
+  (empty projection) was initially fallen back to PyArrow's stub-column path; **superseded 2026-07-28
+  (§7.10.2)** — it now decodes *nothing at all*: footer row counts answer it via
+  `_NativeCountFragment` (zero crate decodes, zero `pds.dataset` calls). Pinned by
+  `test_count_is_metadata_only_under_arrow_rs` and
+  `test_empty_projection_counts_natively_with_zero_decode`.
 - **Transient-error retry parity proven.** Native `_NativeParquetFragment`s flow through the same
   `iterate_with_retry` wrapper as PyArrow fragments (`_read_fragments_sequential`), so a retryable
   I/O failure mid-read is re-attempted and recovered identically. Pinned by
@@ -1916,8 +1980,10 @@ that costs no memory. Left as-is on purpose.
   follow-up PR after field validation + packaging — exactly as `use_datasource_v2` itself still
   defaults False. The coherent PR here is "introduce the flag-gated arrow-rs reader that fully
   replaces the PyArrow read path for supported files," default off.
-- *Track 2 — broaden the type gate.* **Deferred:** each new type (dictionary, extension/tensor,
-  map, int96, nested-column projection) needs its own per-column-hash parity proof.
+- *Track 2 — broaden the type gate.* **Done** (dictionary, extension/tensor, map, int96 all
+  native with parity proofs — §6.8/§6.10; forced `dictionary_columns` + `coerce_int96_timestamp_unit`
+  closed via alignment casts, and nested-column projection resolved as a platform non-feature —
+  §7.10.2).
 
 **Filesystems beyond local + S3 — analysis (deferred, not blocked).** The gate allows only
 `LocalFileSystem` / `S3FileSystem` today; everything else falls back to PyArrow (correct, just no
@@ -1939,6 +2005,64 @@ that `__reduce__` often does *not* carry, so a naive bridge would connect with t
 credentials — and unlike a type-gate miss, that fails the read rather than falling back. Since S3 is
 the dominant object store for the OOM cases this project targets, local + S3 covers the vast
 majority; GCS/Azure are a clean follow-up once we can test against real buckets.
+
+#### 7.10.2 Python-side gate closures + the dotted-projection non-gap (2026-07-28, flag-gated, not committed)
+
+Executing the functionality-first migration plan (phases 1–2 of 6: close every Python-closable
+fallback before touching packaging/optimization). After this, the only remaining fallback triggers
+are: non-Local/S3 filesystems, extension-typed schema *drift*, and tz-carrying/nested INT96
+oddities. (The per-type gate is **gone entirely**: `_arrow_rs_type_supported`'s one remaining
+rejection was `is_nested` exotics — `union`/`list_view`/`run_end_encoded` — which have no Parquet
+encoding, so a footer-derived schema can never contain one; the function had become constant-True
+dead code and was removed, with a test pinning that PyArrow refuses to *write* a union column.)
+
+**Phase 1 — one mechanism closes four gates.** The per-file half of the support gate was upgraded
+from a yes/no verdict to a *plan*: `_plan_column_alignment(...)` returns a `_ColumnAlignment`
+(null-fills, casts, column order) describing how to make this file's native decode match what the
+PyArrow scanner would produce under the pinned dataset schema; `_apply_column_alignment` applies it
+per decoded batch **before** the post-decode `table.filter` (final authority). Built at plan time
+from the **crate's** footer metadata (authoritative pre-coercion view). What it closes:
+
+- **Schema evolution** — a column missing from a file is null-filled with the unified-schema type
+  (+ column reorder), exactly the scanner's pinned-schema behavior.
+- **Per-file type drift** — cast to the unified type. Safe casts only, so lossy data errors loudly
+  — parity-of-error with the scanner's own implicit cast.
+- **INT96** (incl. `coerce_int96_timestamp_unit`) — cast to `timestamp[unit or ns]` with
+  `allow_time_truncate=True` *only here*, matching PyArrow's own truncating coercion.
+- **Forced `dictionary_columns`** — cast to `dictionary<int32, T>` (what PyArrow's forced-dict
+  decode yields); non-string/binary targets stay on PyArrow.
+
+**Empty projection went from stub-fallback to zero-decode:** no columns + no predicate is answered
+from footer row counts alone (`_NativeCountFragment` — zero crate decodes *and* zero `pds.dataset`
+calls, pinned by spy test). **Pruning safety argument:** alignment casts cannot corrupt native
+row-group pruning because `_literal_to_ir_value` already rejects datetimes/decimals/bytes (so
+timestamp predicates never reach the crate) and int/float/string drift casts are order-preserving.
+**Gate split:** the planned `read()` now gates only on filesystem and admits any plannable
+alignment; the *per-fragment re-gate* stays conservative (no-op alignments only) because PyArrow's
+`physical_schema` is post-coercion — planning an alignment from it would produce a false no-op.
+
+**Pre-existing live bug found & fixed:** with *no explicit projection*, the old gate derived the
+expected columns from each file's own footer, so an evolved file yielded fewer columns than the
+base path (concat schema mismatch downstream), and a unified-schema column absent from *every*
+file was silently dropped. Names now come from the unified schema when one is pinned. Regression
+tests: `test_schema_evolution_null_fill_native_parity`, `test_unified_only_column_not_dropped_natively`.
+
+**Phase 2 — dotted (nested-column) projection is a platform non-feature, not a reader gap.**
+Probed end to end: the *raw* PyArrow scanner can resolve `columns=["user.name"]` (outputs a leaf
+column named `name`), but Ray V2 never passes it through — `FileReader._split_columns` classifies
+any not-on-disk name as "synthesize", nothing synthesizes it, and `_postprocess` drops it, on
+**both** reader paths identically (public-API verified: both flags return only the non-dotted
+columns). So a Rust `ProjectionMask` would be *new functionality* Ray doesn't have on PyArrow
+either — out of scope for a parity migration, deliberately skipped. Nested *types* (struct/list/map
+to any depth) were already native (§6.8). The one change: the gate's blanket fall-back on dots in
+column names was removed — genuinely-nested dotted projections can never reach the gate, so the
+only reachable case was a **flat column literally named `"a.b"`**, which both the scanner and the
+crate resolve by exact flat-name match (verified, including the ambiguous flat-`"user.name"`-plus-
+struct-`user{name}` file) — now native. Pinned by `test_dotted_nested_projection_native_parity`
+and `test_flat_column_named_with_dot_native_parity`.
+
+**Verified:** arrow-rs suite 61 passed + 13 skipped (moto-S3 env), `test_read_parquet_v2.py` 15
+passed, `test_parquet.py` non-S3 256 passed + 1 skipped, ruff + black clean.
 
 ---
 

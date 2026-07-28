@@ -426,12 +426,13 @@ def test_count_is_metadata_only_under_arrow_rs(tmp_path, restore_ctx):
     assert read_calls["n"] == 0, "count unexpectedly invoked the reader"
 
 
-def test_empty_projection_falls_back_to_pyarrow_stub(tmp_path):
-    """A genuinely column-less read (empty projection) is *not* something the
-    native path handles — the gate falls it back to PyArrow's stub-column path,
-    which yields the right row count with a single stub column. This exercises
-    the ``_columns_supported`` empty-projection branch directly (the case
-    ``ds.count()`` would hit if it ever routed through the reader)."""
+def test_empty_projection_counts_natively_with_zero_decode(tmp_path, monkeypatch):
+    """A column-less read (empty projection, no predicate) is answered from the
+    footer row counts alone: no crate decode, no ``pds.dataset`` — strictly
+    less work than PyArrow's stub-column scan. The yielded tables are
+    zero-column with the right ``num_rows``; ``_postprocess``'s stub guard
+    re-adds the row-preserving stub, exactly as on the base path."""
+    import pyarrow.dataset as pds
     from pyarrow.fs import LocalFileSystem
 
     from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
@@ -443,6 +444,21 @@ def test_empty_projection_falls_back_to_pyarrow_stub(tmp_path):
     pq.write_table(table, str(path), write_page_index=True)
     manifest = _make_manifest([str(path)], [os.path.getsize(path)], [None])
 
+    calls = {"decode": 0, "pds": 0}
+    orig_decode = ray_data_arrow_rs.read_row_groups
+    orig_dataset = pds.dataset
+
+    def decode_spy(*a, **k):
+        calls["decode"] += 1
+        return orig_decode(*a, **k)
+
+    def dataset_spy(*a, **k):
+        calls["pds"] += 1
+        return orig_dataset(*a, **k)
+
+    monkeypatch.setattr(ray_data_arrow_rs, "read_row_groups", decode_spy)
+    monkeypatch.setattr(pds, "dataset", dataset_spy)
+
     reader = ArrowRsParquetFileReader(
         filesystem=LocalFileSystem(),
         target_block_size=128 * 1024 * 1024,
@@ -450,8 +466,12 @@ def test_empty_projection_falls_back_to_pyarrow_stub(tmp_path):
     )
     tables = list(reader.read(manifest))
     assert sum(t.num_rows for t in tables) == table.num_rows
-    # PyArrow's count-scan stub column, not a natively-decoded data column.
+    # The stub-column guard in ``_postprocess`` preserves row counts.
     assert all(len(t.column_names) == 1 for t in tables)
+    # The whole answer came from the footer: nothing was decoded, and pyarrow
+    # never opened the file.
+    assert calls["decode"] == 0
+    assert calls["pds"] == 0
 
 
 def test_native_fragment_read_retries_transient_error(tmp_path, monkeypatch):
@@ -997,8 +1017,8 @@ def test_dictionary_column_native_parity(tmp_path, restore_ctx):
     index-divergence trap, so this spans several row groups on purpose.
 
     Distinct from the ``dictionary_columns`` *forced* read (columns coerced to
-    dictionary output at read time), which stays gated in
-    ``_reader_level_supported`` because the crate doesn't honor it."""
+    dictionary output at read time), which the planned path handles via an
+    alignment cast (see ``test_forced_dictionary_columns_native_parity``)."""
     n = 500
     path = tmp_path / "dict.parquet"
     vals = [None if i % 37 == 0 else f"cat{(i * 7) % 13}" for i in range(n)]
@@ -1083,51 +1103,26 @@ def test_extension_types_native_parity(tmp_path, restore_ctx):
             _read_arrow_sorted(cpath, True, restore_ctx)
         )
 
-    # Recursive gate unit checks: map / dictionary / extension are admitted, and
-    # an extension nested inside a struct/list/map recurses into its storage type
-    # (so a top-level check can't be fooled).
-    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
-        _arrow_rs_type_supported,
+    # There is no per-type support gate to unit-check anymore: every
+    # Parquet-encodable type is admitted (proven by the parity reads above), and
+    # Arrow's in-memory-only types (union, list_view, run_end_encoded, ...) have
+    # no Parquet encoding — PyArrow refuses to write them ("Unhandled type for
+    # Arrow to Parquet schema conversion") — so they can never appear in a
+    # footer-derived schema. The old ``_arrow_rs_type_supported`` gate on them
+    # was unreachable dead code, removed 2026-07-28.
+    union_array = pa.UnionArray.from_dense(
+        pa.array([0], pa.int8()),
+        pa.array([0], pa.int32()),
+        [pa.array([1], pa.int64())],
     )
-
-    tensor = pa.fixed_shape_tensor(pa.float32(), [2])
-    assert _arrow_rs_type_supported(tensor) is True
-    assert _arrow_rs_type_supported(pa.struct([("t", tensor)])) is True
-    assert _arrow_rs_type_supported(pa.list_(tensor)) is True
-    assert _arrow_rs_type_supported(pa.map_(pa.string(), pa.int64())) is True
-    assert _arrow_rs_type_supported(pa.map_(pa.string(), tensor)) is True
-    assert _arrow_rs_type_supported(pa.dictionary(pa.int32(), pa.string())) is True
-    # Deep, mixed nesting to any depth is admitted (list>struct>map>list).
-    assert (
-        _arrow_rs_type_supported(
-            pa.list_(pa.struct({"m": pa.map_(pa.string(), pa.list_(pa.int64()))}))
-        )
-        is True
-    )
-    assert (
-        _arrow_rs_type_supported(
-            pa.struct([("a", pa.int64()), ("b", pa.list_(pa.string()))])
-        )
-        is True
-    )
-    # The still-rejected types (union / list_view / run_end_encoded / interval)
-    # are the ``is_nested`` safety net: they have NO Parquet encoding — PyArrow
-    # refuses to write them ("Unhandled type for Arrow to Parquet schema
-    # conversion"), so a Parquet column can never carry one. The gate rejecting
-    # them is defense in depth, not an unfinished type.
-    assert (
-        _arrow_rs_type_supported(
-            pa.dense_union([pa.field("a", pa.int64()), pa.field("b", pa.string())])
-        )
-        is False
-    )
-    if hasattr(pa, "list_view"):
-        assert _arrow_rs_type_supported(pa.list_view(pa.int64())) is False
+    with pytest.raises(pa.lib.ArrowNotImplementedError, match="Unhandled type"):
+        pq.write_table(pa.table({"u": union_array}), str(tmp_path / "union.parquet"))
 
 
 def test_arrow_rs_supported_gate(tmp_path):
     """Unit-check the fallback gate: local flat AND struct/list = supported;
-    nested projection / empty projection / non-local = unsupported."""
+    empty projection / unknown-not-on-disk column (no unified schema to
+    null-fill from) / non-local filesystem = unsupported."""
     import pyarrow.dataset as pds
     from pyarrow.fs import LocalFileSystem
 
@@ -1161,7 +1156,9 @@ def test_arrow_rs_supported_gate(tmp_path):
     assert reader._arrow_rs_supported(flat_frag, []) is False
     # List column → native (ungated 2026-07-21).
     assert reader._arrow_rs_supported(nested_frag, None) is True
-    # Nested-column projection (dotted name) → fall back.
+    # A requested column that isn't on disk (here a dotted name — in real reads
+    # ``_split_columns`` filters these out before the gate) is treated as a
+    # missing column; with no unified schema to null-fill from → fall back.
     assert reader._arrow_rs_supported(nested_frag, ["v.item"]) is False
 
     # Unknown filesystem (neither local nor S3) → fall back.
@@ -1783,15 +1780,16 @@ def test_int96_no_arrow_hint_reads_native_as_ns(tmp_path, restore_ctx, monkeypat
     assert pa_tbl.equals(rs_tbl)
 
 
-def test_int96_with_non_ns_hint_falls_back(tmp_path, restore_ctx, monkeypatch):
+def test_int96_with_non_ns_hint_realigns_natively(tmp_path, restore_ctx, monkeypatch):
     """A PyArrow-written INT96 file embeds a ``timestamp[us]`` hint that the crate
-    honors (→ us) but PyArrow ignores (always ns). The gate must fall this file
-    back to PyArrow so the result stays ``ns`` — identical to the non-arrow-rs
-    path — rather than silently changing the unit."""
+    honors (→ us) but PyArrow ignores (always ns). The planned native path stays
+    native and *realigns*: the plan-time ``_ColumnAlignment`` casts the decoded
+    column to ``ns`` so the result is byte-identical to PyArrow — no fallback."""
     path = tmp_path / "pyarrow_int96.parquet"
     _write_int96(path, embed_arrow_schema=True)
 
-    # Crate would decode to us (honoring the embedded hint) — the divergence.
+    # Crate decodes to us (honoring the embedded hint) — the divergence the
+    # alignment cast repairs.
     assert pa.schema(ray_data_arrow_rs.read_metadata(str(path))).field(
         "t"
     ).type == pa.timestamp("us")
@@ -1801,14 +1799,17 @@ def test_int96_with_non_ns_hint_falls_back(tmp_path, restore_ctx, monkeypatch):
         "id"
     )
 
-    assert not took_native, "INT96/non-ns-hint file must fall back to PyArrow"
+    assert took_native, "INT96/non-ns-hint file should decode natively + realign"
     assert rs_tbl.schema.field("t").type == pa.timestamp("ns")
     assert pa_tbl.equals(rs_tbl)
 
 
 def test_int96_gate_rejects_non_ns_in_columns_supported(tmp_path):
-    """Unit-level: ``_columns_supported`` admits an INT96 column only when the
-    crate's decoded type is ns/no-tz, and rejects a non-ns unit."""
+    """Unit-level: ``_columns_supported`` (the per-fragment re-gate, which
+    requires a *no-op* alignment) stays True for an INT96 column already at
+    ns/no-tz and False for a non-ns unit — the latter now means "needs an
+    alignment cast", which the planned ``read()`` handles natively while the
+    pyarrow-fragment path conservatively falls back."""
     from pyarrow.fs import LocalFileSystem
 
     from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
@@ -1827,6 +1828,265 @@ def test_int96_gate_rejects_non_ns_in_columns_supported(tmp_path):
     assert reader._columns_supported(us_schema, ["id", "t"], []) is True
     # Projecting away the INT96 column sidesteps the gate.
     assert reader._columns_supported(us_schema, ["id"], ["t"]) is True
+
+
+# ---------------------------------------------------------------------------
+# Column alignment: gates closed by the per-file post-decode fixup plan
+# (schema-evolution null-fill, unified-schema cast, INT96 coercion, forced
+# dictionary_columns). Each test compares the native reader against the base
+# PyArrow reader IN-PROCESS over the same manifest, with a crate spy proving
+# the native decode actually ran (no silent fallback).
+# ---------------------------------------------------------------------------
+
+
+def _read_both_in_process(paths, monkeypatch, **reader_kwargs):
+    """Read ``paths`` with the arrow-rs reader and the base PyArrow reader over
+    an identical whole-file manifest; return ``(rs_table, pa_table,
+    native_decodes)`` where ``native_decodes`` counts crate decode calls."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+    from ray.data._internal.datasource_v2.readers.parquet_file_reader import (
+        ParquetFileReader,
+    )
+
+    calls = {"decode": 0}
+    orig = ray_data_arrow_rs.read_row_groups
+
+    def spy(*a, **k):
+        calls["decode"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(ray_data_arrow_rs, "read_row_groups", spy)
+
+    paths = [str(p) for p in paths]
+    manifest = _make_manifest(
+        paths, [os.path.getsize(p) for p in paths], [None] * len(paths)
+    )
+    rs = pa.concat_tables(
+        list(
+            ArrowRsParquetFileReader(
+                filesystem=LocalFileSystem(), **reader_kwargs
+            ).read(manifest)
+        )
+    )
+    pa_tbl = pa.concat_tables(
+        list(
+            ParquetFileReader(filesystem=LocalFileSystem(), **reader_kwargs).read(
+                manifest
+            )
+        )
+    )
+    return rs, pa_tbl, calls["decode"]
+
+
+def _evolved_fixture(tmp_path):
+    """Two-file dataset with schema evolution: file A has (id, x, s[large]);
+    file B lacks ``x`` and stores ``s`` as plain ``string`` (type drift). The
+    unified schema is A's."""
+    a = tmp_path / "evo_a.parquet"
+    b = tmp_path / "evo_b.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2], pa.int64()),
+                "x": pa.array([1.5, 2.5], pa.float64()),
+                "s": pa.array(["a", "b"], pa.large_string()),
+            }
+        ),
+        str(a),
+        write_page_index=True,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([3, 4], pa.int64()),
+                "s": pa.array(["c", "d"], pa.string()),
+            }
+        ),
+        str(b),
+        write_page_index=True,
+    )
+    unified = pa.schema(
+        [("id", pa.int64()), ("x", pa.float64()), ("s", pa.large_string())]
+    )
+    return a, b, unified
+
+
+def test_schema_evolution_null_fill_native_parity(tmp_path, monkeypatch):
+    """A file missing a unified-schema column (schema evolution) plus per-file
+    type drift decodes NATIVELY: the alignment null-fills the missing column
+    with the unified type and casts the drifted one, byte-matching PyArrow's
+    pinned-schema scan. Both files must take the crate path."""
+    a, b, unified = _evolved_fixture(tmp_path)
+
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [a, b], monkeypatch, schema=unified
+    )
+    assert native_decodes >= 2, "both files should decode natively"
+    assert rs.sort_by("id").equals(pa_tbl.sort_by("id"))
+    assert rs.schema == pa_tbl.schema
+
+    # Same with an explicit projection that includes the evolved column.
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [a, b], monkeypatch, schema=unified, columns=["x", "id"]
+    )
+    assert native_decodes >= 2
+    assert rs.sort_by("id").equals(pa_tbl.sort_by("id"))
+
+
+def test_filter_on_evolved_column_native_parity(tmp_path, monkeypatch):
+    """A pushed predicate over the null-filled (evolved) column evaluates on
+    the ALIGNED batch, so rows from the file lacking the column drop exactly
+    like PyArrow's null-comparison semantics."""
+    from ray.data.expressions import col
+
+    a, b, unified = _evolved_fixture(tmp_path)
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [a, b], monkeypatch, schema=unified, predicate=(col("x") > 2.0)
+    )
+    assert native_decodes >= 1
+    assert rs.sort_by("id").equals(pa_tbl.sort_by("id"))
+    assert rs.num_rows == 1  # only id=2 (x=2.5) survives; file B is all-null x
+
+
+def test_coerce_int96_timestamp_unit_native_parity(tmp_path, monkeypatch):
+    """``coerce_int96_timestamp_unit`` no longer falls back: the alignment
+    casts the crate's INT96 decode to PyArrow's coerced unit (truncating,
+    exactly like PyArrow's own coercion), for files with and without an
+    embedded arrow-schema hint."""
+    for embed in (False, True):
+        path = tmp_path / f"i96_{embed}.parquet"
+        _write_int96(path, embed_arrow_schema=embed)
+        rs, pa_tbl, native_decodes = _read_both_in_process(
+            [path],
+            monkeypatch,
+            parquet_format_kwargs={"coerce_int96_timestamp_unit": "ms"},
+        )
+        assert native_decodes >= 1, f"embed={embed} should decode natively"
+        assert rs.schema.field("t").type == pa.timestamp("ms")
+        assert rs.sort_by("id").equals(pa_tbl.sort_by("id"))
+
+
+def test_forced_dictionary_columns_native_parity(tmp_path, monkeypatch):
+    """A forced ``dictionary_columns`` read no longer falls back: the crate
+    decodes the plain column and the alignment dictionary-casts it to exactly
+    PyArrow's forced-dict output (``dictionary<values=string, indices=int32>``)."""
+    path = tmp_path / "forced_dict.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2, 3], pa.int64()),
+                "s": pa.array(["x", "y", "x"]),
+            }
+        ),
+        str(path),
+        write_page_index=True,
+    )
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path], monkeypatch, parquet_format_kwargs={"dictionary_columns": ["s"]}
+    )
+    assert native_decodes >= 1
+    assert rs.schema.field("s").type == pa.dictionary(pa.int32(), pa.string())
+    assert rs.sort_by("id").equals(pa_tbl.sort_by("id"))
+
+
+def test_dotted_nested_projection_native_parity(tmp_path, monkeypatch):
+    """Dotted (nested-field) projection like ``user.name`` stays NATIVE and
+    matches the base reader exactly — which today means the dotted column is
+    silently DROPPED by both paths.
+
+    V2 discards dotted names *before* any reader sees them:
+    ``FileReader._split_columns`` classifies ``user.name`` as not-on-disk (the
+    footer schema has only the root ``user``), routing it to the synthesize
+    bucket, where nothing synthesizes it and ``_postprocess`` drops it. The raw
+    PyArrow scanner *could* resolve it (yielding a leaf column named ``name``),
+    but Ray never passes it through. So true nested projection is a platform
+    feature V2 lacks on the PyArrow path too — implementing a Rust
+    ``ProjectionMask`` for it would be new functionality, not migration parity.
+    This test pins the parity: no fallback, identical (dropped-column) output.
+    """
+    path = tmp_path / "nested_proj.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2], pa.int64()),
+                "user": pa.array(
+                    [{"name": "a", "age": 30}, {"name": "b", "age": 40}],
+                    type=pa.struct([("name", pa.string()), ("age", pa.int64())]),
+                ),
+            }
+        ),
+        str(path),
+        write_page_index=True,
+    )
+
+    # Dotted projection: native decode, and both readers drop the dotted name.
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path], monkeypatch, columns=["user.name", "id"]
+    )
+    assert native_decodes >= 1, "dotted projection must not force a fallback"
+    assert rs.column_names == ["id"]
+    assert rs.equals(pa_tbl)
+
+    # Whole-struct projection (the supported way to read nested data): native
+    # decode with full byte parity.
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path], monkeypatch, columns=["user", "id"]
+    )
+    assert native_decodes >= 1
+    assert rs.column_names == ["user", "id"]
+    assert rs.equals(pa_tbl)
+
+
+def test_flat_column_named_with_dot_native_parity(tmp_path, monkeypatch):
+    """A FLAT top-level column literally named ``"user.name"`` (legal in
+    Parquet) decodes natively with parity — even when the same file also has a
+    struct ``user`` with a ``name`` child. Exact flat-name match wins in both
+    the pyarrow scanner and the crate, so the gate must not fall back on a
+    dot in a column name (dots only ever mean nested *projection* upstream of
+    the reader, where V2 discards them)."""
+    path = tmp_path / "flatdot.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1, 2], pa.int64()),
+                "user.name": pa.array(["flat1", "flat2"]),
+                "user": pa.array(
+                    [{"name": "nested1"}, {"name": "nested2"}],
+                    type=pa.struct([("name", pa.string())]),
+                ),
+            }
+        ),
+        str(path),
+        write_page_index=True,
+    )
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path], monkeypatch, columns=["user.name", "id"]
+    )
+    assert native_decodes >= 1, "flat dotted-named column must decode natively"
+    assert rs.column_names == ["user.name", "id"]
+    assert rs.column("user.name").to_pylist() == ["flat1", "flat2"]
+    assert rs.equals(pa_tbl)
+
+
+def test_unified_only_column_not_dropped_natively(tmp_path, monkeypatch):
+    """A unified-schema column absent from EVERY file in the split must still
+    surface (all-null), matching the base reader under a pinned schema — the
+    column split takes names from the unified schema, not the footers."""
+    path = tmp_path / "no_extra.parquet"
+    pq.write_table(
+        pa.table({"id": pa.array([1, 2], pa.int64())}), str(path), write_page_index=True
+    )
+    unified = pa.schema([("id", pa.int64()), ("later_col", pa.string())])
+    rs, pa_tbl, native_decodes = _read_both_in_process(
+        [path], monkeypatch, schema=unified
+    )
+    assert native_decodes >= 1
+    assert "later_col" in rs.column_names
+    assert rs.sort_by("id").equals(pa_tbl.sort_by("id"))
 
 
 if __name__ == "__main__":
