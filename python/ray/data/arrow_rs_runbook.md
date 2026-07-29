@@ -73,6 +73,16 @@ time) hits three traps; none are arrow-rs-related:
    `bench_suite.py` now pop both env vars in-process; for ad-hoc scripts,
    `unset RAY_RUNTIME_ENV_HOOK RAY_RUNTIME_ENV_PLUGINS` first. Diagnosis pattern
    for any such hang: `cat /tmp/ray/session_latest/logs/runtime_env_agent.err`.
+5. **A fresh shell silently runs the WRONG Ray** (cost a run on 2026-07-28): without
+   `source ~/ray/.venv/bin/activate`, `python` is the image's anaconda, whose
+   preinstalled Ray is the *Anyscale runtime* (`ray.anyscale.data` read path) — the
+   branch reader/crate/flags don't exist there, and it auto-attaches to the managed
+   cluster. Telltales: traceback frames under
+   `/home/ray/anaconda3/.../ray/anyscale/...`, or "Connecting to existing Ray
+   cluster at <ip>:6379". `bench_suite.py` now refuses to start unless
+   `realpath(ray.data.__file__)` resolves into this repo checkout
+   (`RAY_DATA_BENCH_ALLOW_FOREIGN_RAY=1` overrides, for wheel baselines only) and
+   defaults `RAY_ADDRESS=local` itself. Re-activate the venv in every new terminal.
 
 ## 3. Building the crate manually
 

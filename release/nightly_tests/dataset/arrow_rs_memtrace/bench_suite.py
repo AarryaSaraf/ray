@@ -2609,7 +2609,40 @@ def write_summary_csv():
     return path
 
 
+def _assert_branch_ray():
+    """Refuse to run against a Ray that isn't this repo checkout.
+
+    A workspace shell that lost `source ~/ray/.venv/bin/activate` silently runs
+    the image's preinstalled Ray (e.g. /home/ray/anaconda3 with the Anyscale
+    runtime): none of the branch reader / crate / flags exist there, so every
+    number the suite produces is garbage attributed to the wrong code. setup-dev
+    symlinks site-packages/ray/data into the repo, so realpath(ray.data.__file__)
+    must land inside the repo this script lives in.
+    """
+    if os.environ.get("RAY_DATA_BENCH_ALLOW_FOREIGN_RAY") == "1":
+        return
+    import ray.data as _rd
+
+    repo = os.path.realpath(os.path.join(os.path.dirname(__file__), *[".."] * 4))
+    resolved = os.path.realpath(_rd.__file__)
+    if not resolved.startswith(repo + os.sep):
+        raise SystemExit(
+            f"bench_suite: the imported ray.data is {resolved}, which is NOT this "
+            f"repo checkout ({repo}) — you are running the image's preinstalled "
+            "Ray, not the branch. Fix:\n"
+            "  source ~/ray/.venv/bin/activate\n"
+            "  export RAY_ADDRESS=local\n"
+            "and rerun. (RAY_DATA_BENCH_ALLOW_FOREIGN_RAY=1 overrides, for wheel "
+            "baselines only.)"
+        )
+
+
 def main():
+    _assert_branch_ray()
+    # Never attach to a managed workspace cluster by accident — it is a different
+    # Ray version and (worse) silently a different codebase. An explicit shell
+    # export still wins over this default.
+    os.environ.setdefault("RAY_ADDRESS", "local")
     os.makedirs(OUT, exist_ok=True)
     which = sys.argv[1].split(",") if len(sys.argv) > 1 else list(AXES)
     for axis in which:
