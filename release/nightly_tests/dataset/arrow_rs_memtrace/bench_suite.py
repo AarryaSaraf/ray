@@ -508,10 +508,22 @@ def axis_layout():
 
 def axis_schema():
     N = 500_000
+    # `blob` cells are 256 KiB each: 500k of them is ~122 GB, which OOM-kills the
+    # driver during fixture generation (the list of bytes is built whole in memory
+    # before the write). blob exists to exercise the fat-cell binary path, not to be
+    # large, so give it a small row count; the light schemas keep the 500k coverage
+    # count. Row groups can't exceed the row count, so clamp that too.
+    PER_SCHEMA_ROWS = {"blob": 2_000}
     results = []
     hashes = {}
     for schema in fx.SCHEMA_BUILDERS:
-        spec = {"rows": N, "num_files": 1, "row_group_size": 100_000, "schema": schema}
+        n = PER_SCHEMA_ROWS.get(schema, N)
+        spec = {
+            "rows": n,
+            "num_files": 1,
+            "row_group_size": min(100_000, n),
+            "schema": schema,
+        }
         path = fx.make_fixture(f"schema_{schema}", spec)
         for reader in ["pyarrow", "arrow_rs"]:
             label = f"schema__{schema}__{reader}"
