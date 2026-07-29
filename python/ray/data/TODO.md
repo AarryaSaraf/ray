@@ -62,7 +62,11 @@ column drop was ruled expected V2 behavior (golden oracle now encodes it);
 fallback (a cast provably can't reproduce decode-time coercion on pre-1970 values —
 Agents.md §7.11); the pickle-object guard now runs on the native path. Everything
 downstream (optimization targets, the bench re-run, the release-test pitch) keys off
-this run.
+this run. **Status 2026-07-28: the local-filesystem pass is GREEN on Linux — 17/17
+scenarios (parity everywhere, mega_main golden, hive_chunked stability; paths as
+designed: native except the deliberate int96_coerce_ms fallback and the
+pickle_default error gate, where both readers raise identically). Remaining: the
+S3 pass (`RAY_DATA_ARROW_RS_FIXTURE_ROOT=s3://...` per the runbook §5).**
 
 ### 2. In-decode `RowFilter` + late materialization — P1
 Today a pushed filter prunes whole row groups by footer statistics (native), but inside
