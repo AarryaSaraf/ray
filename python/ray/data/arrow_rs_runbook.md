@@ -9,7 +9,18 @@ rationale live in [Agents.md](Agents.md); this file is only *how to run things*.
 
 ## 1. Fresh machine, one command
 
-`release/nightly_tests/dataset/arrow_rs_memtrace/setup.sh` brings a fresh box
+Step 0, if the box doesn't have the repo yet (e.g. a replacement node):
+
+```bash
+git clone https://github.com/AarryaSaraf/ray.git ~/ray
+cd ~/ray && git checkout arrow-rs-parquet-reader
+# setup.sh picks the Ray nightly wheel matching `git merge-base HEAD upstream/master`,
+# so the upstream remote must exist:
+git remote add upstream https://github.com/ray-project/ray.git
+git fetch upstream master --quiet
+```
+
+Then `release/nightly_tests/dataset/arrow_rs_memtrace/setup.sh` brings a fresh box
 (Linux x86-64 or macOS/arm64) to "the suite runs":
 
 ```bash
