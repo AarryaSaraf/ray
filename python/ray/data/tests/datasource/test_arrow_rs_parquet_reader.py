@@ -355,6 +355,99 @@ def test_native_read_allows_pickle_object_columns_with_env_var(tmp_path, monkeyp
     assert got.column("obj").to_pylist() == [{"key": "value"}, {"key": "other"}]
 
 
+def _write_int96_file(path, num_rows=1_000):
+    """INT96-physical timestamps, all pre-1970 and 1ns past a microsecond
+    boundary — the values where decode-time unit coercion (floors) and a
+    post-decode cast (truncates toward zero) differ by exactly one unit."""
+    us_vals = [(i - num_rows) * 86_400_000_000 + i for i in range(num_rows)]
+    table = pa.table(
+        {
+            "id": pa.array(range(num_rows), type=pa.int64()),
+            "ts": pa.array([v * 1000 + 1 for v in us_vals], type=pa.timestamp("ns")),
+        }
+    )
+    pq.write_table(
+        table,
+        str(path),
+        use_deprecated_int96_timestamps=True,
+        store_schema=False,
+        write_page_index=True,
+    )
+
+
+def test_coerce_int96_kwarg_parity(tmp_path, restore_ctx):
+    """`coerce_int96_timestamp_unit` must yield exactly what the base V2
+    pyarrow reader yields. On the full V2 pipeline that is subtle: the pinned
+    unified schema (kwarg-blind ``pq.read_schema``) casts the coerced values
+    BACK to the inferred ns — so the kwarg's observable effect is
+    ms-quantized-and-FLOORED *values* in an ns-typed column. A native ns
+    decode plus cast can't reproduce the floor on pre-1970 values, so the
+    reader falls back per file; this test pins the observable contract,
+    however it's met. Regression test for the corpus `int96_coerce_ms`
+    finding (native path returned raw ns, ignoring the kwarg)."""
+    path = tmp_path / "int96.parquet"
+    _write_int96_file(path)
+
+    kw = {"dataset_kwargs": {"coerce_int96_timestamp_unit": "ms"}}
+    expected = _read_arrow_sorted(
+        path, use_arrow_rs=False, restore_ctx=restore_ctx, **kw
+    )
+    got = _read_arrow_sorted(path, use_arrow_rs=True, restore_ctx=restore_ctx, **kw)
+    assert got.equals(expected)
+
+    # The kwarg must have had its observable effect (guards against a "parity"
+    # where both readers ignored it): values are ms-quantized and floored —
+    # the raw values sit 1ns past a µs boundary, so flooring to ms lands on
+    # the boundary and truncation toward zero would not.
+    ts = expected.column("ts").cast(pa.int64()).to_pylist()
+    raw = _read_arrow_sorted(path, use_arrow_rs=False, restore_ctx=restore_ctx)
+    raw_ts = raw.column("ts").cast(pa.int64()).to_pylist()
+    assert all(v % 1_000_000 == 0 for v in ts), "values not ms-quantized"
+    assert all(v <= r for v, r in zip(ts, raw_ts)), "not floored (truncated?)"
+
+
+def test_coerce_int96_kwarg_routes_int96_file_to_fallback(tmp_path, monkeypatch):
+    """The kwarg-honoring mechanism: a file that decodes an INT96 column under
+    `coerce_int96_timestamp_unit` must NOT go native; the same file without
+    the kwarg must."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+
+    path = tmp_path / "int96.parquet"
+    _write_int96_file(path)
+
+    native_calls = {"n": 0}
+    orig = ray_data_arrow_rs.read_row_groups
+
+    def spy(*a, **k):
+        native_calls["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(ray_data_arrow_rs, "read_row_groups", spy)
+
+    def run(parquet_format_kwargs):
+        reader = ArrowRsParquetFileReader(
+            filesystem=LocalFileSystem(),
+            target_block_size=128 * 1024 * 1024,
+            parquet_format_kwargs=parquet_format_kwargs,
+        )
+        manifest = _make_manifest([str(path)], [os.path.getsize(path)], [None])
+        return pa.concat_tables(list(reader.read(manifest)))
+
+    native_calls["n"] = 0
+    with_kwarg = run({"coerce_int96_timestamp_unit": "ms"})
+    assert native_calls["n"] == 0, "int96 file went native despite the kwarg"
+    assert with_kwarg.schema.field("ts").type == pa.timestamp("ms")
+
+    native_calls["n"] = 0
+    without_kwarg = run(None)
+    assert native_calls["n"] > 0, "int96 file without the kwarg should stay native"
+    assert without_kwarg.schema.field("ts").type == pa.timestamp("ns")
+
+
 def test_native_chunked_read_row_hash_parity(tmp_path):
     """A chunked file (one manifest row per ``[row_group_start, row_group_end)``
     range) must produce byte-identical ``row_hash`` values via the native path
@@ -2034,11 +2127,13 @@ def test_filter_on_evolved_column_native_parity(tmp_path, monkeypatch):
     assert rs.num_rows == 1  # only id=2 (x=2.5) survives; file B is all-null x
 
 
-def test_coerce_int96_timestamp_unit_native_parity(tmp_path, monkeypatch):
-    """``coerce_int96_timestamp_unit`` no longer falls back: the alignment
-    casts the crate's INT96 decode to PyArrow's coerced unit (truncating,
-    exactly like PyArrow's own coercion), for files with and without an
-    embedded arrow-schema hint."""
+def test_coerce_int96_timestamp_unit_falls_back(tmp_path, monkeypatch):
+    """A file decoding INT96 under ``coerce_int96_timestamp_unit`` FALLS BACK
+    (with or without an embedded arrow-schema hint): pyarrow's decode-time
+    coercion floors (parquet types.h divides the unsigned nanos-of-day) while
+    a post-decode cast truncates toward zero — one unit apart on every
+    pre-1970 value, so no cast reproduces the kwarg. Parity still holds
+    because the fallback IS pyarrow for that file."""
     for embed in (False, True):
         path = tmp_path / f"i96_{embed}.parquet"
         _write_int96(path, embed_arrow_schema=embed)
@@ -2047,7 +2142,7 @@ def test_coerce_int96_timestamp_unit_native_parity(tmp_path, monkeypatch):
             monkeypatch,
             parquet_format_kwargs={"coerce_int96_timestamp_unit": "ms"},
         )
-        assert native_decodes >= 1, f"embed={embed} should decode natively"
+        assert native_decodes == 0, f"embed={embed} must fall back under the kwarg"
         assert rs.schema.field("t").type == pa.timestamp("ms")
         assert rs.sort_by("id").equals(pa_tbl.sort_by("id"))
 

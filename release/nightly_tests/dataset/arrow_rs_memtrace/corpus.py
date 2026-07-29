@@ -682,6 +682,15 @@ def check_golden(payload_rows, golden, dirs=("main",)):
                 bad.append(f"{rel}: id {rid} missing from read")
                 continue
             for col in g["columns"]:
+                if col == "path":
+                    # V2 reserves the name "path" for the include_paths
+                    # synthetic column and strips an on-disk column of that
+                    # name from every read (include_paths on or off). Ruled
+                    # EXPECTED V2 behavior 2026-07-28 (source of truth = the
+                    # base V2 pyarrow reader; V1 differs but is not the
+                    # reference). patho.parquet keeps the column as collision
+                    # bait — the differential oracle still covers it.
+                    continue
                 checked += 1
                 if got.get(col, "<absent>") != grow[col]:
                     bad.append(

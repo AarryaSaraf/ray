@@ -1467,9 +1467,10 @@ that costs no memory. Left as-is on purpose.
   defaults False. The coherent PR here is "introduce the flag-gated arrow-rs reader that fully
   replaces the PyArrow read path for supported files," default off.
 - *Track 2 — broaden the type gate.* **Done** (dictionary, extension/tensor, map, int96 all
-  native with parity proofs — §6.8/§6.10; forced `dictionary_columns` + `coerce_int96_timestamp_unit`
-  closed via alignment casts, and nested-column projection resolved as a platform non-feature —
-  §7.10.2).
+  native with parity proofs — §6.8/§6.10; forced `dictionary_columns` closed via alignment casts,
+  `coerce_int96_timestamp_unit` re-decided 2026-07-28 as a per-file *fallback* — a cast can't
+  reproduce decode-time coercion on pre-1970 values, §7.11 — and nested-column projection
+  resolved as a platform non-feature — §7.10.2).
 
 **Filesystems beyond local + S3 — analysis (deferred, not blocked).** The gate allows only
 `LocalFileSystem` / `S3FileSystem` today; everything else falls back to PyArrow (correct, just no
@@ -1513,8 +1514,10 @@ from the **crate's** footer metadata (authoritative pre-coercion view). What it 
   (+ column reorder), exactly the scanner's pinned-schema behavior.
 - **Per-file type drift** — cast to the unified type. Safe casts only, so lossy data errors loudly
   — parity-of-error with the scanner's own implicit cast.
-- **INT96** (incl. `coerce_int96_timestamp_unit`) — cast to `timestamp[unit or ns]` with
-  `allow_time_truncate=True` *only here*, matching PyArrow's own truncating coercion.
+- **INT96** — an embedded hint unit is cast to `timestamp[ns]` (PyArrow's default; an exact
+  upcast). With `coerce_int96_timestamp_unit` set the file **falls back** instead: PyArrow's
+  decode-time coercion floors, a cast truncates toward zero — one unit apart on every pre-1970
+  value (§7.11; corpus-caught 2026-07-28, replacing the earlier truncating-cast approach).
 - **Forced `dictionary_columns`** — cast to `dictionary<int32, T>` (what PyArrow's forced-dict
   decode yields); non-string/binary targets stay on PyArrow.
 
@@ -1560,9 +1563,11 @@ two and silently ignore the rest while the fallback honored them all. Now an exp
 - perf-only, ignorable natively (`pre_buffer`, `buffer_size`, `use_buffered_stream`,
   `cache_options`): tune PyArrow's I/O strategy, cannot change decoded bytes; the crate has its own
   I/O strategy.
-- aligned (`coerce_int96_timestamp_unit`, `dictionary_columns`): reproduced per file by
-  `_ColumnAlignment` on the planned path; still block the per-fragment re-gate (no crate footer to
-  plan from).
+- aligned (`coerce_int96_timestamp_unit`, `dictionary_columns`): handled per file by the
+  alignment *plan* on the planned path — `dictionary_columns` via a cast,
+  `coerce_int96_timestamp_unit` by falling back whenever the file actually decodes an INT96
+  column (floor-vs-truncate, §7.11; files without INT96 stay native). Both still block the
+  per-fragment re-gate (no crate footer to plan from).
 - footer-verified (`thrift_string_size_limit`, `thrift_container_size_limit`; added
   2026-07-28 after the audit): the limits only decide whether a *footer* is accepted or
   rejected, so the planned read enforces them with a metadata-only pyarrow footer probe
@@ -1667,6 +1672,20 @@ has a revive-trigger in [TODO.md](TODO.md).
   extension types (uuid, json, …) from Parquet logical types at read time. Reproducing
   the toggle's exact on/off semantics against the crate's own extension-metadata
   passthrough is real work for a kwarg essentially nobody passes.
+- **A file decoding INT96 columns under `coerce_int96_timestamp_unit`** (added
+  2026-07-28, replacing the §6.10-era cast approach after the corpus caught it).
+  The kwarg means decode-time unit coercion, and that is **provably not a cast**:
+  pyarrow's `Int96GetMilliSeconds`/`...MicroSeconds` (arrow `cpp/src/parquet/types.h`)
+  divide the *unsigned* nanoseconds-of-day before adding the signed day offset —
+  a floor of the full instant — while casting the decoded signed int64 truncates
+  toward zero. One unit apart on every pre-1970 value with a sub-unit remainder;
+  measured on the corpus 1964 fixture: all 1715 negative values off by exactly 1ms.
+  (On the full V2 pipeline the observable is subtler still: the kwarg-blind pinned
+  unified schema casts the coerced values *back* to the inferred unit, so parity
+  means ms-quantized-floored values in an ns-typed column.) Per-file and surgical:
+  the plan gate sees the kwarg + the crate footer's `int96_columns`, so files
+  without INT96 stay native (the kwarg is inert for them), and INT96 files
+  *without* the kwarg stay native too (hint units upcast exactly to ns).
 - **Non-Local/S3 filesystems (GCS, Azure, HDFS, fsspec).** GCS/Azure are *feasible*
   (`object_store` ships both backends; ≈ one Cargo feature + one `_s3_config`-style
   bridge each), but the credential bridge is the real risk: short-lived tokens /

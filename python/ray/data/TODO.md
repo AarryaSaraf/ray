@@ -55,12 +55,14 @@ type with pinned extremes, deep nesting, exotic encodings/compressions, patholog
 layouts, int96 hint/no-hint, schema evolution, tensors, pickle) driven through 17
 scenarios per reader with differential + golden + stability oracles. Two additions for
 this run: set `RAY_DATA_ARROW_RS_STRICT=1` so any silent fallback **errors with its
-reason** ("the run passed" then means "the native path produced every byte checked"),
-and **re-check the one known open divergence** from the smoke run:
-`coerce_int96_timestamp_unit="ms"` — pyarrow coerces to ms, but the native path
-appeared to ignore the kwarg and honor the file's embedded per-column hints instead,
-contradicting the alignment's claim to reproduce that coercion. Everything downstream
-(optimization targets, the bench re-run, the release-test pitch) keys off this run.
+reason** ("the run passed" then means "the native path produced every byte checked").
+The mac smoke run's three findings are all closed (2026-07-28): the on-disk-`path`
+column drop was ruled expected V2 behavior (golden oracle now encodes it);
+`coerce_int96_timestamp_unit` now routes INT96-decoding files to the per-file
+fallback (a cast provably can't reproduce decode-time coercion on pre-1970 values —
+Agents.md §7.11); the pickle-object guard now runs on the native path. Everything
+downstream (optimization targets, the bench re-run, the release-test pitch) keys off
+this run.
 
 ### 2. In-decode `RowFilter` + late materialization — P1
 Today a pushed filter prunes whole row groups by footer statistics (native), but inside

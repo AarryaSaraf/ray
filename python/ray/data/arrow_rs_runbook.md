@@ -127,9 +127,10 @@ already proves which path ran), and use strict for targeted checks where a read
 is *expected* fully native — e.g. re-running a single scenario or a
 production-shaped read where a silent fallback would invalidate the result.
 
-**Known open divergence to re-check on this run:**
-`coerce_int96_timestamp_unit="ms"` — pyarrow coerces to ms, the native path
-appeared to honor the file's embedded per-column hints instead (TODO item 1).
+The mac smoke run's three findings are closed as of 2026-07-28 — `path`-column
+drop ruled expected V2 behavior (golden oracle encodes it),
+`coerce_int96_timestamp_unit` → per-file fallback, pickle guard on the native
+path — so a clean corpus should now come back all-OK. Any new failure is news.
 
 ## 6. Benchmarks
 

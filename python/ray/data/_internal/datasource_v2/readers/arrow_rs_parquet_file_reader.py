@@ -73,7 +73,9 @@ Prototype limitations (documented, not hidden)
   difference is mechanical, the planned ``read()`` stays native and realigns
   post-decode via a per-file :class:`_ColumnAlignment`: schema-evolution
   columns are null-filled, per-file type drift is cast to the unified schema,
-  INT96 units are realigned (including ``coerce_int96_timestamp_unit``), and
+  INT96 hint units are upcast to pyarrow's default ns (but a file decoding
+  INT96 under ``coerce_int96_timestamp_unit`` falls back — decode-time
+  coercion floors where a cast truncates, splitting on pre-1970 values), and
   forced ``dictionary_columns`` reads are dictionary-cast. An empty projection
   with no predicate (count-style scan) decodes nothing at all — footer row
   counts answer it (:class:`_NativeCountFragment`).
@@ -247,7 +249,13 @@ _FORMAT_KWARGS_PERF_ONLY = frozenset(
     {"pre_buffer", "buffer_size", "use_buffered_stream", "cache_options"}
 )
 # Parquet-format kwargs whose *semantic* effect the planned native read
-# reproduces post-decode via ``_ColumnAlignment`` casts.
+# reproduces post-decode via ``_ColumnAlignment`` casts. Membership here means
+# the kwarg never blocks the reader; the per-file plan decides. For
+# ``coerce_int96_timestamp_unit`` the plan is a *fallback* whenever the file
+# actually decodes an INT96 column: pyarrow's decode-time coercion floors
+# (parquet types.h divides the unsigned nanos-of-day) while a post-decode cast
+# truncates toward zero — off by one unit on every pre-1970 value, so the cast
+# cannot reproduce it. Files without INT96 stay native (the kwarg is inert).
 _FORMAT_KWARGS_ALIGNED = frozenset(
     {"coerce_int96_timestamp_unit", "dictionary_columns"}
 )
@@ -1131,10 +1139,12 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         - a column absent from this file (schema evolution) → **null-fill**
           with the unified type (``None`` when there's no unified schema to
           take the type from, or the fill type is an extension);
-        - an INT96 column → **cast** to the type PyArrow produces
-          (``timestamp[coerce_int96_timestamp_unit or ns]``, truncation allowed
-          exactly like PyArrow's coercion); non-timestamp / tz-carrying INT96
-          oddities stay on PyArrow;
+        - an INT96 column → **cast** to timestamp[ns] (PyArrow's default; an
+          exact upcast from any embedded hint unit). When
+          ``coerce_int96_timestamp_unit`` is set the file **falls back**
+          instead: decode-time coercion floors, a post-decode cast truncates
+          toward zero — irreconcilable on pre-1970 values. Non-timestamp /
+          tz-carrying INT96 oddities stay on PyArrow;
         - a forced ``dictionary_columns`` read → **cast** to
           ``dictionary<int32, type>`` (what PyArrow's forced-dict decode
           yields); non-string/binary targets stay on PyArrow;
@@ -1188,15 +1198,23 @@ class ArrowRsParquetFileReader(ParquetFileReader):
             target = field_type
             allow_time_truncate = False
             if name in int96:
-                # PyArrow decodes INT96 to timestamp[coerce_unit or ns, no tz];
-                # the crate instead honors an embedded non-ns arrow-schema hint.
-                # Realign by casting to PyArrow's target. Truncation is allowed
-                # because that is precisely what PyArrow's own
-                # ``coerce_int96_timestamp_unit`` does (ns → coarser unit).
+                if coerce_unit is not None:
+                    # A cast cannot reproduce pyarrow's decode-time coercion:
+                    # pyarrow FLOORS (parquet types.h Int96GetXxx divide the
+                    # unsigned nanos-of-day before adding the signed day
+                    # offset) while a post-decode cast truncates the signed
+                    # total toward zero — one unit apart on every pre-1970
+                    # value with a sub-unit remainder (measured: all 1715
+                    # negative values in the 1964 corpus fixture). The kwarg
+                    # is honored by decoding this file via pyarrow instead.
+                    return None
+                # No kwarg: pyarrow decodes INT96 to timestamp[ns, no tz]; the
+                # crate instead honors an embedded non-ns arrow-schema hint.
+                # Realign by casting to ns — an exact upcast (multiplication),
+                # never a truncation.
                 if not (pa.types.is_timestamp(target) and target.tz is None):
                     return None  # nested/tz-carrying INT96 oddity — stay safe
-                target = pa.timestamp(coerce_unit or "ns")
-                allow_time_truncate = True
+                target = pa.timestamp("ns")
             if name in dictionary_columns:
                 # PyArrow's forced dictionary decode yields
                 # dictionary<values=type, indices=int32>. Only string/binary
