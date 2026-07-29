@@ -35,7 +35,7 @@ agreed order; `Parked` = not now, revive-trigger in the detail.
 | 2 | Optimization: in-decode `RowFilter` + late materialization | Low | Med | P1 |
 | 3 | Optimization: bloom-filter row-group pruning (`=`/`IN`) | Med | Med | P1 |
 | 4 | Optimization: wide-string decode kernel / K-split reorder | Med | Med | P1 |
-| 5 | Fix the `decode_budget=32MB` → 431 MB memory cliff | Med | Med | P1 |
+| 5 | ~~Fix the `decode_budget=32MB` → 431 MB memory cliff~~ (macOS artifact, closed) | — | — | **Done** |
 | 6 | Full bench re-run: memory + timing, incl. the `oom` axis | Med | **High** | P1 (after 2–5) |
 | 7 | Ray release tests + present the results | Med | **High** | P2 |
 | 8 | Packaging: ship the crate (wheel or optional dep) | Low–Med | **High** | P2 |
@@ -99,12 +99,18 @@ ranges make real concurrent progress while still emitting in row order (today th
 serialize — that's why best-tuned K wins at 2 M rows but not 8 M). Rust-only work,
 benchmarkable Ray-free via `standalone_decode_bench.py`.
 
-### 5. The 32 MB budget cliff — P1
-In the reader-settings sweep, `decode_budget=32 MiB` produced a 431 MB per-worker peak
-— non-linear vs 39 MB at 8 MiB (Agents.md §5.12). Suspects: the byte-budget batcher
-emitting an oversized batch over a many-group chunk, or a `fetch_window`/K interaction.
-Must be understood before any budget-sweep number above 8 MB is quoted, and before
-tuning guidance says "raise the budget for speed."
+### 5. The 32 MB budget cliff — DONE (macOS-allocator artifact, disproven on Linux)
+The macOS reader-settings sweep showed `decode_budget=32 MiB` → 431 MB per-worker peak
+(non-linear vs 39 MB at 8 MiB). Root-caused 2026-07-29 with a Ray-free `micro_alloc_probe`
+A/B: the driver is per-batch **row count** (clamped to `requested`=131072), not the budget
+value — past ~87381 rows a `huge_str` column's decode buffer crosses the 4 MiB doubling
+boundary, and **macOS retained those freed >4 MiB chunks across row groups** (a staircase
+climbing ~18 MB/group to a ~437 MB plateau). On Linux the same probe holds ~100 MB @ 8 MiB
+and ~137 MB @ 32 MiB — mild, monotonic, no cliff — because glibc `munmap`s chunks that
+size immediately. So it was never a reader bug; no crate change. The Linux budget sweep is
+quotable end-to-end (Agents.md §5.12 updated). Only lingering note: macOS dev-box RSS
+above ~16 MiB budget is allocator noise, read Linux/USS as authoritative (as §3.5.1 already
+says).
 
 ### 6. Full bench re-run (memory + timing) — P1, after 2–5
 Re-run `arrow_rs_memtrace/bench_suite.py` (all axes, Linux + real S3) once the

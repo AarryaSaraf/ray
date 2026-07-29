@@ -406,8 +406,10 @@ geometry. Env knobs added for this: `RAY_DATA_PARQUET_PRE_BUFFER`,
 reach the workers — the flatness is real, not a plumbing bug.) arrow-rs is the only
 reader with a working memory knob (26 MB @ 2 MiB budget). Caveats: (a) `pre_buffer` is
 an S3 I/O-coalescing knob, not a local memory lever (144 vs 142 MB); (b) the
-`budget=32 MiB → 431 MB` non-linear cliff is an open anomaly (see TODO.md) — not a
-number to quote as clean.
+`budget=32 MiB → 431 MB` non-linear cliff **was a macOS-allocator artifact** —
+disproven on Linux 2026-07-29 (`micro_alloc_probe` on the same fixture: ~100 MB @ 8 MiB,
+~137 MB @ 32 MiB, monotonic). macOS retained freed >4 MiB decode buffers across row
+groups; glibc munmaps them. No crate change; the Linux budget sweep is clean.
 
 ![reader-setting sweep — scanner flat, arrow-rs budget the only lever](agents_assets/reader_settings__max_task.png)
 

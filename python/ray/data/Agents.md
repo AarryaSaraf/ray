@@ -881,9 +881,14 @@ Sweeping every plausibly-bounding PyArrow knob (`batch_readahead` 1→32, `buffe
 `iter_batches`' ~85 MB floor **completely flat** — the scanner decodes whole row groups
 with internal concurrency none of those knobs bound (and the knobs were verified to
 reach the workers, so the flatness is real). **arrow-rs's byte budget is the only
-working memory knob** (26 MB @ 2 MiB budget). Two caveats: `pre_buffer` is an S3
-I/O-coalescing knob, not a local memory lever; and `budget=32 MiB → 431 MB` is an open
-non-linear anomaly (TODO.md) — don't quote budget sweeps above 8 MB until resolved.
+working memory knob** (26 MB @ 2 MiB budget). One caveat: `pre_buffer` is an S3
+I/O-coalescing knob, not a local memory lever. The macOS `budget=32 MiB → 431 MB`
+"cliff" was a **macOS-allocator artifact, disproven on Linux** (2026-07-29): a Ray-free
+`micro_alloc_probe` on the same 30-group fixture holds ~100 MB @ 8 MiB and ~137 MB @
+32 MiB — mild and monotonic, no explosion. macOS retained the crate's freed >4 MiB
+decode buffers across row groups; glibc `munmap`s them immediately. So the budget sweep
+**is** quotable on Linux (the measurement box), and macOS numbers above ~16 MiB budget
+should be read as allocator noise, not a reader property.
 
 ---
 
