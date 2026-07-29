@@ -273,6 +273,88 @@ def test_native_read_is_pyarrow_free(tmp_path, monkeypatch):
     assert got.sort_by("id").equals(table.sort_by("id"))
 
 
+def _write_pickle_object_file(path, objs):
+    import pickle
+
+    from ray.data._internal.object_extensions.arrow import ArrowPythonObjectType
+
+    ext_type = ArrowPythonObjectType()
+    storage = pa.array([pickle.dumps(o) for o in objs], type=ext_type.storage_type)
+    table = pa.table(
+        {
+            "id": pa.array(range(len(objs)), type=pa.int64()),
+            "obj": pa.ExtensionArray.from_storage(ext_type, storage),
+        }
+    )
+    pq.write_table(table, str(path), write_page_index=True)
+
+
+def test_native_read_rejects_pickle_object_columns(tmp_path, monkeypatch):
+    """The pyarrow path refuses to serve pickled-object columns without the
+    explicit env opt-in — unpickling executes arbitrary code, so the guard is
+    a security boundary, not a convenience. The native path must enforce the
+    same gate. Regression test for the corpus `pickle_default` finding, where
+    the native decode served the column with no error."""
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+
+    marker = tmp_path / "exploit_marker"
+
+    class Exploit:
+        def __reduce__(self):
+            return (os.system, (f"touch {marker}",))
+
+    path = tmp_path / "data.parquet"
+    _write_pickle_object_file(path, [Exploit()])
+
+    monkeypatch.delenv("RAY_DATA_AUTOLOAD_PICKLE_OBJECT_SCALAR", raising=False)
+
+    # Spy: the raise must come from the NATIVE path — if the file fell back,
+    # the pyarrow reader's own guard would fire and this test would prove
+    # nothing about the native one.
+    native_calls = {"n": 0}
+    orig = ray_data_arrow_rs.read_row_groups
+
+    def spy(*a, **k):
+        native_calls["n"] += 1
+        return orig(*a, **k)
+
+    monkeypatch.setattr(ray_data_arrow_rs, "read_row_groups", spy)
+
+    reader = ArrowRsParquetFileReader(
+        filesystem=LocalFileSystem(), target_block_size=128 * 1024 * 1024
+    )
+    manifest = _make_manifest([str(path)], [os.path.getsize(path)], [None])
+    with pytest.raises(ValueError, match="arrow_pickled_object"):
+        pa.concat_tables(list(reader.read(manifest)))
+
+    assert native_calls["n"] > 0, "native decode never ran (pyarrow fallback?)"
+    assert not marker.exists(), "pickle.load executed attacker code"
+
+
+def test_native_read_allows_pickle_object_columns_with_env_var(tmp_path, monkeypatch):
+    from pyarrow.fs import LocalFileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        ArrowRsParquetFileReader,
+    )
+
+    path = tmp_path / "data.parquet"
+    _write_pickle_object_file(path, [{"key": "value"}, {"key": "other"}])
+
+    monkeypatch.setenv("RAY_DATA_AUTOLOAD_PICKLE_OBJECT_SCALAR", "1")
+
+    reader = ArrowRsParquetFileReader(
+        filesystem=LocalFileSystem(), target_block_size=128 * 1024 * 1024
+    )
+    manifest = _make_manifest([str(path)], [os.path.getsize(path)], [None])
+    got = pa.concat_tables(list(reader.read(manifest))).sort_by("id")
+    assert got.column("obj").to_pylist() == [{"key": "value"}, {"key": "other"}]
+
+
 def test_native_chunked_read_row_hash_parity(tmp_path):
     """A chunked file (one manifest row per ``[row_group_start, row_group_end)``
     range) must produce byte-identical ``row_hash`` values via the native path

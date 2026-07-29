@@ -110,6 +110,9 @@ import pyarrow.dataset as pds
 from typing_extensions import override
 
 from ray._common.utils import env_integer
+from ray.data._internal.datasource.parquet_datasource import (
+    _check_for_pickle_object_columns,
+)
 from ray.data._internal.datasource_v2.native_metadata import (
     read_native_metadata as _read_native_metadata_via_crate,
 )
@@ -1433,6 +1436,13 @@ class ArrowRsParquetFileReader(ParquetFileReader):
         for batch in record_batch_reader:
             table = pa.Table.from_batches([batch], schema=record_batch_reader.schema)
             table = _apply_column_alignment(table, alignment)
+            # Same opt-in gate as the pyarrow path: unpickling an
+            # ArrowPythonObjectType column executes arbitrary code, so serving
+            # one requires the explicit env opt-in. Before the row filter — the
+            # check is schema-based, and pyarrow's scanner raises even for
+            # batches the filter would empty out.
+            if not self._allow_pickle_object_columns:
+                _check_for_pickle_object_columns(table)
             if filter_expr is not None:
                 table = table.filter(filter_expr)
                 if table.num_rows == 0:

@@ -813,7 +813,16 @@ def run_scenario(sc, path):
         rows = norm_rows(ds.take_all())
         return {"count": len(rows), "schema": schema_str, "rows": rows}
     except Exception as e:
-        return {"error": f"{type(e).__name__}: {str(e)[:300]}"}
+        # A RayTaskError's str() is a long traceback with the root cause at the
+        # END, so truncating the head used to lose it (expected_error_hit then
+        # searched 300 chars of traceback header). Record the unwrapped cause:
+        # its type is the class parity compares, its message is what
+        # expect_error substrings match against.
+        cause = getattr(e, "cause", None)
+        # RayTaskError's class name already embeds the cause class, e.g.
+        # "RayTaskError(ValueError)" — no need to repeat it.
+        msg = str(cause if cause is not None else e)[:300]
+        return {"error": f"{type(e).__name__}: {msg}"}
 
 
 def compare_payloads(a, b):
