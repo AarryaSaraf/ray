@@ -47,12 +47,23 @@ def _s3_filesystem():
 
     kw = {}
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-    if region:
-        kw["region"] = region
     endpoint = os.environ.get("AWS_ENDPOINT_URL")
     if endpoint:
         kw["endpoint_override"] = endpoint
         kw["scheme"] = "http" if endpoint.startswith("http://") else "https"
+    elif not region and _is_s3():
+        # No region anywhere in the env: S3FileSystem() then talks to the global
+        # endpoint and every HeadObject 301s ("configured region is ''"). Resolve
+        # the bucket's region the same way pyarrow's from_uri does (an anonymous
+        # HeadBucket). read_parquet's own filesystem already does this; only this
+        # explicitly-constructed writer fs missed it.
+        bucket = FIXTURE_ROOT[len("s3://") :].split("/", 1)[0]
+        try:
+            region = pafs.resolve_s3_region(bucket)
+        except Exception:
+            region = None  # fall through; creds/endpoint may still make it work
+    if region:
+        kw["region"] = region
     return pafs.S3FileSystem(**kw)
 
 
@@ -205,16 +216,29 @@ SCHEMA_BUILDERS = {
 # struct/list nesting (ungated 2026-07-21). ``blob`` is a flat binary column, so
 # it decodes natively too. Extension types (both tensor flavors) still fall back
 # to PyArrow.
-NATIVE_SCHEMAS = {"int", "float", "wide_str", "large_str", "huge_str", "blob",
-                  "struct", "list"}
+NATIVE_SCHEMAS = {
+    "int",
+    "float",
+    "wide_str",
+    "large_str",
+    "huge_str",
+    "blob",
+    "struct",
+    "list",
+}
 
 
 def _write_mixed_row_groups(table, path, sizes, filesystem=None):
     """Write `table` split into row groups whose sizes cycle through `sizes`
     (the "many large and small groups" layout, which a single row_group_size
     can't express)."""
-    with pq.ParquetWriter(path, table.schema, write_page_index=True,
-                          compression="snappy", filesystem=filesystem) as w:
+    with pq.ParquetWriter(
+        path,
+        table.schema,
+        write_page_index=True,
+        compression="snappy",
+        filesystem=filesystem,
+    ) as w:
         off = 0
         i = 0
         n = table.num_rows
@@ -252,8 +276,14 @@ def make_fixture(name, spec):
         if "row_group_sizes" in spec:
             _write_mixed_row_groups(table, out, spec["row_group_sizes"], filesystem=fs)
         else:
-            pq.write_table(table, out, row_group_size=spec["row_group_size"],
-                           write_page_index=True, compression="snappy", filesystem=fs)
+            pq.write_table(
+                table,
+                out,
+                row_group_size=spec["row_group_size"],
+                write_page_index=True,
+                compression="snappy",
+                filesystem=fs,
+            )
     return uri
 
 
@@ -269,13 +299,25 @@ def make_mixed_fixture(name="mixed7_tensor", per=400_000):
     if not _is_s3():
         os.makedirs(path, exist_ok=True)
     rng = np.random.default_rng(0)
-    specs = [("int", _ints), ("float", _floats), ("wide_str", _wide_str),
-             ("large_str", _large_str), ("huge_str", _huge_str), ("struct", _struct),
-             ("ray_tensor", _ray_tensor)]
+    specs = [
+        ("int", _ints),
+        ("float", _floats),
+        ("wide_str", _wide_str),
+        ("large_str", _large_str),
+        ("huge_str", _huge_str),
+        ("struct", _struct),
+        ("ray_tensor", _ray_tensor),
+    ]
     for i, (nm, build) in enumerate(specs):
         tbl = pa.table(build(rng, per))
-        pq.write_table(tbl, f"{path}/part-{i:04d}_{nm}.parquet", row_group_size=per,
-                       write_page_index=True, compression="snappy", filesystem=fs)
+        pq.write_table(
+            tbl,
+            f"{path}/part-{i:04d}_{nm}.parquet",
+            row_group_size=per,
+            write_page_index=True,
+            compression="snappy",
+            filesystem=fs,
+        )
     return uri
 
 
