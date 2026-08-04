@@ -973,6 +973,66 @@ identical chunk boundaries flag on/off (verified across target sizes; flag-on ma
 `pq.read_metadata` calls). Result: the two footer reads a supported file used to incur
 (PyArrow in the listing task + arrow-rs in the read task) are now both arrow-rs.
 
+### Phase 4 (release-suite regressions → wide-schema S3 closed as a win)
+
+**6.12 Wide-schema S3 memory blow-up: root cause and the two-part fix (2026-08-03/04).**
+The first flag-on run of Ray's release suite surfaced two regressions vs PyArrow:
+`wide_schema_pipeline_primitives` (5000 columns, S3) at **1.50× more memory**, and
+`mix.8ds_equal_random_mix` (imagenet, many tiny row groups) at 1.67× time. A single-node
+probe (`release/nightly_tests/dataset/arrow_rs_probe/`) reproduced the wide one:
+arrow_rs 4.4–5.6 GB peak-USS per node vs PyArrow's 2.48 on a 4×450 MB-file fixture —
+after first fixing the probe itself (10 Hz sampling missed a short spike; the sampler
+summed the workspace's other Ray instance's workers; fixed = 50 Hz + raylet-descendant
+isolation, giving PyArrow a <0.2% run-to-run spread).
+
+*Root cause.* The async reader's `InMemoryRowGroup` fetches and holds **every projected
+column chunk of a row group at once**, and per-column decode scratch for all 5000
+columns is alive concurrently. A column-count sweep (500→5000 cols on the same file)
+showed the overhead above output grows **superlinearly** (~0.9→0.9→1.9→3.7 GB as
+columns double), while the row-windowed fetch path is structurally inert here:
+`effective_window_step` clamps a fetch window up to one full page, and a wide/short
+group's pages span all rows, so every `fetch_window_mb` collapses to "the whole group"
+(measured: peak flat 4.5–4.7 across fetch_window_mb ∈ {4,16,64,0}). Rows were never
+the blow-up axis; columns were.
+
+*Fix part 1 — column-windowing (`drive_colwindowed`).* Partition a wide group's
+projected column chunks into groups of ≤ `column_fetch_mb` compressed bytes
+(`partition_columns_by_budget`, exact sizes from the footer), decode them one group at
+a time (each group's compressed bytes + scratch freed before the next), then hstack the
+row-aligned batches zero-copy (`ArrayRef` clones are `Arc` bumps — output is held once,
+same as PyArrow). Sweep at concurrency=1: 256 MB→3.16 GB, 64→2.30, 16→1.85, 4→1.76,
+**byte-identical `read_output_gb` (1.9372) throughout** and 0 mismatched rows vs
+PyArrow on a forced-multi-group 50-column sort-compare. Default `column_fetch_mb=16`
+(the knee: minimum memory at wall parity). Note peak-USS *below* output size is real:
+output blocks live in plasma (shared memory), USS counts only the worker's private
+decode working set.
+
+*Fix part 2 — budget-gated concurrent prefetch.* Sequential column groups left the
+decoder idle during every S3 GET (cpu/wall 0.36). An admission loop acquires permits
+from a **KiB-denominated semaphore** (the "bucket", default 4 × `column_fetch_mb`)
+sized per group from footer metadata, and spawns that group's ranged GET; fetches run
+concurrently up to the bucket while decode stays strictly one-group-at-a-time (the
+scratch bound from part 1). Dropping a decoded group's bytes releases its permits and
+wakes the next fetch — fetch concurrency self-adjusts to the fetch:decode speed ratio
+with no rate estimation, and peak prefetch memory is the bucket by construction.
+Measured (concurrency=1): read 48.3 s → **13.3 s (3.6×)** at bucket=64 MB with peak
+1.86 GB (unchanged); bucket=256 reaches 9.4 s (cpu/wall 1.05, fully decode-bound) but
+costs +0.77 GB — memory-first keeps 4×.
+
+*End state (Linux + real S3, fanned out over 4 files, 3 runs each).* Wide schema:
+PyArrow 6.78 GB / 17.1 s vs arrow_rs **4.44 GB / 9.3 s** — the 1.50×-worse release
+number is now **0.66× memory and 1.9× faster**. Imagenet no-regression gate: PyArrow
+6.9 s / 4.31 GB vs arrow_rs 7.2 s / **3.11 GB** (wall parity within 4%, 28% less
+memory; the column machinery can't engage on a 2-column schema — and the old 1.67×
+single-node time gap did not reproduce in this probe). Knobs: `column_fetch_mb`
+(`RAY_DATA_ARROW_RS_COLUMN_FETCH_MB`, default 16) is the one tunable; the bucket
+derives as 4× it (`RAY_DATA_ARROW_RS_COLUMN_PREFETCH_BUDGET_MB` overrides; 0 =
+sequential). Also fixed en route: `arrow_rs_column_fetch_mb` (and the new key) were
+missing from `ARROW_RS_TUNING_KWARGS`, so the documented `dataset_kwargs` path raised
+"Unknown arrow-rs tuning kwargs" — env vars had masked it. Commits (PR branch):
+`a7c580e12c` (column-windowing), `d6bd9356c6` (prefetch + cf=16 default + allowlist),
+`25825c4b7a` (4× derivation).
+
 ---
 
 ## 7. Open holes — what we want critiqued

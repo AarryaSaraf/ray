@@ -126,6 +126,13 @@ Wire the reader into Ray's existing release/nightly Parquet benchmarks (the harn
 `release/nightly_tests/dataset/` already models this) and assemble the presentation:
 the mechanism (Agents.md §3), the deciding numbers (§5.10 + the re-run), and the
 honest caveats (§5.7 decode gap, deliberate fallbacks §7.11).
+**Status 2026-08-04: the first flag-on release-suite run happened and surfaced two
+regressions; both are resolved (Agents.md §6.12).** `wide_schema_pipeline_primitives`
+(5000 cols, S3, was 1.50× more memory) is now a *win* — 0.66× memory + 1.9× faster —
+via column-windowing (`column_fetch_mb=16` default) + a byte-semaphore prefetch bucket
+(4× that). `mix.8ds` imagenet showed wall parity + 28% less memory on the single-node
+probe (the 1.67× release gap did not reproduce there; re-check multi-node on the next
+suite run). Next suite run should confirm both at release scale.
 
 ### 8. Packaging — P2
 The crate must reach users somehow; today it's built locally with `maturin`. Two routes:
