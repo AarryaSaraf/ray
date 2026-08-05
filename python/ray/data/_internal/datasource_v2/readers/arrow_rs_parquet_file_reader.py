@@ -109,6 +109,7 @@ Prototype limitations (documented, not hidden)
 import json
 import logging
 import os
+import time
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
@@ -384,6 +385,7 @@ def _raise_if_strict_no_fallback(reason: str) -> None:
     dropped off the native path onto PyArrow.
     """
     logger.warning("Ray Data ARROW-RS: falling back to PyArrow — %s", reason)
+    _prof_record("fallback", reason=reason)
     if os.environ.get("RAY_DATA_ARROW_RS_STRICT", "").lower() in ("", "0", "false"):
         return
     raise RuntimeError(
@@ -392,6 +394,39 @@ def _raise_if_strict_no_fallback(reason: str) -> None:
         "must prove the native arrow-rs path ran; unset the env var to allow "
         "the fallback."
     )
+
+
+def _prof_dir() -> Optional[str]:
+    """Directory for profiling records, or ``None`` when profiling is off.
+
+    Deliberately the *same* variable the native crate reads
+    (``RAY_DATA_ARROW_RS_PROFILE_DIR``), so a run's Python-side and Rust-side
+    records land in one directory and can be joined on ``pid`` — the Python
+    record says which fragment and why it took a path, the Rust record says what
+    the planner then did with it.
+    """
+    if os.environ.get("RAY_DATA_ARROW_RS_PROFILE", "").lower() in ("", "0", "false"):
+        return None
+    return os.environ.get("RAY_DATA_ARROW_RS_PROFILE_DIR") or None
+
+
+def _prof_record(kind: str, **fields: Any) -> None:
+    """Append one JSON profiling record. Never raises into the read path."""
+    prof_dir = _prof_dir()
+    if not prof_dir:
+        return
+    try:
+        import json as _json
+        import socket
+
+        rec = {"kind": kind, "pid": os.getpid(), "host": socket.gethostname(), **fields}
+        # One file per process, append-only: a single small write is atomic under
+        # O_APPEND, so the reader threads in a task can't interleave lines.
+        fname = f"arrow_rs_prof_{os.getpid()}.jsonl"
+        with open(os.path.join(prof_dir, fname), "a") as fh:
+            fh.write(_json.dumps(rec) + "\n")
+    except Exception:  # noqa: BLE001 - instrumentation must never fail a read
+        pass
 
 
 def _trace_reader_path(supported: bool) -> None:
@@ -1656,11 +1691,23 @@ class ArrowRsParquetFileReader(ParquetFileReader):
 
         record_batch_reader = pa.RecordBatchReader.from_stream(reader)
 
+        # Per-fragment profiling: what we asked the crate for, and what came back.
+        # Pairs with the crate's own ``s3_plan``/``s3_rg``/``local_rg`` records
+        # (same pid, same directory) to give one joined view per fragment.
+        prof = _prof_dir() is not None
+        prof_t0 = time.perf_counter() if prof else 0.0
+        prof_rows = prof_bytes = prof_batches = prof_peak = 0
+
         # Yield each budget-sized batch straight through. The read op's
         # BlockOutputBuffer coalesces to target_max_block_size downstream (same
         # as the PyArrow path) — accumulating a full block here too would just
         # stack a second block-sized buffer on top of it. See module docstring.
         for batch in record_batch_reader:
+            if prof:
+                prof_batches += 1
+                prof_rows += batch.num_rows
+                prof_bytes += batch.nbytes
+                prof_peak = max(prof_peak, batch.nbytes)
             table = pa.Table.from_batches([batch], schema=record_batch_reader.schema)
             table = _apply_column_alignment(table, alignment)
             if expected_schema is not None:
@@ -1679,3 +1726,34 @@ class ArrowRsParquetFileReader(ParquetFileReader):
             if columns is not None:
                 table = table.select([c for c in columns if c in table.column_names])
             yield table
+
+        if prof:
+            _prof_record(
+                "fragment",
+                path=path,
+                row_groups=row_groups,
+                num_row_groups=(len(row_groups) if row_groups is not None else None),
+                storage=("s3" if isinstance(fs, S3FileSystem) else "local"),
+                columns=read_columns,
+                num_columns=(len(read_columns) if read_columns else None),
+                batch_size=batch_size,
+                wall_s=round(time.perf_counter() - prof_t0, 4),
+                batches=prof_batches,
+                rows=prof_rows,
+                decoded_bytes=prof_bytes,
+                peak_batch_bytes=prof_peak,
+                # Resolved knobs, so a sweep's records are self-describing.
+                decode_budget_bytes=tuning.decode_budget_bytes,
+                fetch_window_mb=tuning.fetch_window_mb,
+                column_fetch_mb=tuning.column_fetch_mb,
+                prefetch_budget_mb=(
+                    tuning.prefetch_budget_mb
+                    if tuning.prefetch_budget_mb is not None
+                    else 4 * max(tuning.fetch_window_mb, tuning.column_fetch_mb)
+                ),
+                k=tuning.k,
+                split_threshold_bytes=split_threshold,
+                target_block_size=self._target_block_size,
+                has_predicate=predicate_json is not None,
+                has_filter=filter_expr is not None,
+            )

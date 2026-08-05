@@ -137,6 +137,73 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 // --------------------------------------------------------------------------- //
+// Profiling (opt-in, zero cost when off)
+// --------------------------------------------------------------------------- //
+// Set `RAY_DATA_ARROW_RS_PROFILE=1` to emit one JSON object per planning /
+// decode event. These are the facts the Python layer cannot see and that the
+// regression hypotheses turn on:
+//
+//   * `kind:"s3_plan"`   — which split axis a row group took (`col_group_rgs` vs
+//     `row_window_rgs`), how many units, and **how many units are larger than the
+//     whole prefetch budget** (`oversized_units` > 0 means fetch is serialized
+//     against decode — one unit holds the entire semaphore).
+//   * `kind:"s3_rg"`     — per row group: fetch-wait vs decode seconds, and for
+//     the column-group path `retained_bytes` = the decoded bytes held
+//     simultaneously to hstack. That number *is* the working set; if it tracks
+//     the whole row group, `decode_budget_bytes` is not bounding anything.
+//   * `kind:"local_rg"`  — the effective decode batch: `eff_rows` and
+//     `eff_batch_bytes` vs the budget, so a floored batch is visible directly.
+//
+// Records go to `$RAY_DATA_ARROW_RS_PROFILE_DIR/arrow_rs_prof_<pid>.jsonl` when
+// that variable is set (one file per worker process, append-only, line-atomic),
+// otherwise to stderr prefixed `ARROW_RS_PROF ` so they can be grepped out of
+// Ray worker logs.
+fn prof_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("RAY_DATA_ARROW_RS_PROFILE").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        )
+    })
+}
+
+fn prof_dir() -> Option<&'static String> {
+    static DIR: OnceLock<Option<String>> = OnceLock::new();
+    DIR.get_or_init(|| std::env::var("RAY_DATA_ARROW_RS_PROFILE_DIR").ok())
+        .as_ref()
+}
+
+/// Emit one profiling record. `fields` must be JSON object body without braces.
+fn prof_emit(kind: &str, fields: String) {
+    if !prof_enabled() {
+        return;
+    }
+    let line = format!(
+        "{{\"kind\":\"{}\",\"pid\":{},{}}}",
+        kind,
+        std::process::id(),
+        fields
+    );
+    match prof_dir() {
+        Some(dir) => {
+            use std::io::Write;
+            let path = format!("{}/arrow_rs_prof_{}.jsonl", dir, std::process::id());
+            // Best-effort: profiling must never fail a read. O_APPEND makes a
+            // single small write atomic, so concurrent threads can't interleave.
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(f, "{}", line);
+            }
+        }
+        None => eprintln!("ARROW_RS_PROF {}", line),
+    }
+}
+
+// --------------------------------------------------------------------------- //
 // Byte-budget batch sizing (ported from main.rs `byte_budget_rows`)
 // --------------------------------------------------------------------------- //
 /// Choose a batch row count so `rows * bytes_per_row ~= budget_bytes`, using the
@@ -667,6 +734,30 @@ impl RowGroupSeqReader {
             self.batch_clamp,
             self.budget_bytes,
         );
+        if prof_enabled() {
+            // `eff_batch_bytes` vs `budget_bytes` shows directly whether the 2048-row
+            // floor has overridden the byte budget (it does above ~budget/2048 per row).
+            let bpr = (rgm.total_byte_size() as f64 / rgm.num_rows().max(1) as f64).max(1.0);
+            prof_emit(
+                "local_rg",
+                format!(
+                    "\"path\":\"{}\",\"rg\":{},\"eff_rows\":{},\"bytes_per_row\":{:.1},\
+                     \"eff_batch_bytes\":{:.0},\"budget_bytes\":{},\"batch_clamp\":{},\
+                     \"rg_rows\":{},\"rg_uncompressed_bytes\":{},\"floored\":{}",
+                    self.path,
+                    rg,
+                    eff,
+                    bpr,
+                    eff as f64 * bpr,
+                    self.budget_bytes,
+                    self.batch_clamp,
+                    rgm.num_rows(),
+                    rgm.total_byte_size(),
+                    // The floor bound the batch rather than the byte budget.
+                    (self.budget_bytes as f64 / bpr) < 2048.0
+                ),
+            );
+        }
         ParquetRecordBatchReaderBuilder::new_with_metadata(
             File::open(&self.path)?,
             self.meta.clone(),
@@ -1399,6 +1490,40 @@ async fn drive_s3(
 
     // --- admission loop: budget-gated concurrent prefetch ---
     let budget_kib = prefetch_budget_mb.saturating_mul(1024).max(1);
+
+    // Plan shape: which axis each row group took, and whether any unit is larger
+    // than the whole bucket (an oversized unit acquires every permit, so it
+    // fetches alone and decode cannot overlap it).
+    if prof_enabled() {
+        let hstack_rgs = rg_plans
+            .iter()
+            .filter(|p| matches!(p.decode, RgDecode::Hstack(_)))
+            .count();
+        let oversized = units.iter().filter(|u| u.kib > budget_kib).count();
+        prof_emit(
+            "s3_plan",
+            format!(
+                "\"path\":\"{}\",\"row_groups\":{},\"col_group_rgs\":{},\"row_window_rgs\":{},\
+                 \"units\":{},\"unit_kib_sum\":{},\"unit_kib_max\":{},\"oversized_units\":{},\
+                 \"prefetch_budget_kib\":{},\"colwindow_budget_bytes\":{},\"fetch_window_mb\":{},\
+                 \"decode_budget_bytes\":{},\"batch_clamp\":{},\"batch_rows\":{}",
+                path,
+                rg_plans.len(),
+                hstack_rgs,
+                rg_plans.len() - hstack_rgs,
+                units.len(),
+                units.iter().map(|u| u.kib).sum::<u64>(),
+                units.iter().map(|u| u.kib).max().unwrap_or(0),
+                oversized,
+                budget_kib,
+                colwindow_budget,
+                fetch_window_mb,
+                decode_budget,
+                batch_clamp,
+                rg_plans.first().map(|p| p.batch_rows).unwrap_or(0),
+            ),
+        );
+    }
     let budget_kib = budget_kib.min(u32::MAX as u64 / 2);
     let sem = Arc::new(Semaphore::new(budget_kib as usize));
     // Handles are tiny; the byte budget is what actually bounds prefetch. The
@@ -1448,14 +1573,26 @@ async fn drive_s3(
     for plan in rg_plans {
         match plan.decode {
             RgDecode::Windows(n) => {
+                let (mut fetch_s, mut decode_s, mut nb, mut peak_batch) = (0f64, 0f64, 0usize, 0);
                 for _ in 0..n {
-                    let mut stream =
-                        match next_unit_stream(&mut hrx, &meta, plan.rg, plan.batch_rows).await {
-                            Ok(s) => s,
-                            Err(e) => send_err!(e),
-                        };
-                    while let Some(item) = stream.next().await {
+                    let t = std::time::Instant::now();
+                    let stream =
+                        next_unit_stream(&mut hrx, &meta, plan.rg, plan.batch_rows).await;
+                    fetch_s += t.elapsed().as_secs_f64();
+                    let mut stream = match stream {
+                        Ok(s) => s,
+                        Err(e) => send_err!(e),
+                    };
+                    loop {
+                        let t = std::time::Instant::now();
+                        let item = stream.next().await;
+                        decode_s += t.elapsed().as_secs_f64();
+                        let Some(item) = item else { break };
                         let is_err = item.is_err();
+                        if let Ok(b) = &item {
+                            nb += 1;
+                            peak_batch = peak_batch.max(b.get_array_memory_size());
+                        }
                         let msg = item.map_err(|e| ArrowError::ExternalError(Box::new(e)));
                         if tx.send(msg).await.is_err() {
                             return; // consumer dropped
@@ -1467,17 +1604,37 @@ async fn drive_s3(
                     // `stream` drops here -> window bytes freed, permits
                     // released, next fetch admitted.
                 }
+                if prof_enabled() {
+                    prof_emit(
+                        "s3_rg",
+                        format!(
+                            "\"rg\":{},\"mode\":\"row_windows\",\"units\":{},\"batch_rows\":{},\
+                             \"batches\":{},\"peak_batch_bytes\":{},\"retained_bytes\":{},\
+                             \"fetch_wait_s\":{:.4},\"decode_s\":{:.4}",
+                            plan.rg, n, plan.batch_rows, nb, peak_batch, peak_batch, fetch_s,
+                            decode_s
+                        ),
+                    );
+                }
             }
             RgDecode::Hstack(n) => {
+                let (mut fetch_s, mut decode_s) = (0f64, 0f64);
                 let mut group_batches: Vec<Vec<RecordBatch>> = Vec::with_capacity(n);
                 for _ in 0..n {
-                    let mut stream =
-                        match next_unit_stream(&mut hrx, &meta, plan.rg, plan.batch_rows).await {
-                            Ok(s) => s,
-                            Err(e) => send_err!(e),
-                        };
+                    let t = std::time::Instant::now();
+                    let stream =
+                        next_unit_stream(&mut hrx, &meta, plan.rg, plan.batch_rows).await;
+                    fetch_s += t.elapsed().as_secs_f64();
+                    let mut stream = match stream {
+                        Ok(s) => s,
+                        Err(e) => send_err!(e),
+                    };
                     let mut batches = Vec::new();
-                    while let Some(item) = stream.next().await {
+                    loop {
+                        let t = std::time::Instant::now();
+                        let item = stream.next().await;
+                        decode_s += t.elapsed().as_secs_f64();
+                        let Some(item) = item else { break };
                         match item {
                             Ok(b) => batches.push(b),
                             Err(e) => send_err!(ArrowError::ExternalError(Box::new(e))),
@@ -1486,6 +1643,36 @@ async fn drive_s3(
                     group_batches.push(batches);
                     // Group bytes + permits released here; decoded batches (the
                     // output) are retained for the hstack below.
+                }
+
+                // The decisive H1 measurement: how many decoded bytes are held
+                // *simultaneously* to stitch this row group. If this tracks the
+                // whole row group, `decode_budget_bytes` bounds nothing here.
+                if prof_enabled() {
+                    let retained: usize = group_batches
+                        .iter()
+                        .flat_map(|g| g.iter())
+                        .map(|b| b.get_array_memory_size())
+                        .sum();
+                    let nb: usize = group_batches.iter().map(|g| g.len()).sum();
+                    let rgm = meta.metadata().row_group(plan.rg);
+                    prof_emit(
+                        "s3_rg",
+                        format!(
+                            "\"rg\":{},\"mode\":\"column_groups\",\"units\":{},\"batch_rows\":{},\
+                             \"batches\":{},\"retained_bytes\":{},\"rg_rows\":{},\
+                             \"rg_uncompressed_bytes\":{},\"fetch_wait_s\":{:.4},\"decode_s\":{:.4}",
+                            plan.rg,
+                            n,
+                            plan.batch_rows,
+                            nb,
+                            retained,
+                            rgm.num_rows(),
+                            rgm.total_byte_size(),
+                            fetch_s,
+                            decode_s
+                        ),
+                    );
                 }
 
                 // --- hstack the row-aligned batches into full-width batches ---

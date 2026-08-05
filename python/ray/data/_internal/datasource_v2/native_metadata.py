@@ -8,6 +8,7 @@ module holds the logic they share (filesystem eligibility, S3 config bridging,
 and the actual ``read_metadata`` call) so neither layer imports the other.
 """
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -56,13 +57,31 @@ def s3_config(fs: "S3FileSystem") -> dict:
     # the endpoint override is an http:// URL, so trust the endpoint URL first.
     allow_http = (str(endpoint).startswith("http://")) or opts.get("scheme") == "http"
 
+    anonymous = bool(opts.get("anonymous", False))
+    access_key_id = _val("access_key")
+    secret_access_key = _val("secret_key")
+    session_token = _val("session_token")
+    if not anonymous and access_key_id is None:
+        # `S3FileSystem()` built with no explicit keys resolves credentials
+        # internally, but `__reduce__` reports them as unset -- so the crate would
+        # receive none and fall back to object_store's own chain, which reaches for
+        # EC2 instance metadata (169.254.169.254). On an instance that works and
+        # hides the gap; anywhere credentials live only in the environment (a
+        # laptop, a container with IMDS disabled) every read fails after a ~7 s
+        # IMDS timeout with "Error performing PUT http://169.254.169.254/...".
+        # Read the standard env vars ourselves, which is the same place the
+        # ambient chain would look first, so both clients agree.
+        access_key_id = os.environ.get("AWS_ACCESS_KEY_ID") or None
+        secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or None
+        session_token = os.environ.get("AWS_SESSION_TOKEN") or None
+
     return {
         "region": _val("region") or "us-east-1",
-        "anonymous": bool(opts.get("anonymous", False)),
+        "anonymous": anonymous,
         "endpoint": endpoint,
-        "access_key_id": _val("access_key"),
-        "secret_access_key": _val("secret_key"),
-        "session_token": _val("session_token"),
+        "access_key_id": access_key_id,
+        "secret_access_key": secret_access_key,
+        "session_token": session_token,
         "allow_http": allow_http,
         "virtual_hosted_style": bool(opts.get("force_virtual_addressing", False)),
     }

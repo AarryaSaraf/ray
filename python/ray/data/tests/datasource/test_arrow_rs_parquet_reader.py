@@ -1624,6 +1624,43 @@ def test_s3_config_recovers_endpoint_and_creds(s3_fs):
     assert cfg["anonymous"] is False
 
 
+def test_s3_config_falls_back_to_env_credentials(monkeypatch):
+    """A filesystem built with no explicit keys must still hand the crate creds.
+
+    ``S3FileSystem()`` resolves credentials internally, but ``__reduce__`` reports
+    ``access_key``/``secret_key`` as unset — so without this fallback the crate
+    receives none and object_store reaches for EC2 instance metadata
+    (169.254.169.254). On an instance that silently works; anywhere credentials
+    live only in the environment every read dies after the IMDS timeout.
+    """
+    from pyarrow.fs import S3FileSystem
+
+    from ray.data._internal.datasource_v2.readers.arrow_rs_parquet_file_reader import (
+        _s3_config,
+    )
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "env-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "env-secret")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "env-token")
+
+    cfg = _s3_config(S3FileSystem(region="us-west-2"))
+    assert cfg["access_key_id"] == "env-key"
+    assert cfg["secret_access_key"] == "env-secret"
+    assert cfg["session_token"] == "env-token"
+
+    # Explicit keys on the filesystem must still win over the environment.
+    cfg = _s3_config(
+        S3FileSystem(region="us-west-2", access_key="fs-key", secret_key="fs-secret")
+    )
+    assert cfg["access_key_id"] == "fs-key"
+    assert cfg["secret_access_key"] == "fs-secret"
+
+    # An anonymous filesystem must stay anonymous, whatever is in the env.
+    cfg = _s3_config(S3FileSystem(region="us-west-2", anonymous=True))
+    assert cfg["anonymous"] is True
+    assert cfg["access_key_id"] is None
+
+
 def test_read_metadata_s3_matches_pyarrow(s3_fs, s3_path):
     """`read_metadata_s3` fetches the footer over the moto endpoint (same config
     recovery as the data path) and returns the same schema + row-group counts as
