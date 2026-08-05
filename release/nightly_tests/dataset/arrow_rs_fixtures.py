@@ -176,7 +176,7 @@ def _build_table(name: str, rng, args) -> pa.Table:
     raise ValueError(name)
 
 
-def _filesystem(out: str, endpoint: Optional[str]):
+def _filesystem(out: str, endpoint: Optional[str], region: Optional[str] = None):
     """Return ``(filesystem, path)``. A local path gets ``None`` (pyarrow infers
     a LocalFileSystem); an ``s3://`` path with an endpoint gets an explicitly
     configured S3FileSystem so MinIO/moto works without ambient AWS config."""
@@ -191,6 +191,11 @@ def _filesystem(out: str, endpoint: Optional[str]):
         kwargs["endpoint_override"] = endpoint
         # MinIO/moto over plain HTTP; the real thing uses TLS and ignores this.
         kwargs["scheme"] = "http" if endpoint.startswith("http://") else "https"
+    # Against real S3, pin the region rather than letting pyarrow discover it:
+    # the crate's object_store client is given one explicitly, and a mismatch
+    # shows up as a confusing PermanentRedirect only on the arrow-rs arm.
+    if region:
+        kwargs["region"] = region
     fs = S3FileSystem(**kwargs)
     return fs, path
 
@@ -223,7 +228,7 @@ def _chunk_report(local_or_buf, name: str) -> dict:
 def write_shape(name: str, args) -> dict:
     spec = SHAPES[name]
     rng = np.random.default_rng(abs(hash(name)) % (2**31))
-    fs, base = _filesystem(args.out, args.endpoint)
+    fs, base = _filesystem(args.out, args.endpoint, getattr(args, "region", None))
     report = None
     for file_index in range(spec["num_files"]):
         table = _build_table(spec["build"], rng, args)
@@ -267,6 +272,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help=f"Comma-separated subset of {sorted(SHAPES)}, or 'all'",
     )
     p.add_argument("--endpoint", default=None, help="S3 endpoint (MinIO/moto)")
+    p.add_argument(
+        "--region",
+        default=os.environ.get("AWS_DEFAULT_REGION"),
+        help="S3 region for real-S3 writes (default: $AWS_DEFAULT_REGION)",
+    )
     p.add_argument("--compression", default="snappy")
     p.add_argument(
         "--fat-chunk-mib",

@@ -14,6 +14,21 @@ REPO="$(cd "$HERE/../../../.." && pwd)"
 OUT_DIR="${OUT_DIR:-$HERE/out}"
 mkdir -p "$OUT_DIR"
 
+# --- our own S3 bucket --------------------------------------------------------
+# Everything reads and writes here: fixtures, the staged TPC-H copy, and exp3's
+# output. Using a bucket we own removes the permission question entirely (the
+# shared `ray-benchmark-data` is readable but not writable, and its sibling
+# `-internal-` bucket is not readable at all), and it means the S3 experiments
+# run against REAL S3 -- real latency, real concurrency limits -- which is what
+# the prefetch/serialisation hypothesis actually needs.
+S3_BUCKET="${S3_BUCKET:-arrowrs-bench-21f6c795}"
+S3_PREFIX="${S3_PREFIX:-arrow_rs_probe}"
+S3_ROOT="s3://$S3_BUCKET/$S3_PREFIX"
+# Both pyarrow and the crate must agree on the region; pyarrow can discover it
+# per bucket, object_store cannot, so pin it.
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-west-2}"
+export AWS_REGION="${AWS_REGION:-$AWS_DEFAULT_REGION}"
+
 NUM_CPUS="${NUM_CPUS:-8}"
 # ~8 GiB of a 32 GB box. Ray's default is 30% of *free* RAM; pinning it keeps the
 # object store from being a moving target between the two arms.
@@ -59,6 +74,32 @@ print(f"env OK: ray.data={resolved}")
 PYEOF
 }
 export REPO
+
+# --- guard: can we actually reach the bucket, both ways? ----------------------
+# Fails in seconds instead of ten minutes into a run. Checks WRITE too, because
+# exp3 writes and a read-only credential would only surface at the end.
+check_s3() {
+  S3_BUCKET="$S3_BUCKET" S3_PREFIX="$S3_PREFIX" python - <<'PYEOF'
+import os, sys
+from pyarrow.fs import S3FileSystem
+bucket, prefix = os.environ["S3_BUCKET"], os.environ["S3_PREFIX"]
+region = os.environ.get("AWS_DEFAULT_REGION", "us-west-2")
+probe = f"{bucket}/{prefix}/.probe"
+try:
+    fs = S3FileSystem(region=region)
+    with fs.open_output_stream(probe) as f:
+        f.write(b"ok")
+    fs.delete_file(probe)
+except Exception as exc:
+    sys.exit(
+        f"FATAL: cannot write s3://{probe} ({type(exc).__name__}: {exc}).\n"
+        "On an EC2/Anyscale box credentials come from the instance role and no\n"
+        "export is needed. Otherwise:  "
+        'eval "$(aws configure export-credentials --format env)"'
+    )
+print(f"s3 OK: s3://{bucket}/{prefix} readable and writable in {region}")
+PYEOF
+}
 
 # Run one command with the arrow-rs reader on (arg 1 = "arrow_rs"|"pyarrow"),
 # profiling into a per-run directory. Remaining args are the command.

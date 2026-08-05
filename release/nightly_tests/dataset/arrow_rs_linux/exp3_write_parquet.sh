@@ -15,17 +15,21 @@
 # Scaled down from the release config (sf1000 -> sf10); the shape is what
 # matters, not the volume.
 #
-# Needs: AWS credentials (input bucket) and ~10 GB of local disk for the output.
-# The release target bucket is not writable outside the release account, hence
-# RAY_DATA_BENCH_WRITE_ROOT.
+# Needs: credentials for our bucket. Both the input and the output live there,
+# so this exercises the real S3 write path the release case uses -- writing to
+# local disk instead would change the very thing under test (the write task's
+# memory profile), since a local write has no multipart upload buffering.
 #
 # Runtime: ~20 min for four arms.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 check_env
+check_s3
 
-DATA="${DATA:-s3://ray-benchmark-data/tpch/parquet/sf10/lineitem}"
-export RAY_DATA_BENCH_WRITE_ROOT="${RAY_DATA_BENCH_WRITE_ROOT:-$OUT_DIR/write}"
-mkdir -p "$RAY_DATA_BENCH_WRITE_ROOT"
+SF="${SF:-10}"
+DATA="${DATA:-$S3_ROOT/tpch/sf$SF/lineitem}"
+export RAY_DATA_BENCH_WRITE_ROOT="${RAY_DATA_BENCH_WRITE_ROOT:-$S3_ROOT/write}"
+
+python "$HERE/stage_data.py" --dst "$DATA" --sf "$SF" --region "$AWS_DEFAULT_REGION"
 
 cd "$DATASET_DIR"
 
@@ -42,8 +46,30 @@ for budget in 2097152 33554432 134217728; do
     python read_and_consume_benchmark.py "$DATA" --format parquet --write
 done
 
-# Clean up the written data -- sf10 lineitem is a few GB per arm.
-rm -rf "${RAY_DATA_BENCH_WRITE_ROOT:?}"/*
+# Clean up the written data -- sf10 lineitem is a few GB per arm, four arms.
+# Deliberately narrow: refuses to touch anything outside our own prefix, so a
+# mis-set RAY_DATA_BENCH_WRITE_ROOT cannot delete a bucket root.
+WRITE_ROOT="$RAY_DATA_BENCH_WRITE_ROOT" S3_PREFIX="$S3_PREFIX" python - <<'PYEOF'
+import os, shutil
+root, prefix = os.environ["WRITE_ROOT"], os.environ["S3_PREFIX"]
+if not root.startswith("s3://"):
+    shutil.rmtree(root, ignore_errors=True)
+    raise SystemExit(0)
+bucket, _, key = root[len("s3://") :].partition("/")
+if not key or prefix not in key:
+    raise SystemExit(f"refusing to delete s3://{bucket}/{key} -- not under {prefix}/")
+import boto3
+client = boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION"))
+deleted = 0
+for page in client.get_paginator("list_objects_v2").paginate(
+    Bucket=bucket, Prefix=key.rstrip("/") + "/"
+):
+    batch = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+    if batch:
+        client.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+        deleted += len(batch)
+print(f"cleaned {deleted} objects under s3://{bucket}/{key}")
+PYEOF
 
 python "$HERE/compare_results.py" \
   "$OUT_DIR"/exp3_write_budget*_arrow_rs.json \

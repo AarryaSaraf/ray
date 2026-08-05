@@ -13,8 +13,13 @@ all of them in the crate's **S3** planner — `plan_s3_units`,
 `partition_columns_by_budget`, and the prefetch admission loop. Those functions
 exist only in `read_row_groups_s3`; the local-filesystem path has no units, no
 column groups and no fetch budget. **That is why no benchmark we had ever run
-touched them**, and why experiment 2 needs an S3 endpoint even though it runs on
-localhost.
+touched them**, and why all three experiments go through S3.
+
+Everything reads and writes `s3://arrowrs-bench-21f6c795/arrow_rs_probe/`
+(us-west-2) — a bucket we own, so there is no permission ambiguity and exp3 has
+somewhere to write. The TPC-H input for exps 1 and 3 is copied into it once,
+server-side, by `stage_data.py`; the scripts call that themselves and it is a
+no-op on re-runs.
 
 | # | Experiment | Question it answers |
 |---|---|---|
@@ -54,20 +59,30 @@ start in that state rather than producing meaningless numbers.
 
 ```bash
 cd ~/ray/release/nightly_tests/dataset/arrow_rs_linux
-export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...   # exp1 + exp3 only
 ./run_all.sh            # ~45-60 min total; keeps going if one experiment fails
 ```
 
 or individually:
 
 ```bash
-./exp1_iter_batches.sh      # ~10 min, needs AWS creds
-./exp2_fat_col.sh           # ~15 min, no creds (moto on localhost)
-./exp3_write_parquet.sh     # ~20 min, needs AWS creds + ~10 GB free disk
+./exp1_iter_batches.sh      # ~10 min  (stages 2.84 GB of TPC-H on first run)
+./exp2_fat_col.sh           # ~15 min  (writes ~1.5 GB of fixtures on first run)
+./exp3_write_parquet.sh     # ~20 min  (writes a few GB per arm, then deletes it)
 ```
 
+**Credentials:** on an EC2/Anyscale box the instance role covers all of this and
+you need to export nothing. Every script calls `check_s3` first, which does a
+real write-then-delete against the bucket and fails in seconds with the exact
+fix if it can't. If credentials live only in `~/.aws/credentials`, export them —
+`eval "$(aws configure export-credentials --format env)"` — because the crate's
+`object_store` is built with `features = ["aws"]` and reads env vars and IMDS
+but *not* the profile file, while pyarrow reads all three. That asymmetry shows
+up as the arrow-rs arm alone getting `ACCESS_DENIED`.
+
 Knobs: `OUT_DIR` (default `./out`), `NUM_CPUS` (8), `OBJECT_STORE_MB` (8192),
-`DATA` (the input path), `MOTO_PORT` (5002).
+`S3_BUCKET` / `S3_PREFIX` / `AWS_DEFAULT_REGION`, `SF` (TPC-H scale, 10),
+`DATA` (overrides the input path), `REGEN=1` (rebuild exp2 fixtures),
+`MOTO=1` (run exp2 against a local moto server instead of real S3).
 
 Both arms of every A/B are pinned to the same `num_cpus` and object-store size,
 because Ray derives both from *free* RAM by default — which drifts between runs
@@ -111,11 +126,18 @@ The columns that decide the hypotheses, all printed in the summaries:
   fate-shares, and `ray.init()` hangs forever with no error), and disable
   task-event reporting (a 2026-07 nightly SIGSEGVs in the aggregator flush).
   If a run hangs anyway: `cat /tmp/ray/session_latest/logs/runtime_env_agent.err`.
+- **Run in us-west-2.** The bucket is there; a box in another region turns every
+  GET into a cross-region round trip, which is the exact variable exp2 measures.
 - **Bucket access:** `s3://ray-benchmark-data/tpch/...` is readable from an
-  Anyscale account. `s3://ray-benchmark-data-internal-us-west-2/...` is **not** —
-  which is why exps 1 and 3 use TPC-H data and exp 2 uses generated fixtures.
-- **moto holds objects in RAM** (~1.5 GB for the default fixture set). Fine on
-  32 GB; if you scale the fixtures up, switch to MinIO and point `--endpoint` at
-  it — nothing else changes.
-- **Disk:** exp3 writes a few GB per arm and cleans up after itself; keep ~20 GB
-  free.
+  Anyscale account (it is the staging source, read once).
+  `s3://ray-benchmark-data-internal-us-west-2/...` is **not** readable — which is
+  why exp2 uses generated fixtures rather than the real wide-schema input.
+- **What's left in the bucket:** the staged TPC-H copy (2.84 GB at sf10) and the
+  exp2 fixtures (~1.5 GB), both reused across runs. exp3's output is deleted at
+  the end of the script, by a prefix-scoped delete that refuses to touch
+  anything outside `$S3_PREFIX`. To reclaim it all:
+  `aws s3 rm --recursive s3://arrowrs-bench-21f6c795/arrow_rs_probe/`.
+- **`MOTO=1`** runs exp2 against a local moto server. It answers the *retention*
+  half of the hypothesis but not the *serialisation* half — moto on localhost has
+  no latency, so an oversized unit hogging the prefetch semaphore costs nothing
+  there. Also note moto holds objects in RAM (~1.5 GB for these fixtures).

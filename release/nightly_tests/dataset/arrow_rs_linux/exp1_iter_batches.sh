@@ -12,15 +12,20 @@
 # control predicts ~0.3x. Either that gap reproduces here or it is a
 # cluster-scale effect.
 #
-# Needs: AWS credentials in the environment (the TPC-H bucket is readable from
-# an Anyscale account; it is not public).
+# Needs: credentials for OUR bucket (instance role on an EC2/Anyscale box, no
+# export needed). The TPC-H bytes are staged into it once, server-side, by
+# stage_data.py -- so the input is the release data but the bucket is ours.
 #
 # Runtime: ~10 min for both arms. Reads 2.84 GB compressed / ~8.5 GB decoded.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 check_env
+check_s3
 
-DATA="${DATA:-s3://ray-benchmark-data/tpch/parquet/sf10/lineitem}"
+SF="${SF:-10}"
+DATA="${DATA:-$S3_ROOT/tpch/sf$SF/lineitem}"
 FORMAT="${FORMAT:-numpy}"
+
+python "$HERE/stage_data.py" --dst "$DATA" --sf "$SF" --region "$AWS_DEFAULT_REGION"
 
 cd "$DATASET_DIR"
 for reader in pyarrow arrow_rs; do
