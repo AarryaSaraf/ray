@@ -94,11 +94,53 @@ class ObjectStoreMemorySampler:
             )
 
 
+def _pin_ray_address() -> None:
+    """Point the State API at *our* Ray instance.
+
+    Single-machine runs use ``RAY_ADDRESS=local`` so ``ray.init()`` can never
+    attach to an Anyscale workspace's managed cluster. But the State API
+    re-resolves the address from the environment, and "local" is ambiguous when
+    two instances are up -- ours and the workspace's -- so it raises
+    ``ConnectionError: Found multiple active Ray instances``. The driver knows
+    its own GCS address; pinning it makes the resolution unambiguous. No-op on a
+    real cluster, where there is only one instance and RAY_ADDRESS is already set.
+    """
+    try:
+        gcs = ray.get_runtime_context().gcs_address
+    except Exception:
+        return
+    if gcs:
+        os.environ["RAY_ADDRESS"] = gcs
+
+
+def _stats_summary(ds: "ray.data.Dataset", detail: bool = True):
+    """``get_stats_summary``, degrading instead of failing.
+
+    ``detail=True`` additionally queries the State API for per-operator
+    scheduling overhead. That query can fail for reasons unrelated to anything
+    we measure -- no dashboard/API server, task events disabled, address
+    ambiguity -- and it would take the per-task memory distributions down with
+    it, which are the entire point of these runs. So fall back to the summary
+    without scheduling overhead rather than losing every metric.
+    """
+    _pin_ray_address()
+    if detail:
+        try:
+            return ds.get_stats_summary(detail=True)
+        except Exception:
+            logger.warning(
+                "get_stats_summary(detail=True) failed; retrying without "
+                "scheduling overhead (memory metrics are unaffected)",
+                exc_info=True,
+            )
+    return ds.get_stats_summary(detail=False)
+
+
 def collect_dataset_stats(ds: "ray.data.Dataset") -> Dict[str, Any]:
     """Collect execution stats from a Dataset as a JSON-serializable dict.
     This is a subset from `get_stats_summary`, because we are only adding the ones
     we care about for the release tests."""
-    summary = ds.get_stats_summary(detail=True)
+    summary = _stats_summary(ds)
     return {
         "total_scheduling_runtime": summary.streaming_exec_schedule_s,
         "avg_scheduling_loop_duration_s": summary.streaming_exec_schedule_avg_s,
@@ -173,7 +215,7 @@ def collect_operator_metrics(ds: "ray.data.Dataset") -> Dict[str, Any]:
 
     out: Dict[str, Any] = {"operators_detail": []}
     try:
-        summary = ds.get_stats_summary(detail=True)
+        summary = _stats_summary(ds)
         for node in DatasetStatsSummary._collect_dataset_stats_summaries(summary):
             extra = getattr(node, "extra_metrics", {}) or {}
             mem = {out_key: extra.get(in_key) for out_key, in_key in mem_keys}
