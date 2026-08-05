@@ -1,7 +1,7 @@
 import ray
 import argparse
 
-from benchmark import Benchmark
+from benchmark import Benchmark, collect_operator_metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,8 +60,15 @@ def main(args):
             join_type=args.join_type,
         )
 
-        # Process joined_ds if needed
+        # Materialize rather than count(): count() on a joined plan executes a
+        # *copy*, so the stats (and thus the read operators' time and per-task
+        # decode memory) would be attached to a handle we then throw away.
+        joined_ds = joined_ds.materialize()
         print(f"Join completed with {joined_ds.count()} records.")
+
+        # Two read operators here (left + right); operators_detail carries both,
+        # and the read_* convenience fields describe the first.
+        return {**vars(args), **collect_operator_metrics(joined_ds)}
 
     benchmark.run_fn(str(vars(args)), benchmark_fn)
     benchmark.write_result()

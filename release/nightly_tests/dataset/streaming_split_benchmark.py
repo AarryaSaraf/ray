@@ -1,7 +1,7 @@
 import argparse
 from typing import Optional
 
-from benchmark import Benchmark
+from benchmark import Benchmark, collect_operator_metrics
 import ray
 
 
@@ -62,8 +62,9 @@ def main(args):
         ]
         ray.get(future)
 
-        # Report arguments for the benchmark.
-        return vars(args)
+        # streaming_split consumes `ds` itself (the actors pull from its splits),
+        # so the read operator's stats are on `ds`.
+        return {**vars(args), **collect_operator_metrics(ds)}
 
     benchmark.run_fn("main", benchmark_fn)
     benchmark.write_result()

@@ -5,7 +5,7 @@ import pyarrow.compute as pc
 import ray
 from ray.data.datatype import DataType
 from ray.data.expressions import udf
-from benchmark import Benchmark
+from benchmark import Benchmark, with_operator_metrics
 
 # Define schemas for TPC-H tables
 TABLE_COLUMNS = {
@@ -123,5 +123,8 @@ def load_table(
 
 def run_tpch_benchmark(name: str, benchmark_fn):
     benchmark = Benchmark()
-    benchmark.run_fn(name, benchmark_fn)
+    # Every tpch_q*.py ends in a bare `....materialize()` and returns vars(args);
+    # the wrapper picks the executed handle back up so all 20 queries report
+    # per-operator read time and per-task decode memory without editing each one.
+    benchmark.run_fn(name, with_operator_metrics(benchmark_fn))
     benchmark.write_result()

@@ -1,3 +1,4 @@
+import functools
 import gc
 import json
 import logging
@@ -138,8 +139,16 @@ def collect_operator_metrics(ds: "ray.data.Dataset") -> Dict[str, Any]:
     first-class field.
 
     NOTE: stats attach to the consumed dataset handle. Consume ``ds`` itself
-    (``iter_*``/``write_*``/``materialize``) before calling this; ``ds.count()``
-    executes a *copy* of the plan and leaves ``ds`` without stats.
+    (``iter_*``/``write_*``/``materialize``) before calling this.
+
+    ``ds.count()`` reports nothing, for two stacked reasons: on a plain
+    ``read_parquet`` dataset ``Dataset.count`` returns ``_meta_count()`` straight
+    from the footer row counts (``dataset.py:4114``) and **executes nothing at
+    all** — no decode, no tasks, no stats; and even when it does fall through, it
+    builds a ``Count`` op over a *copy* of the plan, leaving ``ds`` unexecuted.
+    So a ``--count`` benchmark measures footer reading, not decoding. Use
+    ``--iter-batches`` (decodes everything, retains ~one batch) when you want the
+    decode working set, or ``--iter-bundles`` when you want retention too.
     """
     from ray.data._internal.stats import DatasetStatsSummary
 
@@ -153,6 +162,14 @@ def collect_operator_metrics(ds: "ray.data.Dataset") -> Dict[str, Any]:
         ("avg_max_rss_per_task_bytes", "average_max_rss_per_task"),
         ("max_rss_per_task_bytes", "max_rss_per_task"),
     ]
+    # Distributions behind those scalars. ``average_max_uss_per_task`` returns
+    # None at zero samples, which renders identically to "memory was flat" — so
+    # always report the sample count and the spread alongside it. A row with
+    # ``uss_num_samples: 0`` is an instrumentation gap; a row with 1 is a single
+    # task, where avg == max and no spread is knowable. Neither is comparable to
+    # a many-sample row, and without this field you cannot tell them apart.
+    dist_keys = [("uss", "max_uss_bytes"), ("rss", "max_rss_bytes")]
+    dist_stats = ("num_samples", "mean", "min", "max", "p50", "p90", "p99")
 
     out: Dict[str, Any] = {"operators_detail": []}
     try:
@@ -160,6 +177,14 @@ def collect_operator_metrics(ds: "ray.data.Dataset") -> Dict[str, Any]:
         for node in DatasetStatsSummary._collect_dataset_stats_summaries(summary):
             extra = getattr(node, "extra_metrics", {}) or {}
             mem = {out_key: extra.get(in_key) for out_key, in_key in mem_keys}
+            for prefix, dist_key in dist_keys:
+                dist = extra.get(dist_key)
+                dist = dist if isinstance(dist, dict) else {}
+                # num_samples defaults to 0 (not None): "no samples" is a fact we
+                # know, unlike a percentile that needs the datasketches extra.
+                mem[f"{prefix}_num_samples"] = dist.get("num_samples", 0)
+                for stat in dist_stats[1:]:
+                    mem[f"{prefix}_{stat}_bytes"] = dist.get(stat)
             for op in node.operators_stats or []:
                 out["operators_detail"].append(
                     {
@@ -177,12 +202,68 @@ def collect_operator_metrics(ds: "ray.data.Dataset") -> Dict[str, Any]:
                 out["read_operator_name"] = entry["operator_name"]
                 out["read_wall_time_s"] = entry["wall_time_s"]
                 out["read_output_size_bytes"] = entry["output_size_bytes"]
+                out["read_output_num_rows"] = entry["output_num_rows"]
+                # Decoded bytes per row: which side of the arrow-rs decode-budget
+                # floor this shape falls on (the byte budget stops binding above
+                # ~budget/2048 bytes per row), so a regression can be attributed
+                # to row width without re-reading the fixture's footer.
+                rows, nbytes = entry["output_num_rows"], entry["output_size_bytes"]
+                out["read_decoded_bytes_per_row"] = (
+                    (nbytes / rows) if (rows and nbytes) else None
+                )
                 for out_key, _ in mem_keys:
                     out[f"read_{out_key}"] = entry[out_key]
+                for prefix, _ in dist_keys:
+                    out[f"read_{prefix}_num_samples"] = entry[f"{prefix}_num_samples"]
+                    for stat in dist_stats[1:]:
+                        out[f"read_{prefix}_{stat}_bytes"] = entry[
+                            f"{prefix}_{stat}_bytes"
+                        ]
                 break
     except Exception:
         logger.warning("collect_operator_metrics failed", exc_info=True)
     return out
+
+
+def with_operator_metrics(benchmark_fn):
+    """Wrap a ``benchmark_fn`` so :func:`collect_operator_metrics` runs against the
+    last dataset the function materialized, and merge the result into its dict.
+
+    Stats live on the executed handle, which most drivers never return — they end
+    in a bare ``....materialize()`` inside an expression statement and then
+    ``return vars(args)``. Threading the handle out of each of them would be ~20
+    near-identical edits; capturing it here is one. During the call
+    ``Dataset.materialize`` is temporarily wrapped to remember what it returned,
+    and restored in a ``finally`` so a failing benchmark cannot leave the patch
+    installed.
+
+    No-ops (returns the fn's dict unchanged) if the fn materialized nothing or
+    returned a non-dict, so it is safe to apply to any driver.
+    """
+
+    @functools.wraps(benchmark_fn)
+    def wrapper(*args, **kwargs):
+        from ray.data import Dataset
+
+        captured = {}
+        original = Dataset.materialize
+
+        def spy(self, *a, **kw):
+            out = original(self, *a, **kw)
+            captured["ds"] = out
+            return out
+
+        Dataset.materialize = spy
+        try:
+            result = benchmark_fn(*args, **kwargs)
+        finally:
+            Dataset.materialize = original
+
+        if isinstance(result, dict) and "ds" in captured:
+            return {**result, **collect_operator_metrics(captured["ds"])}
+        return result
+
+    return wrapper
 
 
 class RuntimeEnvSetupTracker:

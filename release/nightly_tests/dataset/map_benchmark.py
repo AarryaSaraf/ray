@@ -7,7 +7,7 @@ import pyarrow.compute as pc
 import pandas as pd
 import ray
 
-from benchmark import Benchmark
+from benchmark import Benchmark, collect_operator_metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -134,8 +134,16 @@ def main(args: argparse.Namespace) -> None:
         for _ in ds.iter_internal_ref_bundles():
             pass
 
-        # Report arguments for the benchmark.
-        return vars(args)
+        # Report arguments plus per-operator metrics. `use_datasource_v2` is
+        # reported explicitly because this driver forces it OFF above: the
+        # DataSource V2 read path -- and therefore the arrow-rs reader, which is
+        # only reachable through it -- is NOT exercised here. Any A/B of the
+        # Parquet reader must treat these cases as controls, not treatments.
+        return {
+            **vars(args),
+            "use_datasource_v2": ctx.use_datasource_v2,
+            **collect_operator_metrics(ds),
+        }
 
     benchmark.run_fn("main", benchmark_fn)
     benchmark.write_result()

@@ -1,5 +1,6 @@
 import argparse
 import functools
+import os
 import uuid
 from typing import Callable
 
@@ -9,7 +10,14 @@ import ray
 from ray.data import SaveMode
 
 # Add a random prefix to avoid conflicts between different runs.
-WRITE_PATH = f"s3://ray-data-write-benchmark/{uuid.uuid4().hex}"
+#
+# RAY_DATA_BENCH_WRITE_ROOT overrides the destination so the write cases can run
+# outside the release account, which cannot write to this bucket -- point it at a
+# local directory or a personal bucket to reproduce `write_parquet` on one machine.
+WRITE_ROOT = os.environ.get(
+    "RAY_DATA_BENCH_WRITE_ROOT", "s3://ray-data-write-benchmark"
+).rstrip("/")
+WRITE_PATH = f"{WRITE_ROOT}/{uuid.uuid4().hex}"
 # Region of the ray-data-write-benchmark bucket. write_parquet resolves this
 # automatically, but deltalake's Rust S3 client doesn't follow a region
 # redirect -- it defaults to us-east-1 and fails outright ("Received redirect
