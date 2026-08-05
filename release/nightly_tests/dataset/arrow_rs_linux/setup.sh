@@ -119,11 +119,14 @@ fi
 # aiohttp: NOT pulled in by the ray[data] extra, but the runtime-env agent imports
 # it; without it the agent crashes and the raylet fate-shares (`ray start` hangs
 # indefinitely) — cost a day on the 2026-07-27 workspace run.
-say "installing harness deps (psutil, matplotlib, numpy, aiohttp, pandas, moto)"
+say "installing harness deps (psutil, matplotlib, numpy, aiohttp, pandas, moto, grpcio)"
 # moto[server] + boto3: the S3 experiments need an S3-compatible endpoint on
-# localhost, because the planner defect we are chasing exists only in the
-# crate's S3 path -- a file:// run provably cannot reproduce it.
-PIP psutil matplotlib numpy aiohttp pandas "moto[server]" boto3
+# localhost, so `MOTO=1` can run exp2 without a cloud account.
+# grpcio: recent master dropped it from the base install and made
+# `ray._private.grpc_utils` a lazy import, so `ray[data]` no longer brings it --
+# but every release driver calls `get_memory_info_reply` for object-store and
+# spill stats, which fails with ModuleNotFoundError partway into the first run.
+PIP psutil matplotlib numpy aiohttp pandas "moto[server]" boto3 grpcio
 
 # --- 6. verify the arrow-rs path actually engages ---
 say "verifying arrow-rs read path end to end"

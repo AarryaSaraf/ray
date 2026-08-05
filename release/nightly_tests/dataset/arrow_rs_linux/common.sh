@@ -70,6 +70,17 @@ try:
     import ray_data_arrow_rs  # noqa: F401
 except ImportError as exc:
     sys.exit(f"FATAL: native crate not importable ({exc}). Run setup.sh.")
+# grpcio is a lazy import inside ray._private.grpc_utils, reached only when a
+# driver asks for object-store/spill stats -- so a missing one does not fail at
+# import time, it fails several minutes into the first benchmark.
+try:
+    import grpc  # noqa: F401
+except ImportError:
+    sys.exit(
+        "FATAL: grpcio missing. Recent master dropped it from the base install,\n"
+        "but every release driver calls get_memory_info_reply(). Run: "
+        "uv pip install grpcio"
+    )
 print(f"env OK: ray.data={resolved}")
 PYEOF
 }
