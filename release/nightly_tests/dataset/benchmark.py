@@ -197,6 +197,21 @@ def collect_operator_metrics(ds: "ray.data.Dataset") -> Dict[str, Any]:
     def _sum(stat) -> Any:
         return stat.sum if stat is not None else None
 
+    def _spread(stat, prefix: str) -> Dict[str, Any]:
+        """Flatten a ``StatsSummary`` into ``<prefix>_{count,min,max,mean}`` keys.
+
+        Ray already accumulates these; nothing here computes anything new. See
+        ``OperatorStatsSummary.task_rows`` / ``.node_count``.
+        """
+        if stat is None:
+            return {f"{prefix}_{k}": None for k in ("count", "min", "max", "mean")}
+        return {
+            f"{prefix}_count": stat.count,
+            f"{prefix}_min": stat.min,
+            f"{prefix}_max": stat.max,
+            f"{prefix}_mean": stat.mean,
+        }
+
     # (result-dict key, extra_metrics key) for the per-task memory metrics.
     mem_keys = [
         ("avg_max_uss_per_task_bytes", "average_max_uss_per_task"),
@@ -212,6 +227,12 @@ def collect_operator_metrics(ds: "ray.data.Dataset") -> Dict[str, Any]:
     # a many-sample row, and without this field you cannot tell them apart.
     dist_keys = [("uss", "max_uss_bytes"), ("rss", "max_rss_bytes")]
     dist_stats = ("num_samples", "mean", "min", "max", "p50", "p90", "p99")
+    # Promoted to top-level ``read_*`` alongside the memory metrics.
+    decomposition_keys = [
+        f"{p}_{k}"
+        for p in ("task_rows", "node_count")
+        for k in ("count", "min", "max", "mean")
+    ] + ["earliest_start_time", "latest_end_time", "time_total_s"]
 
     out: Dict[str, Any] = {"operators_detail": []}
     try:
@@ -228,6 +249,26 @@ def collect_operator_metrics(ds: "ray.data.Dataset") -> Dict[str, Any]:
                 for stat in dist_stats[1:]:
                     mem[f"{prefix}_{stat}_bytes"] = dist.get(stat)
             for op in node.operators_stats or []:
+                # How the work was decomposed and where it ran. Ray accumulates
+                # both already (``rows_per_task`` keyed by task index,
+                # ``tasks_per_node`` keyed by node id) but nothing surfaced them,
+                # so every comparison so far has had to *infer* task count from
+                # ``uss_num_samples`` and could say nothing at all about
+                # placement. ``task_rows_count`` is the read-task count;
+                # ``task_rows_{min,max}`` is how evenly the input was split;
+                # ``node_count_count`` is how many nodes participated and
+                # ``node_count_{min,max}`` how lopsided the spread was.
+                #
+                # This is what makes a single-node run comparable to a 10-node
+                # one: without it, a ratio difference between the two cannot be
+                # attributed to the reader rather than to the decomposition.
+                decomposition = {
+                    **_spread(op.task_rows, "task_rows"),
+                    **_spread(op.node_count, "node_count"),
+                    "earliest_start_time": op.earliest_start_time,
+                    "latest_end_time": op.latest_end_time,
+                    "time_total_s": op.time_total_s,
+                }
                 out["operators_detail"].append(
                     {
                         "operator_name": op.operator_name,
@@ -236,6 +277,7 @@ def collect_operator_metrics(ds: "ray.data.Dataset") -> Dict[str, Any]:
                         "udf_time_s": _sum(op.udf_time),
                         "output_num_rows": _sum(op.output_num_rows),
                         "output_size_bytes": _sum(op.output_size_bytes),
+                        **decomposition,
                         **mem,
                     }
                 )
@@ -261,6 +303,8 @@ def collect_operator_metrics(ds: "ray.data.Dataset") -> Dict[str, Any]:
                         out[f"read_{prefix}_{stat}_bytes"] = entry[
                             f"{prefix}_{stat}_bytes"
                         ]
+                for key in decomposition_keys:
+                    out[f"read_{key}"] = entry.get(key)
                 break
     except Exception:
         logger.warning("collect_operator_metrics failed", exc_info=True)
