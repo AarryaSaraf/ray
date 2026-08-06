@@ -6,7 +6,13 @@
 # get the SAME num_cpus and object-store budget, because Ray's defaults derive
 # from *free* RAM, which drifts between runs and would silently change the
 # comparison.
-set -euo pipefail
+# Strict mode for scripts, but NOT when sourced into an interactive shell:
+# `set -e` there means the next command that returns nonzero -- a failed grep, a
+# completion probe -- closes the terminal.
+case $- in
+  *i*) ;;
+  *) set -euo pipefail ;;
+esac
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATASET_DIR="$(cd "$HERE/.." && pwd)"
