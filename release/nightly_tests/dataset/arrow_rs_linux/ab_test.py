@@ -103,6 +103,27 @@ BASELINE = "pyarrow"
 CONTROL = "pyarrow_control"
 
 
+def prepare_env() -> None:
+    """Make this process's environment safe for a private local Ray.
+
+    common.sh does the same thing for the exp*.sh scripts, but this runner is
+    invoked directly, so it cannot rely on having been sourced. Every item here
+    is a workspace trap that produces a confusing failure rather than an
+    obvious one.
+    """
+    # A platform-injected runtime-env hook (`cgroup_runtime_plugin` on Anyscale)
+    # is imported by ray.init() and is not in this venv: ModuleNotFoundError
+    # before a single row is read.
+    for var in ("RAY_RUNTIME_ENV_HOOK", "RAY_RUNTIME_ENV_PLUGINS"):
+        os.environ.pop(var, None)
+    # Never attach to the workspace's managed cluster: different Ray, different
+    # reader, meaningless comparison.
+    os.environ["RAY_ADDRESS"] = "local"
+    # Some 2026-07 nightlies SIGSEGV in the task-event aggregator flush.
+    os.environ.setdefault("RAY_task_events_report_interval_ms", "0")
+    os.environ.setdefault("RAY_DATA_USE_DATASOURCE_V2", "1")
+
+
 def run_one(case: str, arm: str, rep: int, out_dir: str) -> Optional[Dict[str, Any]]:
     """Run one arm once and return its parsed result dict (None if it failed)."""
     tag = f"{case}_{arm}_r{rep}"
@@ -125,6 +146,15 @@ def run_one(case: str, arm: str, rep: int, out_dir: str) -> Optional[Dict[str, A
 
     if proc.returncode != 0:
         print(f"  [{tag}] FAILED rc={proc.returncode} after {elapsed:.0f}s", flush=True)
+        # Show why, here: a silent failure repeated 9 times is how you lose an
+        # hour to one missing environment variable.
+        try:
+            with open(os.path.join(out_dir, f"{tag}.log")) as log:
+                tail = log.read().strip().splitlines()[-6:]
+            for line in tail:
+                print(f"      | {line}", flush=True)
+        except OSError:
+            pass
         return None
     try:
         with open(result_path) as handle:
@@ -256,11 +286,18 @@ def main(argv: Optional[List[str]] = None) -> None:
         raise SystemExit(f"unknown case(s) {unknown}; known: {list(CASES)}")
     arms = [a for a in ARMS if not (args.no_control and a == CONTROL)]
     os.makedirs(args.out, exist_ok=True)
+    prepare_env()
     everything: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
     for case in names:
         print(f"\n### {case}: {args.repeats} repeats x {len(arms)} arms")
         results: Dict[str, List[Dict[str, Any]]] = {a: [] for a in arms}
+        # One warm-up run, discarded: the first read of the session pays for
+        # cold S3 connections and an unpopulated Ray worker pool, and it would
+        # otherwise land entirely on whichever arm happens to go first.
+        if run_one(case, BASELINE, -1, args.out) is None:
+            print(f"!!! {case}: warm-up failed, skipping the case (see log above)")
+            continue
         for rep in range(args.repeats):
             # ABBA: reverse the arm order on odd repeats so a monotone drift
             # over the session cancels instead of favouring one arm.
