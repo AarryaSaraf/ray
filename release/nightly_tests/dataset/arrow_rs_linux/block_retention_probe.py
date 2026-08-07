@@ -111,6 +111,15 @@ def main() -> int:
         "needs inputs and output alive together. Ignored by the pyarrow arm.",
     )
     parser.add_argument(
+        "--num-blocks",
+        type=int,
+        default=0,
+        help="override_num_blocks: how many read tasks to split the input into. "
+        "0 leaves Ray's choice (one task per file here). This is the axis that "
+        "separates 'the task holds all its output' (USS falls proportionally) "
+        "from 'the allocator never returns freed pages' (USS pinned regardless).",
+    )
+    parser.add_argument(
         "--write-to",
         default=None,
         help="fuse a write onto the read (the release write_parquet shape). "
@@ -141,7 +150,10 @@ def main() -> int:
         os.makedirs(args.write_to, exist_ok=True)
 
     started = time.perf_counter()
-    ds = ray.data.read_parquet(args.source)
+    read_kwargs = {}
+    if args.num_blocks:
+        read_kwargs["override_num_blocks"] = args.num_blocks
+    ds = ray.data.read_parquet(args.source, **read_kwargs)
     if args.write_to:
         ds.write_parquet(args.write_to)
     else:
@@ -155,6 +167,7 @@ def main() -> int:
         "reader": args.reader,
         "block_mib": args.block_mib,
         "decode_budget_mib": args.decode_budget_mib or None,
+        "num_blocks": args.num_blocks or None,
         "mode": "write" if args.write_to else "iter_bundles",
         "source": args.source,
         "wall_s": round(wall, 2),

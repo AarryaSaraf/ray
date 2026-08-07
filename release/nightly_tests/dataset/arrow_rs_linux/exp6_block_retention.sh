@@ -50,6 +50,7 @@ WRITE_DIR="$LOCAL_ROOT/exp6_write"
 RESULTS="$OUT_DIR/exp6"
 BLOCKS="${BLOCKS:-16 64 128 512}"
 BUDGETS="${BUDGETS:-8 32 64 128}"
+NUM_BLOCKS="${NUM_BLOCKS:-4 16 64}"
 FIXED_BLOCK="${FIXED_BLOCK:-128}"
 mkdir -p "$RESULTS"
 
@@ -78,6 +79,28 @@ done
 for budget in $BUDGETS; do
   run_probe "B_arrow_rs_bud${budget}" \
     --reader arrow_rs --block-mib "$FIXED_BLOCK" --decode-budget-mib "$budget"
+done
+
+# Phase C -- the axis that phases A and B could not distinguish.
+#
+# A flat block sweep does NOT mean "nothing is retained": if a task holds ALL of
+# its output, the total is invariant to how that output is chunked, so flat is
+# exactly what retention-of-everything looks like. The way to tell is to change
+# how much each task produces, which override_num_blocks does directly.
+#
+#   USS falls ~proportionally  -> the task holds its output. Smaller read tasks
+#                                 are then an immediate mitigation, and the real
+#                                 fix is finding what keeps the blocks alive.
+#   USS pinned near 1 GiB      -> nothing is held; peak USS is tracking the
+#                                 allocator's high-water mark over the task's
+#                                 lifetime churn, not live data. Then no amount
+#                                 of streaming helps and the lever is the
+#                                 allocator (arena count, trim, or task size).
+for nb in $NUM_BLOCKS; do
+  for reader in pyarrow arrow_rs; do
+    run_probe "C_${reader}_nb${nb}" \
+      --reader "$reader" --block-mib "$FIXED_BLOCK" --num-blocks "$nb"
+  done
 done
 rm -rf "$WRITE_DIR"
 
@@ -145,11 +168,37 @@ if subset:
         f"PHASE B blk={fixed}M",
     )
 
+# Phase C: the input is fixed, so bytes-per-task is inversely proportional to
+# the task count. Print USS x tasks -- constant means USS tracks per-task
+# volume; rising means USS is pinned regardless of how little a task produces.
+for reader in ("pyarrow", "arrow_rs"):
+    subset = sorted(
+        (r for r in rows if r["tag"].startswith("C_") and r["reader"] == reader),
+        key=lambda r: r["num_blocks"] or 0,
+    )
+    if not subset:
+        continue
+    head = f"{'PHASE C ' + reader:<22}{'avg USS/task':>15}{'tasks':>7}{'USS x tasks':>14}{'wall':>8}"
+    print(head)
+    print("-" * len(head))
+    for r in subset:
+        avg = (r.get("avg_max_uss_per_task") or 0) / MiB
+        n = r.get("task_count") or 0
+        print(
+            f"{'nb=' + str(r['num_blocks']):<22}{avg:>12.0f}MiB{n:>7}"
+            f"{avg * n / 1024:>11.1f}GiB{r['wall_s']:>8.1f}"
+        )
+    print()
+
 print(
     "A lineitem file is ~6.0M rows x 172 B = 1.03 GiB decoded; standalone, the"
-    "\nsame read holds 23 MiB. Phase A spread >1.5x means blocks accumulate in the"
-    "\ntask. Phase B falling toward the block size means batch/block alignment is"
-    "\nthe fix, and the decode budget should derive from target_block_size rather"
-    "\nthan being a constant."
+    "\nsame read holds 23 MiB."
+    "\n"
+    "\nPhase A/B flat does NOT mean nothing is retained: if a task holds ALL its"
+    "\noutput, the total is invariant to chunking, so flat is what that looks like."
+    "\nPhase C is the discriminator. USS falling ~proportionally with task size"
+    "\nmeans the task holds its output. USS pinned near 1 GiB while tasks shrink"
+    "\n16x means it is not live data at all -- it is the allocator's high-water"
+    "\nmark over lifetime churn, and streaming cannot fix it."
 )
 PYEOF
