@@ -80,7 +80,7 @@ def read_stats(ds) -> Dict[str, Any]:
             ),
             None,
         )
-        return {
+        out = {
             "operators": names,
             "avg_max_uss_per_task": extra.get("average_max_uss_per_task"),
             "max_uss_per_task": extra.get("max_uss_per_task"),
@@ -91,6 +91,18 @@ def read_stats(ds) -> Dict[str, Any]:
             "task_count": getattr(rows, "count", None),
             "rows_per_task_mean": getattr(rows, "mean", None),
         }
+        # Finding the operator is not the same as finding its numbers. A summary
+        # taken off an un-executed plan has the right operator names and no
+        # samples at all, which renders as "0 MiB / 0 tasks" -- indistinguishable
+        # from a real measurement of a read that used no memory. Fail loudly.
+        if not out["uss_num_samples"] or not out["avg_max_uss_per_task"]:
+            out["stats_error"] = (
+                f"Read operator {names} carries no USS samples "
+                f"(num_samples={out['uss_num_samples']}, "
+                f"avg={out['avg_max_uss_per_task']}) -- the summary is almost "
+                "certainly off an un-executed plan"
+            )
+        return out
     # An empty dict would print as 0 MiB / 0 tasks, which reads as a measurement
     # rather than a failure. Say which operators were actually there.
     return {"stats_error": f"no Read operator among {seen or '[]'}"}
@@ -178,9 +190,18 @@ def main() -> int:
     if args.write_to:
         ds.write_parquet(args.write_to)
     else:
-        # Consume without materializing: retention we are hunting is inside the
-        # read task, and .materialize() would add the object store on top of it.
-        for _ in ds.iter_internal_ref_bundles():
+        # Consume without materializing: the retention we are hunting is inside
+        # the read task, and .materialize() would add the object store on top.
+        #
+        # NOT ds.iter_internal_ref_bundles(): it calls
+        # _execute_to_iterator(capture_executor=False) (dataset.py:7398) so the
+        # executor is not retained -- which also leaves ds._current_executor as
+        # None, so get_stats_summary() falls through to _raw_stats(), the
+        # UN-EXECUTED plan, and reports zero tasks and zero memory. Calling
+        # _execute_to_iterator directly runs the identical execution with the
+        # executor captured, which is what the stats read needs.
+        bundle_iter, _, _ = ds._execute_to_iterator()
+        for _ in bundle_iter:
             pass
     wall = time.perf_counter() - started
 

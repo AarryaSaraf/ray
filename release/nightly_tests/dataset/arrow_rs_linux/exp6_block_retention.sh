@@ -97,7 +97,7 @@ run_probe() {  # tag, then probe args
     || echo "  FAILED -- see $RESULTS/$tag.log"
   # A silent stats failure prints as 0 MiB / 0 tasks, which reads like a
   # measurement. Surface it at run time instead of in the summary table.
-  grep -h "WARNING: no Read operator" "$RESULTS/$tag.log" 2>/dev/null || true
+  grep -h "^WARNING:" "$RESULTS/$tag.log" 2>/dev/null || true
 }
 
 if has_phase A; then
@@ -488,16 +488,24 @@ for reader in ("pyarrow", "arrow_rs"):
         avg = (r.get("avg_max_uss_per_task") or 0) / MiB
         n = r.get("uss_num_samples") or 0
         d = TOTAL_DECODED_MIB / n if n else 0
-        points.append((d, avg))
         label = (
             f"chunk={r['chunk_mib']}M" if r.get("chunk_mib") else "chunk=default(1G)"
         )
+        if r.get("stats_error"):
+            print(f"{label:<22}{'NO STATS -- see the log':>50}")
+            continue
+        points.append((d, avg))
         print(f"{label:<22}{avg:>12.0f}MiB{n:>7}{d:>18,.0f}{r['wall_s']:>8.1f}")
+    # Fitting through arms that reported nothing produces a confident-looking
+    # slope out of zeros, which is worse than printing no slope at all.
     intercept, slope = fit(points)
-    if slope is not None:
+    if slope is None:
+        print(f"{'':<22}  too few valid arms to fit a slope")
+    else:
         print(
             f"{'':<22}  unfused USS ~= {intercept:.0f} MiB + {slope:.3f} x D"
-            f"   (fused, threads=1: arrow-rs was 162 + 0.825 x D)"
+            f"   ({len(points)}/{len(subset)} arms)"
+            f"\n{'':<22}  compare fused, threads=1: arrow-rs was 162 + 0.825 x D"
         )
     print()
 
