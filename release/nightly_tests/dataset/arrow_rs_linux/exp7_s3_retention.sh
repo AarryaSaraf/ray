@@ -387,7 +387,10 @@ if s_rows:
         by_chunk.setdefault(r.get("chunk_mib") or 0, {})[r["reader"]] = r
     head = (
         f"{'PHASE S s3 unfused':<20}{'D MiB':>8}{'pyarrow':>10}{'arrow_rs':>10}"
-        f"{'ratio':>8}{'local R':>9}{'s3-local':>10}{'wall R':>9}"
+        # wall P as well as wall R: "less memory at wall parity" is the whole
+        # claim, and the first version of this table printed only arrow-rs's wall,
+        # which cannot support the second half of it.
+        f"{'ratio':>8}{'local R':>9}{'s3-local':>10}{'wall P':>8}{'wall R':>8}"
     )
     print(head)
     print("-" * len(head))
@@ -408,32 +411,45 @@ if s_rows:
         print(
             f"{label:<20}{d:>8,.0f}{pu:>7.0f}MiB{au:>7.0f}MiB"
             f"{(au / pu if pu else 0):>7.2f}x{loc_r:>9}{delta:>10}"
-            f"{a['wall_s']:>9.1f}"
+            f"{p['wall_s']:>8.1f}{a['wall_s']:>8.1f}"
         )
     for reader in ("pyarrow", "arrow_rs"):
         intercept, slope = fit(pts[reader])
         if slope is not None:
             print(f"{'':<20}  {reader:<9} s3 USS ~= {intercept:.0f} + {slope:.3f} x D")
-    seq = [u for _, u in sorted(pts["arrow_rs"])]
-    if len(seq) > 2:
-        deltas = [b - a for a, b in zip(seq, seq[1:])]
-        incs = " / ".join(f"{d:+.0f}" for d in deltas)
-        # This line used to assert saturation unconditionally whenever there were
-        # more than two points, and on 2026-08-07 it printed "holds on S3" over
-        # increments of +133 / +115 / +270 -- which say the opposite. Test the
-        # claim before making it: saturating means each step costs LESS than the
-        # one before, even though D itself is growing between steps.
-        saturating = all(b <= a * 1.05 for a, b in zip(deltas, deltas[1:]))
+    # Saturation has to be judged on MARGINAL cost -- MiB of peak per additional
+    # MiB decoded -- not on the raw USS increments.
+    #
+    # Two bugs lived on this line. The first asserted saturation unconditionally
+    # whenever there were more than two points, and printed "holds on S3" over
+    # increments of +133 / +115 / +270. The second (this fix) tested whether the
+    # USS increments shrink, which is not the same claim: the chunk sweep does not
+    # step D evenly. On 2026-08-07 D went 62 -> 211 -> 527 -> 1055, so the D steps
+    # were +149 / +316 / +528 -- doubling. Constant USS increments over doubling D
+    # increments IS saturating, but constant USS increments over EVEN D steps would
+    # be plain linear, and the old test called both "saturating".
+    ordered = sorted(pts["arrow_rs"])
+    if len(ordered) > 2:
+        deltas = [b[1] - a[1] for a, b in zip(ordered, ordered[1:])]
+        marginal = [
+            (b[1] - a[1]) / (b[0] - a[0]) if b[0] != a[0] else 0
+            for a, b in zip(ordered, ordered[1:])
+        ]
+        # 1.0 = holds every extra byte it decodes; the standalone reader hit 0.02.
+        saturating = all(b <= a * 1.05 for a, b in zip(marginal, marginal[1:]))
         verdict = (
-            "shrinking increments = saturating = the OOM property HOLDS on S3"
+            "marginal cost falling = saturating = the OOM property HOLDS"
             if saturating
-            else "increments NOT shrinking -> memory still tracks task size, so "
-            "saturation does NOT transfer to S3"
+            else "marginal cost NOT falling -> memory tracks task size, so "
+            "saturation does NOT transfer"
         )
         print(
-            f"{'':<20}  arrow_rs increments: {incs} MiB"
-            f"\n{'':<20}  {verdict}"
-            f"\n{'':<20}  Local (exp6 phase F) was +141 / +96 / +21."
+            f"{'':<20}  arrow_rs USS increments: "
+            + " / ".join(f"{d:+.0f}" for d in deltas)
+            + f" MiB\n{'':<20}  marginal MiB peak per MiB decoded: "
+            + " / ".join(f"{m:.2f}" for m in marginal)
+            + f"\n{'':<20}  {verdict}"
+            f"\n{'':<20}  Local (exp6 phase F, block=128M) was 0.95 / 0.30 / 0.04."
         )
     print()
 
