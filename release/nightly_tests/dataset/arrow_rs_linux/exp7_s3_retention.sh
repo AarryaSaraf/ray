@@ -72,6 +72,13 @@ TOTAL_DECODED_MIB="${TOTAL_DECODED_MIB:-4219}"
 
 FIXED_BLOCK="${FIXED_BLOCK:-128}"
 S_CHUNKS="${S_CHUNKS:-16 64 256 0}"
+# fetch_window_mb for the phase S grid. 0 = the shipping default (16), which is
+# what the first run used -- and phase W then found 16 is the WORST setting on
+# this axis. `S_WINDOW=128 PHASES=S ./exp7_s3_retention.sh` re-asks the transport
+# question at the best one.
+S_WINDOW="${S_WINDOW:-0}"
+# Replicates per arm. Default 1 for a first look; use 3 before quoting anything.
+REPEAT="${REPEAT:-1}"
 # 0 = leave the shipping default (16). 4 and 64 bracket it; 128 is deliberately
 # past the point where the window stops bounding anything, as the control.
 WINDOWS="${WINDOWS:-4 16 64 128}"
@@ -103,17 +110,30 @@ python "$HERE/stage_data.py" --dst "$S3_DATA" --sf "$SF" \
 # Profiling is on for every arm: col_group_rgs and s3_rg-retained_bytes are the
 # only way to tell "the window is working" from "the column-group branch fired
 # and retained the whole row group", and those two look identical in USS.
+#
+# REPEAT is not optional rigour here, it is a correction. The 2026-08-07 run
+# happened to measure the SAME configuration (arrow_rs, default chunk, shipping
+# knobs, threads=1) in three different phases and got 802 / 837 / 892 MiB at
+# 11.5 / 7.1 / 7.0 s -- 11% spread on memory and 64% on wall. Phase S's ratios
+# (1.33 / 1.17 / 1.11) are not separable from each other at that noise level, and
+# a single arm cannot be quoted. The summary reports the median and the spread so
+# the noise is visible in the table instead of inferred across phases.
 run_probe() {  # tag, then probe args
   local tag="$1"; shift
-  echo "=== $tag"
-  env RAY_DATA_ARROW_RS_PROFILE=1 \
-      RAY_DATA_ARROW_RS_PROFILE_DIR="$RESULTS/prof/$tag" \
-    python "$HERE/block_retention_probe.py" \
-      --source "$S3_DATA" --max-files "$MAX_FILES" \
-      --out "$RESULTS/$tag.json" "$@" \
-      > "$RESULTS/$tag.log" 2>&1 \
-    || echo "  FAILED -- see $RESULTS/$tag.log"
-  grep -h "^WARNING:" "$RESULTS/$tag.log" 2>/dev/null || true
+  local rep
+  for rep in $(seq 1 "${REPEAT:-1}"); do
+    local rtag="$tag"
+    [ "${REPEAT:-1}" -gt 1 ] && rtag="${tag}_r${rep}"
+    echo "=== $rtag"
+    env RAY_DATA_ARROW_RS_PROFILE=1 \
+        RAY_DATA_ARROW_RS_PROFILE_DIR="$RESULTS/prof/$rtag" \
+      python "$HERE/block_retention_probe.py" \
+        --source "$S3_DATA" --max-files "$MAX_FILES" \
+        --out "$RESULTS/$rtag.json" "$@" \
+        > "$RESULTS/$rtag.log" 2>&1 \
+      || echo "  FAILED -- see $RESULTS/$rtag.log"
+    grep -h "^WARNING:" "$RESULTS/$rtag.log" 2>/dev/null || true
+  done
 }
 
 # Phase S -- the exp6 phase F grid, over S3.
@@ -131,14 +151,29 @@ run_probe() {  # tag, then probe args
 #       becomes the main event rather than a follow-up.
 #   BOTH readers shift up by a constant -> transport overhead, cancels in the
 #       ratio, story unchanged.
+#
+# ANSWERED 2026-08-07, and it was the bad branch: increments +133 / +115 / +270,
+# i.e. flat then accelerating. Saturation does NOT transfer. arrow-rs came out
+# 1.33 / 1.17 / 1.11 / 0.96x -- WORSE than PyArrow at every task size but the
+# largest, which is the release regression reproduced on one box.
+#
+# But phase W then showed that grid was run at the WORST available S3 setting:
+# fetch_window_mb=16 costs 892 MiB at the default chunk where 128 costs 618, at
+# wall parity. S_WINDOW re-runs the grid at a chosen window so the transport
+# question gets asked at a setting we would actually ship. 0 = leave the default
+# (which is what produced the numbers above).
 if has_phase S; then
 for chunk in $S_CHUNKS; do
   for reader in pyarrow arrow_rs; do
     chunk_args=()
     [ "$chunk" != 0 ] && chunk_args=(--chunk-mib "$chunk")
+    win_args=()
+    # pyarrow ignores the knob, but passing it only to one arm would put the two
+    # arms on different env, so it goes to both or neither.
+    [ "${S_WINDOW:-0}" != 0 ] && win_args=(--fetch-window-mb "$S_WINDOW")
     run_probe "S_${reader}_chunk${chunk}" \
       --reader "$reader" --block-mib "$FIXED_BLOCK" --threads 1 \
-      "${chunk_args[@]}"
+      "${chunk_args[@]}" "${win_args[@]}"
   done
 done
 fi
@@ -206,6 +241,7 @@ RESULTS="$RESULTS" TOTAL_DECODED_MIB="$TOTAL_DECODED_MIB" \
 import glob
 import json
 import os
+import re
 
 MiB = 1024 * 1024
 TOTAL_DECODED_MIB = float(os.environ["TOTAL_DECODED_MIB"])
@@ -223,15 +259,77 @@ def nearest_local(d):
     return LOCAL_F[key] if abs(key - d) / key < 0.25 else None
 
 
-rows = []
+raw = []
 for path in sorted(glob.glob(os.path.join(RESULTS, "*.json"))):
     with open(path) as handle:
         r = json.load(handle)
     r["tag"] = os.path.basename(path)[: -len(".json")]
-    rows.append(r)
+    raw.append(r)
 
-if not rows:
+if not raw:
     raise SystemExit(f"no results in {RESULTS}")
+
+
+def _median(vals):
+    s = sorted(vals)
+    mid = len(s) // 2
+    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
+
+def collapse(records):
+    """Median over replicates of the same configuration, carrying the spread.
+
+    Not cosmetic. The first run measured the same config in three phases and got
+    802 / 837 / 892 MiB at 11.5 / 7.1 / 7.0 s: 11% on memory, 64% on wall. Any
+    table that shows one number per arm invites reading a 1.11x as different from
+    a 1.17x when the instrument cannot tell them apart. The spread column is the
+    reader's warning that it cannot.
+    """
+    keys = (
+        "reader",
+        "block_mib",
+        "chunk_mib",
+        "threads",
+        "fetch_window_mb",
+        "prefetch_budget_mb",
+        "decode_budget_mib",
+    )
+    groups = {}
+    for r in records:
+        # Strip the _rN replicate suffix so replicates land in one group and the
+        # phase letter still distinguishes grids that share knob settings.
+        base = re.sub(r"_r\d+$", "", r["tag"])
+        groups.setdefault(
+            (base.split("_")[0], tuple(r.get(k) for k in keys)), []
+        ).append(r)
+    out = []
+    for (_, _), reps in groups.items():
+        good = [r for r in reps if not r.get("stats_error")]
+        merged = dict((good or reps)[0])
+        merged["tag"] = re.sub(r"_r\d+$", "", merged["tag"])
+        merged["n_reps"] = len(reps)
+        if good:
+            uss = [r["avg_max_uss_per_task"] for r in good]
+            merged["avg_max_uss_per_task"] = _median(uss)
+            merged["wall_s"] = _median([r["wall_s"] for r in good])
+            merged["uss_spread"] = (max(uss) / min(uss)) if min(uss) else 0
+        out.append(merged)
+    return out
+
+
+rows = collapse(raw)
+spreads = [r["uss_spread"] for r in rows if r.get("uss_spread", 0) and r["n_reps"] > 1]
+if spreads:
+    print(
+        f"replicates: {max(r['n_reps'] for r in rows)} per arm, worst within-arm "
+        f"USS spread {max(spreads):.2f}x -- differences smaller than this are noise\n"
+    )
+else:
+    print(
+        "replicates: 1 per arm. The 2026-08-07 run showed ~1.11x run-to-run spread\n"
+        "on identical configs, so treat any ratio difference under ~15% as noise.\n"
+        "Re-run with REPEAT=3 before quoting a number.\n"
+    )
 
 # Every fit below divides TOTAL_DECODED_MIB by the task count, so a run that
 # read a different number of files than that constant assumes silently produces
@@ -318,11 +416,24 @@ if s_rows:
             print(f"{'':<20}  {reader:<9} s3 USS ~= {intercept:.0f} + {slope:.3f} x D")
     seq = [u for _, u in sorted(pts["arrow_rs"])]
     if len(seq) > 2:
-        incs = " / ".join(f"{b - a:+.0f}" for a, b in zip(seq, seq[1:]))
+        deltas = [b - a for a, b in zip(seq, seq[1:])]
+        incs = " / ".join(f"{d:+.0f}" for d in deltas)
+        # This line used to assert saturation unconditionally whenever there were
+        # more than two points, and on 2026-08-07 it printed "holds on S3" over
+        # increments of +133 / +115 / +270 -- which say the opposite. Test the
+        # claim before making it: saturating means each step costs LESS than the
+        # one before, even though D itself is growing between steps.
+        saturating = all(b <= a * 1.05 for a, b in zip(deltas, deltas[1:]))
+        verdict = (
+            "shrinking increments = saturating = the OOM property HOLDS on S3"
+            if saturating
+            else "increments NOT shrinking -> memory still tracks task size, so "
+            "saturation does NOT transfer to S3"
+        )
         print(
             f"{'':<20}  arrow_rs increments: {incs} MiB"
-            f"\n{'':<20}  shrinking increments = saturating = the OOM property"
-            f"\n{'':<20}  holds on S3. Local was +141 / +96 / +21."
+            f"\n{'':<20}  {verdict}"
+            f"\n{'':<20}  Local (exp6 phase F) was +141 / +96 / +21."
         )
     print()
 
@@ -355,10 +466,16 @@ if w_rows:
         if len(vals) > 1:
             print(f"{'':<20}  spread {max(vals) / min(vals):.2f}x")
     print(
-        f"\n{'':<20}  Standalone (exp5, no Ray) the same read cost 23 MiB local\n"
-        f"{'':<20}  and 174 MiB on S3. If that 151 MiB gap is the window, it\n"
-        f"{'':<20}  tracks this sweep; if it is flat, it is the object_store\n"
-        f"{'':<20}  client and no knob here reaches it.\n"
+        f"\n{'':<20}  2026-08-07: memory FALLS as the window GROWS -- 892 MiB at\n"
+        f"{'':<20}  the shipping 16 MiB against 618 at 128, wall-neutral. Note\n"
+        f"{'':<20}  prefetch_budget_mb=-1 derives to 4 x max(window, 16), so the\n"
+        f"{'':<20}  128 arm had a 512 MiB byte budget and still used the least:\n"
+        f"{'':<20}  what costs is the NUMBER of concurrent units, not the bytes\n"
+        f"{'':<20}  admitted. A 4 MiB window carves a row group into many small\n"
+        f"{'':<20}  units and the budget admits ~16 at once, each with its own\n"
+        f"{'':<20}  decode state; a 128 MiB window means one. The budget=16 rows\n"
+        f"{'':<20}  confirm it from the other side -- capping the count directly\n"
+        f"{'':<20}  makes the window irrelevant (spread 1.03x).\n"
     )
 
 # --- phase T: does the serial default survive latency? -----------------------
