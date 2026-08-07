@@ -108,6 +108,32 @@ def read_stats(ds) -> Dict[str, Any]:
     return {"stats_error": f"no Read operator among {seen or '[]'}"}
 
 
+def _clamp_files(source: str, limit: int):
+    """The first ``limit`` .parquet files under ``source``, as an explicit list.
+
+    Sorted by name, so the local and S3 arms pick the SAME files rather than
+    whatever order the listing happens to return -- lineitem files differ in row
+    count, and "4 files" that are not the same 4 files is not a transport
+    comparison.
+
+    ``FileSystem.from_uri`` handles both ``s3://`` and bare local paths, and
+    returns the path with the scheme stripped, which is what ``get_file_info``
+    wants. The scheme is put back for S3 because ``read_parquet`` resolves a
+    bare ``bucket/key`` as a local relative path.
+    """
+    from pyarrow.fs import FileSelector, FileSystem, FileType
+
+    fs, root = FileSystem.from_uri(source)
+    infos = fs.get_file_info(FileSelector(root, recursive=True))
+    files = sorted(
+        i.path for i in infos if i.type == FileType.File and i.path.endswith(".parquet")
+    )
+    if not files:
+        raise SystemExit(f"no .parquet files under {source}")
+    scheme = source.split("://")[0] + "://" if "://" in source else ""
+    return [scheme + p for p in files[:limit]]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--source", required=True)
@@ -150,10 +176,41 @@ def main() -> int:
         "0 leaves the default.",
     )
     parser.add_argument(
+        "--fetch-window-mb",
+        type=int,
+        default=0,
+        help="RAY_DATA_ARROW_RS_FETCH_WINDOW_MB -- how many compressed bytes of "
+        "one row group the S3 path holds in flight before decoding them "
+        "(default 16). S3-ONLY: the local path memory-maps and has no fetch "
+        "window at all, which is why standalone arrow-rs costs 23 MiB on local "
+        "disk and 174 MiB on S3 for the same data. 0 leaves the default.",
+    )
+    parser.add_argument(
+        "--prefetch-budget-mb",
+        type=int,
+        default=0,
+        help="RAY_DATA_ARROW_RS_PREFETCH_BUDGET_MB -- total compressed bytes "
+        "admitted ahead of the decoder across ALL in-flight units. Defaults to "
+        "-1, meaning 4 x max(fetch_window_mb, column_fetch_mb) = 64 MiB at the "
+        "shipping defaults. This is the other half of the S3 working set: peak "
+        "~= prefetch_budget + decode_budget. 0 leaves the default.",
+    )
+    parser.add_argument(
         "--write-to",
         default=None,
         help="fuse a write onto the read (the release write_parquet shape). "
         "Omitted = iterate bundles, which keeps the read unfused.",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=0,
+        help="read only the first N .parquet files under --source, sorted by "
+        "name. Needed to compare transports: exp5 copies 4 files to local disk "
+        "but stage_data.py stages the WHOLE sf10 prefix to S3, so an unclamped "
+        "S3 arm reads ~11 files against local's 4 -- different data, and the "
+        "MiB-decoded-per-task axis every fit is against would be wrong. "
+        "0 reads everything.",
     )
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
@@ -166,6 +223,12 @@ def main() -> int:
     if args.decode_budget_mib:
         os.environ["RAY_DATA_ARROW_RS_DECODE_BUDGET_BYTES"] = str(
             args.decode_budget_mib * MiB
+        )
+    if args.fetch_window_mb:
+        os.environ["RAY_DATA_ARROW_RS_FETCH_WINDOW_MB"] = str(args.fetch_window_mb)
+    if args.prefetch_budget_mb:
+        os.environ["RAY_DATA_ARROW_RS_PREFETCH_BUDGET_MB"] = str(
+            args.prefetch_budget_mb
         )
     # Read before ray.data imports: _DEFAULT_NUM_THREADS is a module-level
     # env_integer, so setting it afterwards has no effect at all.
@@ -181,12 +244,22 @@ def main() -> int:
     if args.chunk_mib:
         ctx.parquet_chunker_target_chunk_size = args.chunk_mib * MiB
 
+    # A URI is not a local directory: rmtree/makedirs on "s3://..." would create
+    # a literal ./s3:/ tree next to the script and leave the real prefix
+    # untouched, so an S3 write arm would silently append to the previous arm's
+    # output. Only clean paths we can actually clean.
+    if args.write_to and "://" in args.write_to:
+        return f"FATAL: --write-to must be a local path, got {args.write_to}"
     if args.write_to:
         shutil.rmtree(args.write_to, ignore_errors=True)
         os.makedirs(args.write_to, exist_ok=True)
 
+    source = (
+        _clamp_files(args.source, args.max_files) if args.max_files else args.source
+    )
+
     started = time.perf_counter()
-    ds = ray.data.read_parquet(args.source)
+    ds = ray.data.read_parquet(source)
     if args.write_to:
         ds.write_parquet(args.write_to)
     else:
@@ -211,8 +284,11 @@ def main() -> int:
         "decode_budget_mib": args.decode_budget_mib or None,
         "chunk_mib": args.chunk_mib or None,
         "threads": args.threads or None,
+        "fetch_window_mb": args.fetch_window_mb or None,
+        "prefetch_budget_mb": args.prefetch_budget_mb or None,
         "mode": "write" if args.write_to else "iter_bundles",
         "source": args.source,
+        "num_files": len(source) if isinstance(source, list) else None,
         "wall_s": round(wall, 2),
     }
     result.update(read_stats(ds))

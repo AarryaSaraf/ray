@@ -68,7 +68,7 @@ E_THREADS="${E_THREADS:-1 4}"
 # section 8); the open question is E, so `PHASES=E ./exp6_block_retention.sh` is
 # the useful invocation now. The summary prints whatever results are on disk, so
 # running one phase still shows the others from the previous run underneath it.
-PHASES="${PHASES:-A B C D E F}"
+PHASES="${PHASES:-A B C D E F G}"
 mkdir -p "$RESULTS"
 has_phase() { case " $PHASES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -276,6 +276,45 @@ for chunk in $E_CHUNKS; do
     PROBE_WRITE=0 run_probe "F_${reader}_chunk${chunk}" \
       --reader "$reader" --block-mib "$FIXED_BLOCK" --threads 1 \
       "${chunk_args[@]}"
+  done
+done
+fi
+
+# Phase G -- what is the unfused ceiling made of?
+#
+# F answered its question: the writer was holding 589 MiB, and unfused arrow-rs
+# SATURATES -- 185 / 326 / 422 / 443 MiB across a 17x rise in task size, while
+# PyArrow climbs 209 / 347 / 471 / 901 with no ceiling. Saturation is the whole
+# point of the project (a bigger file stops costing more), so the next question
+# is what sets the ceiling, because that number is the OOM budget.
+#
+# 443 MiB is ~3.5 x the 128 MiB default target_max_block_size. If the ceiling is
+# "a few finished output blocks waiting to be handed to the object store", then
+# it is a knob and memory becomes something we set rather than something the
+# input decides.
+#
+# Phase A already swept block size and got 1.00-1.01x -- but A was FUSED, and F
+# then showed the writer's 589 MiB was the majority of that measurement. A knob
+# worth ~50 MiB is invisible underneath it. So A has to be re-run without the
+# write before its flatness means anything.
+#
+#   USS scales with block size -> the ceiling is retained output blocks. Ship a
+#       smaller target_max_block_size (or find why they are not released) and
+#       the saturation point drops with it.
+#   USS flat across 32x        -> the ~443 MiB is something else: the decode
+#       working set across in-flight fragments, Rust allocator arenas, or the
+#       block builder's concatenate scratch. Next probe is the crate's own
+#       retained_bytes against this number.
+#
+# Run at the DEFAULT chunk (one file, ~1055 MiB decoded per task): that is where
+# both readers are furthest apart and where the ceiling is actually reached. At
+# chunk=16M a task only produces 62 MiB total, less than one block, so every
+# block setting would look identical for a trivial reason.
+if has_phase G; then
+for reader in pyarrow arrow_rs; do
+  for mib in $BLOCKS; do
+    PROBE_WRITE=0 run_probe "G_${reader}_blk${mib}" \
+      --reader "$reader" --block-mib "$mib" --threads 1
   done
 done
 fi
@@ -509,6 +548,43 @@ for reader in ("pyarrow", "arrow_rs"):
         )
     print()
 
+# Phase G: the block sweep again, but unfused and serial -- i.e. the conditions
+# under which the ~443 MiB ceiling was measured. Phase A ran this fused, where
+# the writer's 589 MiB swamped anything the block knob could do.
+g_rows = [r for r in rows if r["tag"].startswith("G_")]
+if g_rows:
+    head = (
+        f"{'PHASE G unfused blk':<22}{'pyarrow':>12}{'arrow_rs':>12}{'ratio':>8}"
+        f"{'wall P':>9}{'wall R':>9}"
+    )
+    print(head)
+    print("-" * len(head))
+    by_blk = {}
+    for r in g_rows:
+        by_blk.setdefault(r["block_mib"], {})[r["reader"]] = r
+    series = {"pyarrow": [], "arrow_rs": []}
+    for blk in sorted(by_blk):
+        arms = by_blk[blk]
+        p, a = arms.get("pyarrow"), arms.get("arrow_rs")
+        if not (p and a):
+            continue
+        pu = (p.get("avg_max_uss_per_task") or 0) / MiB
+        au = (a.get("avg_max_uss_per_task") or 0) / MiB
+        series["pyarrow"].append(pu)
+        series["arrow_rs"].append(au)
+        print(
+            f"{'block=' + str(blk) + 'M':<22}{pu:>9.0f}MiB{au:>9.0f}MiB"
+            f"{(au / pu if pu else 0):>7.2f}x{p['wall_s']:>9.1f}{a['wall_s']:>9.1f}"
+        )
+    for reader, vals in series.items():
+        if len(vals) > 1 and min(vals) > 0:
+            print(f"{'':<22}  {reader} spread {max(vals) / min(vals):.2f}x")
+    print(
+        f"\n{'':<22}  arrow_rs spread >> 1 -> the ~443 MiB ceiling is retained\n"
+        f"{'':<22}  output blocks, and it is a knob. Flat -> it is not, and the\n"
+        f"{'':<22}  next suspect is in-flight decode scratch inside the crate.\n"
+    )
+
 print(
     "A lineitem file is ~6.0M rows x 172 B = 1.03 GiB decoded; standalone, the"
     f"\nsame read holds 23 MiB. Four files = {TOTAL_DECODED_MIB:,} MiB decoded total."
@@ -548,5 +624,19 @@ print(
     "\nslope collapses, the reader streams fine and the accumulator is the write"
     "\npath -- which is shared with PyArrow, so it would not be an arrow-rs defect"
     "\nat all. If it does not move, the read task really does hold its output."
+    "\n"
+    "\nANSWERED: the writer. At the default chunk it held 589 of the 1032 MiB, and"
+    "\nunfused the ratio goes 0.87x -> 0.49x. The important part is not the ratio"
+    "\nbut the SHAPE: unfused arrow-rs goes 185/326/422/443 MiB across a 17x rise"
+    "\nin task size -- increments of +141/+96/+21, flattening toward a ceiling --"
+    "\nwhile PyArrow goes 209/347/471/901, +138/+124/+430, still accelerating. A"
+    "\nceiling is the anti-OOM property; a slope is not. PyArrow's own slope also"
+    "\nworsens when fused (0.675 -> 0.96), so the write path is shared-code work,"
+    "\nnot an arrow-rs defect."
+    "\n"
+    "\nPhase G asks what SETS that ceiling, because the ceiling is the OOM budget."
+    "\n443 MiB is ~3.5 default blocks; if it is retained output blocks it is a"
+    "\nknob. Phase A said no, but A was fused and the writer's 589 MiB would have"
+    "\nhidden anything smaller, so it has to be asked again without the write."
 )
 PYEOF
