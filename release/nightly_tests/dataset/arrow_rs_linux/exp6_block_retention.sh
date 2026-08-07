@@ -59,11 +59,16 @@ THREADS="${THREADS:-1 2 4 8}"
 # is 309 vs 242 MiB, so a ~82 MiB thread-pool cost is most of it.
 FIXED_CHUNK="${FIXED_CHUNK:-16}"
 FIXED_BLOCK="${FIXED_BLOCK:-128}"
-# Which phases to run. Phases A-C are answered (see FINDINGS.md section 4); the
-# open question is D, so `PHASES=D ./exp6_block_retention.sh` is the useful
-# invocation now. The summary prints whatever results are on disk, so running D
-# alone still shows A/B/C from the previous run underneath it.
-PHASES="${PHASES:-A B C D}"
+# Phase E: threads crossed with task size. Phase D showed threads=1 is free at
+# the smallest chunk, but at that chunk a task holds only ~3 fragments -- the
+# question is whether serial decode still costs nothing when a task holds 49.
+E_CHUNKS="${E_CHUNKS:-16 64 256 0}"
+E_THREADS="${E_THREADS:-1 4}"
+# Which phases to run. A-D are answered (arrow_rs_docs/regression_testing.md
+# section 8); the open question is E, so `PHASES=E ./exp6_block_retention.sh` is
+# the useful invocation now. The summary prints whatever results are on disk, so
+# running one phase still shows the others from the previous run underneath it.
+PHASES="${PHASES:-A B C D E}"
 mkdir -p "$RESULTS"
 has_phase() { case " $PHASES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -183,6 +188,49 @@ for threads in $THREADS; do
   done
 done
 fi
+
+# Phase E -- does serial decode stay free as the task gets bigger?
+#
+# ANSWERED by D: the whole ~104 MiB floor is the fragment thread pool. arrow-rs
+# pays +96 MiB for it and PyArrow +18, and at threads=1 arrow-rs (213 MiB) beats
+# PyArrow (223) even at the smallest task size, so the Phase C crossover is
+# entirely an artifact of the pool.
+#
+# Two things D could not see, and E must, before "default the arrow-rs path to
+# one fragment thread" becomes a patch:
+#
+#   1. D ran only at chunk=16M, where a task holds ~3 fragments (4 files / 68
+#      tasks x 49 row groups per file). num_workers = min(threads, fragments),
+#      so threads=4 and threads=8 both clamped to ~3 and the top of that sweep
+#      measured nothing. At the default chunk a task holds 49 fragments, and
+#      serial-over-49 is a completely different proposition from serial-over-3.
+#   2. D's headline is that threads=1 costs no wall time. That is only
+#      established for ~3 fragments.
+#
+# Note threads=1 is not merely less concurrency: `num_workers <= 1` returns
+# early into _read_fragments_sequential (file_reader.py:481) and make_async_gen
+# is never constructed. That is why 86 of the 96 MiB arrives on the SECOND
+# worker rather than spreading evenly -- the second worker buys a concurrent
+# decode and the whole queue apparatus at once. E cannot separate those two
+# either; it only asks whether the trade stays good.
+#
+#   threads=1 wall stays flat as the chunk grows -> ship the serial default.
+#   threads=1 wall degrades at big chunks        -> the win is task-size
+#       dependent, and the fix is per-fragment retention (or a smaller default
+#       chunk) rather than serialising the pool.
+#
+# chunk=0 means "leave the default" (1 GiB, i.e. one whole file per task).
+if has_phase E; then
+for chunk in $E_CHUNKS; do
+  for threads in $E_THREADS; do
+    chunk_args=()
+    [ "$chunk" != 0 ] && chunk_args=(--chunk-mib "$chunk")
+    run_probe "E_arrow_rs_chunk${chunk}_thr${threads}" \
+      --reader arrow_rs --block-mib "$FIXED_BLOCK" --threads "$threads" \
+      "${chunk_args[@]}"
+  done
+done
+fi
 rm -rf "$WRITE_DIR"
 
 RESULTS="$RESULTS" FIXED_BLOCK="$FIXED_BLOCK" python - <<'PYEOF' | tee "$OUT_DIR/exp6_summary.txt"
@@ -280,7 +328,7 @@ for reader in ("pyarrow", "arrow_rs"):
         # count, and the check that the chunk knob actually took effect.
         n = r.get("uss_num_samples") or r.get("task_count") or 0
         print(
-            f"{'chunk=' + str(r.get('chunk_mib')) + 'M':<22}{avg:>12.0f}MiB"
+            f"{('chunk=' + str(r['chunk_mib']) + 'M') if r.get('chunk_mib') else 'chunk=default(1G)':<22}{avg:>12.0f}MiB"
             f"{(mx / avg if avg else 0):>9.2f}{n:>7}"
             f"{(TOTAL_DECODED_MIB / n if n else 0):>18,.0f}{r['wall_s']:>8.1f}"
         )
@@ -317,6 +365,39 @@ for reader in ("pyarrow", "arrow_rs"):
         )
     print()
 
+# Phase E: threads x task size, arrow_rs only. Phase D established that
+# threads=1 is both lighter and no slower -- but only where a task held ~3
+# fragments. The wall column is the one that matters here: if serialising stays
+# free as the task grows to 49 fragments, the serial default ships.
+e_rows = [r for r in rows if r["tag"].startswith("E_")]
+if e_rows:
+    by_chunk = {}
+    for r in e_rows:
+        by_chunk.setdefault(r.get("chunk_mib") or 0, {})[r.get("threads") or 0] = r
+    head = (
+        f"{'PHASE E arrow_rs':<22}{'USS thr=1':>12}{'USS thr=4':>12}{'mem saved':>11}"
+        f"{'wall thr=1':>12}{'wall thr=4':>12}{'wall cost':>11}"
+    )
+    print(head)
+    print("-" * len(head))
+    for chunk in sorted(by_chunk, key=lambda c: (c == 0, c)):
+        arms = by_chunk[chunk]
+        lo, hi = arms.get(1), arms.get(4)
+        if not (lo and hi):
+            continue
+        lo_u = (lo.get("avg_max_uss_per_task") or 0) / MiB
+        hi_u = (hi.get("avg_max_uss_per_task") or 0) / MiB
+        label = "chunk=default" if chunk == 0 else f"chunk={chunk}M"
+        print(
+            f"{label:<22}{lo_u:>9.0f}MiB{hi_u:>9.0f}MiB{(hi_u - lo_u):>+10.0f}M"
+            f"{lo['wall_s']:>12.1f}{hi['wall_s']:>12.1f}"
+            f"{(lo['wall_s'] / hi['wall_s'] if hi['wall_s'] else 0):>10.2f}x"
+        )
+    print(
+        f"{'':<22}  mem saved > 0 and wall cost ~1.00x at every chunk -> serial\n"
+        f"{'':<22}  is strictly better and the default should change.\n"
+    )
+
 print(
     "A lineitem file is ~6.0M rows x 172 B = 1.03 GiB decoded; standalone, the"
     f"\nsame read holds 23 MiB. Four files = {TOTAL_DECODED_MIB:,} MiB decoded total."
@@ -330,10 +411,20 @@ print(
     "\n(D = MiB decoded per task). arrow-rs holds less of what it decodes but"
     "\ncarries ~104 MiB more fixed cost, so they cross over at D ~= 385 MiB."
     "\n"
-    "\nPhase D asks what that fixed cost is. Task size is held at the smallest"
-    "\nchunk and only fragment concurrency moves. ~20 MiB per thread on the"
-    "\narrow_rs arm and ~0 on the pyarrow arm means the floor is the thread pool"
-    "\nholding one retained row group per in-flight fragment. Flat on both means"
-    "\nit is Rust-side and the search moves into the crate."
+    "\nPhase D found that fixed cost: it is the fragment thread pool. arrow-rs"
+    "\npays +96 MiB for it and PyArrow +18, and at threads=1 arrow-rs (213 MiB)"
+    "\nbeats PyArrow (223) even at the smallest task -- so the C crossover is an"
+    "\nartifact of the pool, not a property of the decoder. 86 of the 96 arrives"
+    "\non the SECOND worker because num_workers <= 1 returns early into"
+    "\n_read_fragments_sequential (file_reader.py:481) and make_async_gen is never"
+    "\nbuilt; the second worker buys a concurrent decode and the whole queue"
+    "\napparatus at once. Above 2 the sweep measured nothing: num_workers ="
+    "\nmin(threads, fragments) and a chunk=16M task holds only ~3 fragments."
+    "\n"
+    "\nPhase E is the ship/no-ship check. D showed serial is free, but only at ~3"
+    "\nfragments per task; at the default chunk a task holds 49. If wall cost"
+    "\nstays ~1.00x as the chunk grows, defaulting the arrow-rs path to one"
+    "\nfragment thread is strictly better. If it degrades, the win is task-size"
+    "\ndependent and the fix belongs in per-fragment retention instead."
 )
 PYEOF
