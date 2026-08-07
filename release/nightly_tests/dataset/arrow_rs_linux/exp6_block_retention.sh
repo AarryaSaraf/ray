@@ -53,13 +53,25 @@ BUDGETS="${BUDGETS:-8 32 64 128}"
 # On-disk bytes per read task. lineitem compresses ~4x, so these are roughly
 # 1 GiB / 256 MiB / 64 MiB of decoded data per task.
 CHUNKS="${CHUNKS:-256 64 16}"
+THREADS="${THREADS:-1 2 4 8}"
+# Phase D runs at the SMALLEST task size, where the fixed floor is the dominant
+# term and therefore easiest to see: at 62 MiB decoded per task the measured gap
+# is 309 vs 242 MiB, so a ~82 MiB thread-pool cost is most of it.
+FIXED_CHUNK="${FIXED_CHUNK:-16}"
 FIXED_BLOCK="${FIXED_BLOCK:-128}"
+# Which phases to run. Phases A-C are answered (see FINDINGS.md section 4); the
+# open question is D, so `PHASES=D ./exp6_block_retention.sh` is the useful
+# invocation now. The summary prints whatever results are on disk, so running D
+# alone still shows A/B/C from the previous run underneath it.
+PHASES="${PHASES:-A B C D}"
 mkdir -p "$RESULTS"
-# Every phase re-runs on every invocation, so any JSON already here is from an
-# older run -- possibly with different fields (an earlier Phase C keyed on
-# override_num_blocks, which the summary cannot sort alongside chunk_mib).
-# Clearing is what keeps the summary reading one coherent generation of results.
-rm -f "$RESULTS"/*.json
+has_phase() { case " $PHASES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# A phase that re-runs must not read its own previous generation: an earlier
+# Phase C keyed on override_num_blocks, and the summary cannot sort those
+# alongside chunk_mib. Clear only the phases about to be rewritten, so a
+# selective run leaves the other phases' results intact.
+for p in $PHASES; do rm -f "$RESULTS/${p}_"*.json; done
 
 # One process per arm: Ray reuses workers, and MemoryProfiler reads whole-process
 # private memory, so a second arm in the same cluster inherits the first arm's
@@ -77,16 +89,20 @@ run_probe() {  # tag, then probe args
   grep -h "WARNING: no Read operator" "$RESULTS/$tag.log" 2>/dev/null || true
 }
 
+if has_phase A; then
 for reader in pyarrow arrow_rs; do
   for mib in $BLOCKS; do
     run_probe "A_${reader}_blk${mib}" --reader "$reader" --block-mib "$mib"
   done
 done
+fi
 
+if has_phase B; then
 for budget in $BUDGETS; do
   run_probe "B_arrow_rs_bud${budget}" \
     --reader arrow_rs --block-mib "$FIXED_BLOCK" --decode-budget-mib "$budget"
 done
+fi
 
 # Phase C -- the axis that phases A and B could not distinguish.
 #
@@ -113,14 +129,60 @@ done
 #                                 of streaming helps and the lever is the
 #                                 allocator (arena count, trim, or task size).
 #
+# ANSWERED: neither, cleanly. USS does fall with task size (so it IS live data,
+# and the allocator branch is dead), but the two readers fall along different
+# lines -- see FINDINGS.md section 4. With D = MiB decoded per task,
+#     PyArrow   USS ~= 183 + 0.96*D      (holds ~100% of what it decodes)
+#     arrow-rs  USS ~= 287 + 0.69*D      (holds ~69%, on a 104 MiB higher floor)
+# which crosses over at D ~= 385 MiB: arrow-rs wins on big tasks and loses on
+# small ones. That fixed floor is what phase D goes after.
+#
 # Chunk sizes are on-disk bytes; lineitem compresses ~4x, so 64 MiB on disk is
 # roughly a 256 MiB decode.
+if has_phase C; then
 for chunk in $CHUNKS; do
   for reader in pyarrow arrow_rs; do
     run_probe "C_${reader}_chunk${chunk}" \
       --reader "$reader" --block-mib "$FIXED_BLOCK" --chunk-mib "$chunk"
   done
 done
+fi
+
+# Phase D -- what is the fixed per-task floor made of?
+#
+# Phase C says arrow-rs pays ~104 MiB more per task than PyArrow no matter how
+# small the task gets. The leading suspect is the reader thread pool:
+# _dispatch_fragment_reads (file_reader.py:462) decodes
+# min(RAY_DATA_READ_FILES_NUM_THREADS, len(fragments)) fragments concurrently,
+# the default is 4, and the crate's profiler measured 20.4 MiB retained per row
+# group. Four in flight is ~82 MiB live at every instant regardless of task
+# size, and even the 68-task arm still holds ~7 row groups, enough to keep all
+# four threads fed. 82 against a measured 104 is a good fit.
+#
+# Run at the smallest chunk, where the floor dominates the linear term.
+#
+#   arrow_rs USS falls ~20 MiB per thread removed -> confirmed. The floor is
+#       concurrency x row-group retention, and the fix is a per-reader thread
+#       default (note arrow-rs SCALES with threads where PyArrow is saturated,
+#       so the answer may be more threads with smaller per-thread retention, not
+#       fewer threads).
+#   arrow_rs USS flat across 1..8 threads        -> the floor is Rust-side
+#       (tokio thread stacks, object_store client, allocator arenas) and the
+#       search moves into the crate.
+#   BOTH readers fall together                   -> shared cost, not ours; it
+#       cancels in the ratio and the 104 MiB gap is still unexplained.
+#
+# The pyarrow arm is the control: the pool is shared, so if only arrow-rs moves,
+# the retention per in-flight fragment is the crate's, not Ray's.
+if has_phase D; then
+for threads in $THREADS; do
+  for reader in pyarrow arrow_rs; do
+    run_probe "D_${reader}_thr${threads}" \
+      --reader "$reader" --block-mib "$FIXED_BLOCK" --chunk-mib "$FIXED_CHUNK" \
+      --threads "$threads"
+  done
+done
+fi
 rm -rf "$WRITE_DIR"
 
 RESULTS="$RESULTS" FIXED_BLOCK="$FIXED_BLOCK" python - <<'PYEOF' | tee "$OUT_DIR/exp6_summary.txt"
@@ -129,6 +191,10 @@ import json
 import os
 
 MiB = 1024 * 1024
+# 4 lineitem files x ~6.0M rows x 172 B/row. Phase C fixes the input and varies
+# the task count, so bytes-per-task is this over the number of tasks -- that is
+# the x-axis the USS fit is against.
+TOTAL_DECODED_MIB = 4219
 rows = []
 for path in sorted(glob.glob(os.path.join(os.environ["RESULTS"], "*.json"))):
     with open(path) as handle:
@@ -202,19 +268,21 @@ for reader in ("pyarrow", "arrow_rs"):
     if not subset:
         continue
     head = (
-        f"{'PHASE C ' + reader:<22}{'avg USS/task':>15}{'tasks':>7}"
-        f"{'USS x tasks':>14}{'wall':>8}"
+        f"{'PHASE C ' + reader:<22}{'avg USS/task':>15}{'max/avg':>9}{'tasks':>7}"
+        f"{'MiB decoded/task':>18}{'wall':>8}"
     )
     print(head)
     print("-" * len(head))
     for r in subset:
         avg = (r.get("avg_max_uss_per_task") or 0) / MiB
+        mx = (r.get("max_uss_per_task") or 0) / MiB
         # uss_num_samples is one sample per task that ran -- an independent
         # count, and the check that the chunk knob actually took effect.
         n = r.get("uss_num_samples") or r.get("task_count") or 0
         print(
-            f"{'chunk=' + str(r.get('chunk_mib')) + 'M':<22}{avg:>12.0f}MiB{n:>7}"
-            f"{avg * n / 1024:>11.1f}GiB{r['wall_s']:>8.1f}"
+            f"{'chunk=' + str(r.get('chunk_mib')) + 'M':<22}{avg:>12.0f}MiB"
+            f"{(mx / avg if avg else 0):>9.2f}{n:>7}"
+            f"{(TOTAL_DECODED_MIB / n if n else 0):>18,.0f}{r['wall_s']:>8.1f}"
         )
     if len({r.get("uss_num_samples") for r in subset}) == 1:
         print(
@@ -223,15 +291,49 @@ for reader in ("pyarrow", "arrow_rs"):
         )
     print()
 
+# Phase D: task size is FIXED, only the reader's fragment concurrency moves. Any
+# USS that tracks the thread count is the per-in-flight-fragment cost, which is
+# the part of the fixed floor that does not shrink when tasks shrink.
+for reader in ("pyarrow", "arrow_rs"):
+    subset = sorted(
+        (r for r in rows if r["tag"].startswith("D_") and r["reader"] == reader),
+        key=lambda r: r.get("threads") or 0,
+    )
+    if not subset:
+        continue
+    head = (
+        f"{'PHASE D ' + reader:<22}{'avg USS/task':>15}{'vs 1 thread':>13}"
+        f"{'tasks':>7}{'wall':>8}"
+    )
+    print(head)
+    print("-" * len(head))
+    base = (subset[0].get("avg_max_uss_per_task") or 0) / MiB
+    for r in subset:
+        avg = (r.get("avg_max_uss_per_task") or 0) / MiB
+        print(
+            f"{'threads=' + str(r.get('threads')):<22}{avg:>12.0f}MiB"
+            f"{(avg - base):>+12.0f}M"
+            f"{(r.get('uss_num_samples') or 0):>7}{r['wall_s']:>8.1f}"
+        )
+    print()
+
 print(
     "A lineitem file is ~6.0M rows x 172 B = 1.03 GiB decoded; standalone, the"
-    "\nsame read holds 23 MiB."
+    f"\nsame read holds 23 MiB. Four files = {TOTAL_DECODED_MIB:,} MiB decoded total."
     "\n"
     "\nPhase A/B flat does NOT mean nothing is retained: if a task holds ALL its"
     "\noutput, the total is invariant to chunking, so flat is what that looks like."
-    "\nPhase C is the discriminator. USS falling ~proportionally with task size"
-    "\nmeans the task holds its output. USS pinned near 1 GiB while tasks shrink"
-    "\n16x means it is not live data at all -- it is the allocator's high-water"
-    "\nmark over lifetime churn, and streaming cannot fix it."
+    "\n"
+    "\nPhase C answered the live-data question -- USS moves with task size, so it"
+    "\nis live data, not an allocator high-water mark. But the two readers fall"
+    "\nalong different lines: PyArrow ~= 183 + 0.96*D, arrow-rs ~= 287 + 0.69*D"
+    "\n(D = MiB decoded per task). arrow-rs holds less of what it decodes but"
+    "\ncarries ~104 MiB more fixed cost, so they cross over at D ~= 385 MiB."
+    "\n"
+    "\nPhase D asks what that fixed cost is. Task size is held at the smallest"
+    "\nchunk and only fragment concurrency moves. ~20 MiB per thread on the"
+    "\narrow_rs arm and ~0 on the pyarrow arm means the floor is the thread pool"
+    "\nholding one retained row group per in-flight fragment. Flat on both means"
+    "\nit is Rust-side and the search moves into the crate."
 )
 PYEOF

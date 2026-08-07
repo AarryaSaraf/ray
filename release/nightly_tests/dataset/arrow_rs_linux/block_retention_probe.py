@@ -127,6 +127,17 @@ def main() -> int:
         "never split and each task decodes a whole file. 0 leaves the default.",
     )
     parser.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="RAY_DATA_READ_FILES_NUM_THREADS -- how many fragments a read task "
+        "decodes concurrently (file_reader.py:44, default 4). Shared by both "
+        "readers. The crate retains ~20 MiB per row group, so 4 in flight is "
+        "~82 MiB live no matter how small the task is; that is the leading "
+        "candidate for the ~104 MiB fixed floor arrow-rs carries over PyArrow. "
+        "0 leaves the default.",
+    )
+    parser.add_argument(
         "--write-to",
         default=None,
         help="fuse a write onto the read (the release write_parquet shape). "
@@ -144,6 +155,10 @@ def main() -> int:
         os.environ["RAY_DATA_ARROW_RS_DECODE_BUDGET_BYTES"] = str(
             args.decode_budget_mib * MiB
         )
+    # Read before ray.data imports: _DEFAULT_NUM_THREADS is a module-level
+    # env_integer, so setting it afterwards has no effect at all.
+    if args.threads:
+        os.environ["RAY_DATA_READ_FILES_NUM_THREADS"] = str(args.threads)
 
     import ray
     from ray.data import DataContext
@@ -174,6 +189,7 @@ def main() -> int:
         "block_mib": args.block_mib,
         "decode_budget_mib": args.decode_budget_mib or None,
         "chunk_mib": args.chunk_mib or None,
+        "threads": args.threads or None,
         "mode": "write" if args.write_to else "iter_bundles",
         "source": args.source,
         "wall_s": round(wall, 2),
