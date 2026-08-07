@@ -68,7 +68,7 @@ E_THREADS="${E_THREADS:-1 4}"
 # section 8); the open question is E, so `PHASES=E ./exp6_block_retention.sh` is
 # the useful invocation now. The summary prints whatever results are on disk, so
 # running one phase still shows the others from the previous run underneath it.
-PHASES="${PHASES:-A B C D E}"
+PHASES="${PHASES:-A B C D E F}"
 mkdir -p "$RESULTS"
 has_phase() { case " $PHASES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -82,11 +82,17 @@ for p in $PHASES; do rm -f "$RESULTS/${p}_"*.json; done
 # private memory, so a second arm in the same cluster inherits the first arm's
 # high-water mark. That worker-reuse effect is the exact artifact that made
 # read_from_uris look like a regression in the release A/B.
+#
+# PROBE_WRITE=0 drops --write-to, so the read is consumed by
+# iter_internal_ref_bundles instead of being fused into a write task. Phases A-E
+# all ran fused, which means they measured read+write together -- see phase F.
 run_probe() {  # tag, then probe args
   local tag="$1"; shift
+  local write_args=(--write-to "$WRITE_DIR")
+  [ "${PROBE_WRITE:-1}" = 0 ] && write_args=()
   echo "=== $tag"
   python "$HERE/block_retention_probe.py" \
-    --source "$DATA" --write-to "$WRITE_DIR" --out "$RESULTS/$tag.json" "$@" \
+    --source "$DATA" "${write_args[@]}" --out "$RESULTS/$tag.json" "$@" \
     > "$RESULTS/$tag.log" 2>&1 \
     || echo "  FAILED -- see $RESULTS/$tag.log"
   # A silent stats failure prints as 0 MiB / 0 tasks, which reads like a
@@ -227,6 +233,48 @@ for chunk in $E_CHUNKS; do
     [ "$chunk" != 0 ] && chunk_args=(--chunk-mib "$chunk")
     run_probe "E_arrow_rs_chunk${chunk}_thr${threads}" \
       --reader arrow_rs --block-mib "$FIXED_BLOCK" --threads "$threads" \
+      "${chunk_args[@]}"
+  done
+done
+fi
+
+# Phase F -- is the retention the reader's, or the writer's?
+#
+# Phase E settled the shipping question: at threads=1 arrow-rs is 0.85-0.88x
+# PyArrow's per-task memory at EVERY task size, at wall parity. But that is a
+# 13% win, and the standalone reader (exp5) held 23 MiB for the same 4219 MiB of
+# decode -- 2%, against 82.5% here. The slope, not the floor, is where the
+# missing win went, and nothing tried so far moves it: block size 1.00-1.01x
+# across 32x, decode budget 1.04x across 16x.
+#
+# The confound: EVERY arm in phases A-E passed --write-to, so all of them
+# measured `read_parquet -> write_parquet` fused into one task. The Parquet
+# writer holds its own column buffers in that same process, so the 0.825 slope
+# may be the writer's accumulation rather than the reader's retention. No
+# experiment here has ever run the read unfused.
+#
+# F re-runs the E grid with the write dropped: the read is consumed by
+# iter_internal_ref_bundles, which pulls blocks through without materializing
+# them.
+#
+#   unfused slope collapses  -> the reader streams correctly and the retention
+#       is the writer's. That reopens H7 in a new form (not "small batches make
+#       the writer accumulate" -- the budget sweep killed that -- but "the
+#       writer accumulates regardless of batch size"), and the next target is
+#       the write path, which is shared with PyArrow.
+#   unfused slope unchanged  -> the read task itself holds its output, and the
+#       gap between 23 MiB standalone and ~0.8x-of-decode in Ray is the
+#       reader/block layer after all.
+#
+# The pyarrow arm is the control: if BOTH readers' slopes collapse unfused, the
+# writer is the accumulator and it is not an arrow-rs defect at all.
+if has_phase F; then
+for chunk in $E_CHUNKS; do
+  for reader in pyarrow arrow_rs; do
+    chunk_args=()
+    [ "$chunk" != 0 ] && chunk_args=(--chunk-mib "$chunk")
+    PROBE_WRITE=0 run_probe "F_${reader}_chunk${chunk}" \
+      --reader "$reader" --block-mib "$FIXED_BLOCK" --threads 1 \
       "${chunk_args[@]}"
   done
 done
@@ -398,6 +446,61 @@ if e_rows:
         f"{'':<22}  is strictly better and the default should change.\n"
     )
 
+
+def fit(points):
+    """Least-squares USS = intercept + slope * D over [(D, USS)].
+
+    The slope is the fraction of what a task decodes that it still holds at
+    peak: ~1.0 means it keeps everything (PyArrow's scanner), and the standalone
+    reader in exp5 managed 0.02. That number, not the intercept, is where the
+    missing win lives.
+    """
+    n = len(points)
+    if n < 2:
+        return None, None
+    mx = sum(p[0] for p in points) / n
+    my = sum(p[1] for p in points) / n
+    denom = sum((p[0] - mx) ** 2 for p in points)
+    if denom == 0:
+        return None, None
+    slope = sum((p[0] - mx) * (p[1] - my) for p in points) / denom
+    return my - slope * mx, slope
+
+
+# Phase F: the same grid unfused (no write). Phases A-E all fused a write onto
+# the read, so they measured read+write in one task. If the slope collapses
+# here, the accumulation was the writer's.
+for reader in ("pyarrow", "arrow_rs"):
+    subset = sorted(
+        (r for r in rows if r["tag"].startswith("F_") and r["reader"] == reader),
+        key=lambda r: r.get("uss_num_samples") or 0,
+    )
+    if not subset:
+        continue
+    head = (
+        f"{'PHASE F ' + reader:<22}{'avg USS/task':>15}{'tasks':>7}"
+        f"{'MiB decoded/task':>18}{'wall':>8}"
+    )
+    print(head)
+    print("-" * len(head))
+    points = []
+    for r in subset:
+        avg = (r.get("avg_max_uss_per_task") or 0) / MiB
+        n = r.get("uss_num_samples") or 0
+        d = TOTAL_DECODED_MIB / n if n else 0
+        points.append((d, avg))
+        label = (
+            f"chunk={r['chunk_mib']}M" if r.get("chunk_mib") else "chunk=default(1G)"
+        )
+        print(f"{label:<22}{avg:>12.0f}MiB{n:>7}{d:>18,.0f}{r['wall_s']:>8.1f}")
+    intercept, slope = fit(points)
+    if slope is not None:
+        print(
+            f"{'':<22}  unfused USS ~= {intercept:.0f} MiB + {slope:.3f} x D"
+            f"   (fused, threads=1: arrow-rs was 162 + 0.825 x D)"
+        )
+    print()
+
 print(
     "A lineitem file is ~6.0M rows x 172 B = 1.03 GiB decoded; standalone, the"
     f"\nsame read holds 23 MiB. Four files = {TOTAL_DECODED_MIB:,} MiB decoded total."
@@ -421,10 +524,21 @@ print(
     "\napparatus at once. Above 2 the sweep measured nothing: num_workers ="
     "\nmin(threads, fragments) and a chunk=16M task holds only ~3 fragments."
     "\n"
-    "\nPhase E is the ship/no-ship check. D showed serial is free, but only at ~3"
-    "\nfragments per task; at the default chunk a task holds 49. If wall cost"
-    "\nstays ~1.00x as the chunk grows, defaulting the arrow-rs path to one"
-    "\nfragment thread is strictly better. If it degrades, the win is task-size"
-    "\ndependent and the fix belongs in per-fragment retention instead."
+    "\nPhase E answered the ship question yes: wall cost is 0.95-1.02x at every"
+    "\nchunk, so serial fragments are free on time even at 49 fragments per task."
+    "\nIt also corrected the floor story -- the pool's cost is +96/+148/+11/-2 MiB"
+    "\nas the chunk grows, so it is not a constant, it only surfaces while the"
+    "\naccumulated output is small enough not to dominate the peak. Serialized,"
+    "\narrow-rs fits 162 + 0.825*D against PyArrow's 183 + 0.96*D: lower on both"
+    "\nterms, no crossover, a uniform 0.85-0.88x at wall parity."
+    "\n"
+    "\nPhase F chases the part that is still missing. 0.825 means a Ray read task"
+    "\nholds 82.5% of everything it decodes; the same read standalone (exp5) held"
+    "\n2%. Nothing tried moves that slope. But every arm in A-E fused a WRITE onto"
+    "\nthe read, so all of them measured read+write in one task and the writer's"
+    "\ncolumn buffers were never separated out. F re-runs the grid unfused. If the"
+    "\nslope collapses, the reader streams fine and the accumulator is the write"
+    "\npath -- which is shared with PyArrow, so it would not be an arrow-rs defect"
+    "\nat all. If it does not move, the read task really does hold its output."
 )
 PYEOF
