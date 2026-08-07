@@ -47,13 +47,21 @@ def read_stats(ds) -> Dict[str, Any]:
     release harness surfaces it as ``read_avg_max_uss_per_task_bytes``. Pulled
     out here rather than importing ``benchmark.py`` so this probe stays runnable
     on its own.
+
+    Use the PUBLIC ``get_stats_summary``: ``write_parquet`` executes an internal
+    dataset stored at ``ds._write_ds`` and only the public accessor knows to
+    look there (dataset.py:7361). Reading the private summary reports on the
+    outer plan, which never executed, and yields zero tasks and zero memory --
+    silently, because "no samples" and "no memory" render identically.
     """
     from ray.data._internal.stats import DatasetStatsSummary
 
-    summary = ds._get_stats_summary()
+    summary = ds.get_stats_summary()
+    seen = []
     for node in DatasetStatsSummary._collect_dataset_stats_summaries(summary):
         extra = getattr(node, "extra_metrics", {}) or {}
         names = [op.operator_name for op in (node.operators_stats or [])]
+        seen.extend(names)
         # The read is the only operator producing decoded bytes; a fused
         # Read->Write reports under the fused name, so match on substring.
         if not any("Read" in n for n in names):
@@ -77,7 +85,9 @@ def read_stats(ds) -> Dict[str, Any]:
             "task_count": getattr(rows, "count", None),
             "rows_per_task_mean": getattr(rows, "mean", None),
         }
-    return {}
+    # An empty dict would print as 0 MiB / 0 tasks, which reads as a measurement
+    # rather than a failure. Say which operators were actually there.
+    return {"stats_error": f"no Read operator among {seen or '[]'}"}
 
 
 def main() -> int:
@@ -89,6 +99,16 @@ def main() -> int:
         type=int,
         required=True,
         help="DataContext.target_max_block_size, in MiB. Ray's default is 128.",
+    )
+    parser.add_argument(
+        "--decode-budget-mib",
+        type=int,
+        default=0,
+        help="crate decode budget, in MiB. 0 leaves the reader's default (2). "
+        "Ray's streaming unit is target_max_block_size, so what likely matters "
+        "is this as a FRACTION of --block-mib: batches much smaller than a "
+        "block make the block builder accumulate and then concatenate, which "
+        "needs inputs and output alive together. Ignored by the pyarrow arm.",
     )
     parser.add_argument(
         "--write-to",
@@ -104,6 +124,10 @@ def main() -> int:
     os.environ["RAY_DATA_USE_ARROW_RS_PARQUET_READER"] = (
         "1" if args.reader == "arrow_rs" else "0"
     )
+    if args.decode_budget_mib:
+        os.environ["RAY_DATA_ARROW_RS_DECODE_BUDGET_BYTES"] = str(
+            args.decode_budget_mib * MiB
+        )
 
     import ray
     from ray.data import DataContext
@@ -130,11 +154,14 @@ def main() -> int:
     result: Dict[str, Any] = {
         "reader": args.reader,
         "block_mib": args.block_mib,
+        "decode_budget_mib": args.decode_budget_mib or None,
         "mode": "write" if args.write_to else "iter_bundles",
         "source": args.source,
         "wall_s": round(wall, 2),
     }
     result.update(read_stats(ds))
+    if result.get("stats_error"):
+        print(f"WARNING: {result['stats_error']}", file=sys.stderr)
     print(json.dumps(result, indent=2))
     if args.out:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)

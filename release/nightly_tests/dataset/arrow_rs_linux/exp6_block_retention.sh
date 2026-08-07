@@ -1,37 +1,45 @@
 #!/usr/bin/env bash
-# Experiment 6 -- what is a read task holding on to?
+# Experiment 6 -- what is a read task holding, and does batch/block alignment fix it?
 #
 # Standing puzzle: the identical read costs 23 MiB of private memory in a bare
-# process (exp5) and ~1 GiB inside a Ray read task (exp3). Three explanations
-# are already ruled out:
+# process (exp5) and ~1 GiB inside a Ray read task (exp3). Three candidate
+# explanations are already dead:
 #
 #   * the transport   -- local and S3 both show ~1 GiB (exp3 both ways)
-#   * the decode budget -- 2 -> 128 MiB moves per-task USS by 7%
-#   * crate retention -- `retained_bytes` is 20 MiB per row group, and the
-#                        column-group path never ran (`col_group_rgs = 0`)
+#   * crate retention -- `retained_bytes` is 20 MiB per row group, and
+#                        `col_group_rgs = 0`: the column-group path never ran
+#   * the decode budget ALONE -- 2 -> 128 MiB moves per-task USS by 7%
 #
 # What per-task USS *does* equal is one input file's decoded size: lineitem is
-# ~6.0M rows x 172 B = 1.03 GiB, measured USS is 958-1035 MiB. So the task looks
-# like it holds a whole file rather than streaming it.
+# ~6.0M rows x 172 B = 1.03 GiB, measured 958-1035 MiB.
 #
-# This sweeps target_max_block_size over 32x. Two outcomes, both decisive:
+# Two phases, because the budget is probably only meaningful RELATIVE to Ray's
+# streaming unit:
 #
-#   USS rises with block size  -> output blocks accumulate in the task. The fix
-#                                 is in the block layer / output buffer, applies
-#                                 to BOTH readers, and the knob is a workaround.
-#   USS flat across the sweep  -> blocks are NOT what is retained. Next suspect
-#                                 is the fragment loop materializing a whole
-#                                 file per yielded table, which would be immune
-#                                 to every knob we have tried -- and would be
-#                                 ours to fix, since it is where the 40x went.
+# Phase A -- block sweep, both readers, budget at the shipping default.
+#   USS rises with block size  -> output blocks accumulate in the task. That is
+#                                 the block layer, it hits PyArrow too, and the
+#                                 knob is a workaround rather than a fix.
+#   USS flat across 32x        -> blocks are not what is retained; the fragment
+#                                 loop materializing a whole file per yielded
+#                                 table is the next suspect, and that one is
+#                                 ours.
+#   PyArrow flat at ~1.2 GiB too -> the retention predates the arrow-rs reader.
 #
-# Both readers are swept: if PyArrow is flat too, the retention is Ray's and
-# predates us; if only arrow-rs is flat, it is the arrow-rs reader.
+# Phase B -- budget sweep at a FIXED 128 MiB block, arrow-rs only.
+#   Ray's streaming unit is target_max_block_size. Handing the block builder
+#   2 MiB batches means it accumulates ~64 of them and concatenates, and a
+#   concat needs inputs and output alive at once. Emitting batches at or near
+#   the block size should let them pass straight through. exp3 already hinted at
+#   this: 32 MiB beat 2 MiB on every axis, on both transports.
+#   USS falls as budget -> block  -> alignment is the fix; set the default from
+#                                    target_block_size instead of a constant.
+#   USS flat                      -> the block builder is not the accumulator.
 #
-# Local disk only -- S3 adds a fetch path that is not under test here, and exp3
-# already showed the two transports agree.
+# Local disk only: exp3 showed the transports agree, and S3 adds a fetch path
+# that is not under test here.
 #
-# Runtime: ~15 min for 8 arms.
+# Runtime: ~20 min for 12 arms.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 check_env
 
@@ -41,68 +49,107 @@ DATA="${DATA:-$LOCAL_ROOT/lineitem}"
 WRITE_DIR="$LOCAL_ROOT/exp6_write"
 RESULTS="$OUT_DIR/exp6"
 BLOCKS="${BLOCKS:-16 64 128 512}"
+BUDGETS="${BUDGETS:-8 32 64 128}"
+FIXED_BLOCK="${FIXED_BLOCK:-128}"
 mkdir -p "$RESULTS"
 
 # One process per arm: Ray reuses workers, and MemoryProfiler reads whole-process
 # private memory, so a second arm in the same cluster inherits the first arm's
 # high-water mark. That worker-reuse effect is the exact artifact that made
 # read_from_uris look like a regression in the release A/B.
+run_probe() {  # tag, then probe args
+  local tag="$1"; shift
+  echo "=== $tag"
+  python "$HERE/block_retention_probe.py" \
+    --source "$DATA" --write-to "$WRITE_DIR" --out "$RESULTS/$tag.json" "$@" \
+    > "$RESULTS/$tag.log" 2>&1 \
+    || echo "  FAILED -- see $RESULTS/$tag.log"
+  # A silent stats failure prints as 0 MiB / 0 tasks, which reads like a
+  # measurement. Surface it at run time instead of in the summary table.
+  grep -h "WARNING: no Read operator" "$RESULTS/$tag.log" 2>/dev/null || true
+}
+
 for reader in pyarrow arrow_rs; do
   for mib in $BLOCKS; do
-    tag="${reader}_${mib}"
-    echo "=== $tag"
-    python "$HERE/block_retention_probe.py" \
-      --source "$DATA" --reader "$reader" --block-mib "$mib" \
-      --write-to "$WRITE_DIR" --out "$RESULTS/$tag.json" \
-      > "$RESULTS/$tag.log" 2>&1 \
-      || echo "  FAILED -- see $RESULTS/$tag.log"
+    run_probe "A_${reader}_blk${mib}" --reader "$reader" --block-mib "$mib"
   done
+done
+
+for budget in $BUDGETS; do
+  run_probe "B_arrow_rs_bud${budget}" \
+    --reader arrow_rs --block-mib "$FIXED_BLOCK" --decode-budget-mib "$budget"
 done
 rm -rf "$WRITE_DIR"
 
-RESULTS="$RESULTS" python - <<'PYEOF' | tee "$OUT_DIR/exp6_summary.txt"
+RESULTS="$RESULTS" FIXED_BLOCK="$FIXED_BLOCK" python - <<'PYEOF' | tee "$OUT_DIR/exp6_summary.txt"
 import glob
 import json
 import os
 
 MiB = 1024 * 1024
-rows = {}
+rows = []
 for path in sorted(glob.glob(os.path.join(os.environ["RESULTS"], "*.json"))):
     with open(path) as handle:
         r = json.load(handle)
-    rows[(r["reader"], r["block_mib"])] = r
+    r["tag"] = os.path.basename(path)[: -len(".json")]
+    rows.append(r)
 
-head = (
-    f"{'reader':<10}{'block':>8}{'avg USS/task':>15}{'max USS/task':>15}"
-    f"{'tasks':>7}{'rows/task':>12}{'wall':>8}"
-)
-print(head)
-print("-" * len(head))
-for reader in ("pyarrow", "arrow_rs"):
+if any(r.get("stats_error") for r in rows):
+    print("!! some arms reported no Read operator:")
+    for r in rows:
+        if r.get("stats_error"):
+            print(f"   {r['tag']}: {r['stats_error']}")
+    print()
+
+
+def show(subset, label_of, title):
+    head = (
+        f"{title:<22}{'avg USS/task':>15}{'max USS/task':>15}"
+        f"{'tasks':>7}{'rows/task':>12}{'wall':>8}"
+    )
+    print(head)
+    print("-" * len(head))
     series = []
-    for (rd, mib), r in sorted(rows.items(), key=lambda kv: kv[0][1]):
-        if rd != reader:
-            continue
+    for r in subset:
         avg = (r.get("avg_max_uss_per_task") or 0) / MiB
         mx = (r.get("max_uss_per_task") or 0) / MiB
         series.append(avg)
         print(
-            f"{reader:<10}{mib:>7}M{avg:>12.0f}MiB{mx:>12.0f}MiB"
+            f"{label_of(r):<22}{avg:>12.0f}MiB{mx:>12.0f}MiB"
             f"{r.get('task_count') or 0:>7}"
             f"{(r.get('rows_per_task_mean') or 0):>12,.0f}{r['wall_s']:>8.1f}"
         )
     if len(series) > 1 and min(series) > 0:
-        spread = max(series) / min(series)
-        verdict = (
-            "TRACKS the knob -> output blocks accumulate in the task"
-            if spread > 1.5
-            else "FLAT across the sweep -> blocks are not what is retained"
-        )
-        print(f"{'':<10}  spread {spread:.2f}x over the block sweep: {verdict}\n")
+        print(f"{'':<22}  spread {max(series) / min(series):.2f}x\n")
+    else:
+        print()
+
+
+for reader in ("pyarrow", "arrow_rs"):
+    subset = sorted(
+        (r for r in rows if r["tag"].startswith("A_") and r["reader"] == reader),
+        key=lambda r: r["block_mib"],
+    )
+    if subset:
+        show(subset, lambda r: f"{r['reader']} blk={r['block_mib']}M", "PHASE A block")
+
+fixed = os.environ["FIXED_BLOCK"]
+subset = sorted(
+    (r for r in rows if r["tag"].startswith("B_")),
+    key=lambda r: r["decode_budget_mib"] or 0,
+)
+if subset:
+    show(
+        subset,
+        lambda r: f"budget={r['decode_budget_mib']}M",
+        f"PHASE B blk={fixed}M",
+    )
 
 print(
-    "A lineitem file is ~6.0M rows x 172 B = 1.03 GiB decoded. Per-task USS at or"
-    "\nnear that number, unmoved by a 32x block sweep, means the task holds a whole"
-    "\nfile. Standalone, the same read holds 23 MiB."
+    "A lineitem file is ~6.0M rows x 172 B = 1.03 GiB decoded; standalone, the"
+    "\nsame read holds 23 MiB. Phase A spread >1.5x means blocks accumulate in the"
+    "\ntask. Phase B falling toward the block size means batch/block alignment is"
+    "\nthe fix, and the decode budget should derive from target_block_size rather"
+    "\nthan being a constant."
 )
 PYEOF
