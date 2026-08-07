@@ -23,13 +23,28 @@
 # Runtime: ~20 min for four arms.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 check_env
-check_s3
 
 SF="${SF:-10}"
 DATA="${DATA:-$S3_ROOT/tpch/sf$SF/lineitem}"
-export RAY_DATA_BENCH_WRITE_ROOT="${RAY_DATA_BENCH_WRITE_ROOT:-$S3_ROOT/write}"
-
-python "$HERE/stage_data.py" --dst "$DATA" --sf "$SF" --region "$AWS_DEFAULT_REGION"
+# Local mode: point DATA at a directory to run the identical experiment over the
+# local filesystem. The crate's S3 planner (plan_s3_units,
+# partition_columns_by_budget, prefetch admission) does not exist on the local
+# path, so local-vs-S3 says whether the regression needs any of it. exp5 runs the
+# same contrast without Ray; run both and the crate/integration and local/S3
+# questions are answered independently.
+case "$DATA" in
+  s3://*)
+    check_s3
+    export RAY_DATA_BENCH_WRITE_ROOT="${RAY_DATA_BENCH_WRITE_ROOT:-$S3_ROOT/write}"
+    python "$HERE/stage_data.py" --dst "$DATA" --sf "$SF" --region "$AWS_DEFAULT_REGION"
+    ;;
+  *)
+    [ -d "$DATA" ] || { echo "FATAL: DATA=$DATA is neither s3:// nor a directory"; exit 1; }
+    export RAY_DATA_BENCH_WRITE_ROOT="${RAY_DATA_BENCH_WRITE_ROOT:-${LOCAL_ROOT:-$HOME/arrow_rs_local}/ray_write}"
+    mkdir -p "$RAY_DATA_BENCH_WRITE_ROOT"
+    echo "=== local mode: reading $DATA, writing $RAY_DATA_BENCH_WRITE_ROOT"
+    ;;
+esac
 
 cd "$DATASET_DIR"
 
