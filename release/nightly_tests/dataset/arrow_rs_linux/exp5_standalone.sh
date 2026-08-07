@@ -82,6 +82,25 @@ for transport in local s3; do
     done
   done
 done
+
+# --- pipelining control -------------------------------------------------------
+# The default pyarrow arm keeps the scanner's fragment/batch readahead, so it
+# overlaps I/O with decode; the crate's local path is straight-line synchronous.
+# A wall-time gap between them is therefore ambiguous. This arm serializes the
+# scanner: if pyarrow's wall time collapses toward the crate's here, the gap was
+# pipelining, and the crate needs a local prefetch rather than a faster decoder.
+for transport in local s3; do
+  case "$transport" in
+    local) src="$LOCAL_DATA" ;;
+    s3)    src="$S3_DATA" ;;
+  esac
+  tag="${transport}_pyarrow-serial_read"
+  echo "=== $tag"
+  python "$HERE/standalone_parquet_bench.py" \
+    --source "$src" --reader pyarrow --max-files "$MAX_FILES" --readahead 0 \
+    --out "$RESULTS/$tag.json" > "$RESULTS/$tag.log" 2>&1 \
+    || echo "  FAILED -- see $RESULTS/$tag.log"
+done
 rm -rf "$WRITE_DIR"
 
 # --- summary ------------------------------------------------------------------
@@ -95,28 +114,61 @@ rows = {}
 for path in sorted(glob.glob(os.path.join(os.environ["RESULTS"], "*.json"))):
     with open(path) as handle:
         r = json.load(handle)
-    rows[(r["transport"], r["mode"], r["reader"])] = r
+    tag = os.path.basename(path)[: -len(".json")]
+    # pyarrow-serial shares reader="pyarrow" in the JSON; key off the filename.
+    reader = "pyarrow-serial" if "pyarrow-serial" in tag else r["reader"]
+    rows[(r["transport"], r["mode"], reader)] = r
 
-head = f"{'transport':<10}{'mode':<7}{'USS rise pyarrow':>18}{'arrow_rs':>12}{'ratio':>8}{'wall p/a':>14}"
+head = (
+    f"{'transport':<10}{'mode':<7}{'reader':<16}"
+    f"{'USS rise':>11}{'ratio':>8}{'wall':>8}{'cpu':>8}{'cpu/wall':>10}"
+    f"{'batches':>10}{'rows/batch':>12}"
+)
 print(head)
 print("-" * len(head))
 for transport in ("local", "s3"):
     for mode in ("read", "write"):
-        pa_row = rows.get((transport, mode, "pyarrow"))
-        rs_row = rows.get((transport, mode, "arrow_rs"))
-        if not pa_row or not rs_row:
-            print(f"{transport:<10}{mode:<7}  (missing arm -- check the logs)")
-            continue
-        p, r = pa_row["uss_rise"] / MiB, rs_row["uss_rise"] / MiB
-        ratio = f"{r / p:.2f}x" if p > 0 else "-"
-        print(
-            f"{transport:<10}{mode:<7}{p:>15.0f}MiB{r:>9.0f}MiB{ratio:>8}"
-            f"{pa_row['wall_s']:>7.1f}/{rs_row['wall_s']:<6.1f}"
-        )
+        base = rows.get((transport, mode, "pyarrow"))
+        for reader in ("pyarrow", "pyarrow-serial", "arrow_rs"):
+            r = rows.get((transport, mode, reader))
+            if not r:
+                continue
+            uss = r["uss_rise"] / MiB
+            ratio = (
+                "baseline"
+                if r is base
+                else (
+                    f"{uss / (base['uss_rise'] / MiB):.2f}x"
+                    if base and base["uss_rise"] > 0
+                    else "-"
+                )
+            )
+            per_batch = r["rows"] // max(1, r["batches"])
+            print(
+                f"{transport:<10}{mode:<7}{reader:<16}{uss:>8.0f}MiB{ratio:>8}"
+                f"{r['wall_s']:>8.1f}{r.get('cpu_s', 0):>8.1f}"
+                f"{r.get('cpu_per_wall', 0) or 0:>10.2f}"
+                f"{r['batches']:>10,}{per_batch:>12,}"
+            )
+
+# Row parity is the validity check: a memory ratio means nothing if the arms
+# did not decode the same data.
+counts = {}
+for (transport, mode, reader), r in rows.items():
+    counts.setdefault((transport, mode), set()).add(r["rows"])
+bad = [k for k, v in counts.items() if len(v) > 1]
 print(
-    "\nUSS rise = private memory the read added above a post-import baseline."
-    "\nRelease saw 3.36x on write_parquet (whole-machine, inside Ray)."
-    "\nRatio ~1x on BOTH transports here => the crate is not the problem;"
-    "\nthe regression is in the Ray integration and exp3 is where it lives."
+    "\nROW PARITY: "
+    + ("OK -- every arm decoded the same rows" if not bad else f"MISMATCH in {bad}")
+)
+print(
+    "\nUSS rise  = private memory the read added above a post-import baseline."
+    "\ncpu/wall  = cores used. pyarrow's scanner pipelines I/O against decode"
+    "\n            even at use_threads=False; the crate's LOCAL path does not."
+    "\n            If pyarrow > 1 and arrow_rs ~= 1, compare cpu, not wall."
+    "\npyarrow-serial = the same scanner with readahead disabled: the decode-cost"
+    "\n            comparison. If it lands near arrow_rs, the wall gap was"
+    "\n            pipelining and the crate needs local prefetch, not a faster"
+    "\n            decoder."
 )
 PYEOF

@@ -49,6 +49,7 @@ Usage
 import argparse
 import json
 import os
+import resource
 import shutil
 import sys
 import threading
@@ -161,14 +162,27 @@ def list_parquet(source: str) -> Tuple[FileSystem, List[str]]:
     return fs, sorted(files)
 
 
-def read_pyarrow(fs: FileSystem, path: str, batch_size: int):
-    """Ray's V2 PyArrow path: a dataset scanner, one fragment at a time."""
+def read_pyarrow(fs: FileSystem, path: str, batch_size: int, readahead: int = -1):
+    """Ray's V2 PyArrow path: a dataset scanner, one fragment at a time.
+
+    ``use_threads=False`` disables only Arrow's CPU thread pool. The scanner
+    still keeps ``fragment_readahead=4`` / ``batch_readahead=16`` and still runs
+    I/O on the separate I/O pool, so it pipelines reads against decode. The
+    crate's LOCAL path does not pipeline at all (the windowed-async path is
+    S3-only), so the default configuration compares a pipelined reader with an
+    unpipelined one. ``readahead=0`` serializes the scanner to make the decode
+    cost itself comparable; ``-1`` keeps PyArrow's defaults, which is what Ray
+    actually runs.
+    """
     dataset = pds.dataset(path, filesystem=fs, format="parquet")
-    scanner = dataset.scanner(batch_size=batch_size, use_threads=False)
-    yield from scanner.to_batches()
+    kwargs = {"batch_size": batch_size, "use_threads": False}
+    if readahead >= 0:
+        kwargs["fragment_readahead"] = readahead
+        kwargs["batch_readahead"] = readahead
+    yield from dataset.scanner(**kwargs).to_batches()
 
 
-def read_arrow_rs(fs: FileSystem, path: str, batch_size: int):
+def read_arrow_rs(fs: FileSystem, path: str, batch_size: int, readahead: int = -1):
     """The crate, called exactly as ArrowRsParquetFileReader calls it."""
     import ray_data_arrow_rs
     from pyarrow.fs import S3FileSystem
@@ -218,12 +232,13 @@ def run_file(
     batch_size: int,
     writer_dir: Optional[str],
     index: int,
+    readahead: int = -1,
 ) -> Dict[str, int]:
     source = read_arrow_rs if reader == "arrow_rs" else read_pyarrow
     writer = None
     rows = nbytes = batches = 0
     try:
-        for batch in source(fs, path, batch_size):
+        for batch in source(fs, path, batch_size, readahead):
             rows += batch.num_rows
             nbytes += batch.nbytes
             batches += 1
@@ -260,6 +275,15 @@ def main() -> int:
         "higher approximates Ray's concurrent read tasks, but in ONE process, "
         "so it is not equivalent to N Ray workers.",
     )
+    parser.add_argument(
+        "--readahead",
+        type=int,
+        default=-1,
+        help="PyArrow scanner fragment/batch readahead. -1 keeps PyArrow's "
+        "defaults (4/16), which is what Ray runs and which pipelines I/O "
+        "against decode. 0 serializes the scanner, so the arms compare decode "
+        "cost rather than pipelining. Ignored by the arrow_rs arm.",
+    )
     parser.add_argument("--out", default=None, help="write a result JSON here")
     args = parser.parse_args()
 
@@ -289,6 +313,10 @@ def main() -> int:
     baseline = sampler.read()[0]
     sampler.start()
     started = time.perf_counter()
+    # rusage sums CPU across ALL threads of the process, so cpu/wall > 1 means
+    # the arm used more than one core -- the only way to tell a slower decoder
+    # apart from an unpipelined one when both are reported as wall time.
+    cpu0 = resource.getrusage(resource.RUSAGE_SELF)
 
     totals = {"rows": 0, "nbytes": 0, "batches": 0}
     if args.concurrency > 1:
@@ -297,7 +325,14 @@ def main() -> int:
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             futures = [
                 pool.submit(
-                    run_file, fs, p, args.reader, args.batch_size, args.write_to, i
+                    run_file,
+                    fs,
+                    p,
+                    args.reader,
+                    args.batch_size,
+                    args.write_to,
+                    i,
+                    args.readahead,
                 )
                 for i, p in enumerate(files)
             ]
@@ -307,11 +342,13 @@ def main() -> int:
     else:
         for i, path in enumerate(files):
             for key, val in run_file(
-                fs, path, args.reader, args.batch_size, args.write_to, i
+                fs, path, args.reader, args.batch_size, args.write_to, i, args.readahead
             ).items():
                 totals[key] += val
 
     wall = time.perf_counter() - started
+    cpu1 = resource.getrusage(resource.RUSAGE_SELF)
+    cpu = (cpu1.ru_utime - cpu0.ru_utime) + (cpu1.ru_stime - cpu0.ru_stime)
     mem = sampler.stop()
 
     result = {
@@ -320,8 +357,14 @@ def main() -> int:
         "reader": args.reader,
         "mode": "write" if args.write_to else "read",
         "concurrency": args.concurrency,
+        "readahead": args.readahead,
         "files": len(files),
         "wall_s": round(wall, 2),
+        "cpu_s": round(cpu, 2),
+        # >1 means the arm used more than one core. If the pyarrow arm is above
+        # 1 and the arrow_rs arm is at 1, a wall-time gap is pipelining, not a
+        # slower decoder -- and cpu_s is then the fair comparison.
+        "cpu_per_wall": round(cpu / wall, 2) if wall > 0 else None,
         "baseline_uss": baseline,
         # The number that matters: private memory the read actually added, above
         # a post-import baseline. Absolute peak buries it under the interpreter.
