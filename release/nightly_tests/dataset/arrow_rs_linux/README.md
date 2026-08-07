@@ -1,11 +1,24 @@
 # arrow-rs reader — single-machine investigation
 
-Three experiments that reproduce, on one 8-CPU / 32 GB Linux box, what the
-multi-node release A/B (builds 103100 vs 103101) could only show as aggregates.
-Everything here is measurement scaffolding for the flag-gated arrow-rs Parquet
-reader; none of it runs in CI.
+Experiments that reproduce, on one 8-CPU / 32 GB Linux box, what the multi-node
+release A/B (builds 103100 vs 103101) could only show as aggregates. Everything
+here is measurement scaffolding for the flag-gated arrow-rs Parquet reader; none
+of it runs in CI.
 
-## Why these three
+> **Results live in the docs, not here.**
+> `python/ray/data/arrow_rs_docs/regression_testing.md` **§8** carries what these
+> runs found and which hypotheses they killed;
+> `python/ray/data/arrow_rs_docs/TODO.md` §1 carries what is left to do. This
+> file is only how to run things.
+>
+> Headline, so nobody re-derives it: the crate is **not** the problem (outside
+> Ray it is 1.57× faster on 1.62× less CPU at equal cores, at 20–40× less
+> memory). What remains is a **~104 MiB fixed cost per read task** that arrow-rs
+> pays and PyArrow does not, which makes arrow-rs win on big read tasks and lose
+> on small ones. Neither block size (32× sweep) nor decode budget (16× sweep)
+> touches it.
+
+## Why the first three
 
 The release A/B found the arrow-rs reader mixed-to-negative on memory, which
 contradicts every local measurement. Reading the code turned up three defects,
