@@ -124,12 +124,26 @@ run_arm() {
   local reader="$1"; shift
   local tag="$1"; shift
   local prof="$OUT_DIR/prof/${tag}_${reader}"
-  mkdir -p "$prof"
+  local mem="$OUT_DIR/mem/${tag}_${reader}.jsonl"
+  mkdir -p "$prof" "$OUT_DIR/mem"
   echo "=== [$tag] reader=$reader -> $OUT_DIR/${tag}_${reader}.json"
+
+  # Record whole-machine memory alongside Ray's own per-task numbers. The two
+  # disagree -- on the release A/B, node memory confirmed write_parquet's
+  # regression and refuted read_from_uris's -- so a run that captures only one
+  # of them cannot be compared to release. See node_memory.py.
+  python "$HERE/node_memory.py" record --out "$mem" --interval 1 &
+  local mem_pid=$!
+  # Stop the sampler even if the benchmark dies or the shell is interrupted.
+  trap 'kill "$mem_pid" 2>/dev/null || true' RETURN INT TERM
+
   env \
     RAY_DATA_USE_ARROW_RS_PARQUET_READER="$([ "$reader" = arrow_rs ] && echo 1 || echo 0)" \
     RAY_DATA_ARROW_RS_PROFILE=1 \
     RAY_DATA_ARROW_RS_PROFILE_DIR="$prof" \
     TEST_OUTPUT_JSON="$OUT_DIR/${tag}_${reader}.json" \
     "$@" 2>&1 | tee "$OUT_DIR/${tag}_${reader}.log"
+
+  kill "$mem_pid" 2>/dev/null || true
+  wait "$mem_pid" 2>/dev/null || true
 }
