@@ -68,11 +68,15 @@ def read_stats(ds) -> Dict[str, Any]:
             continue
         dist = extra.get("max_uss_bytes")
         dist = dist if isinstance(dist, dict) else {}
+        # Take task_rows from the READ operator specifically. Picking the first
+        # operator that has it lands on the Write in a fused Read->Write, which
+        # emits one metadata row per task -- that is where "rows/task = 1" came
+        # from, and it made the task count unverifiable.
         rows = next(
             (
                 op.task_rows
                 for op in (node.operators_stats or [])
-                if getattr(op, "task_rows", None)
+                if "Read" in op.operator_name and getattr(op, "task_rows", None)
             ),
             None,
         )
@@ -80,6 +84,8 @@ def read_stats(ds) -> Dict[str, Any]:
             "operators": names,
             "avg_max_uss_per_task": extra.get("average_max_uss_per_task"),
             "max_uss_per_task": extra.get("max_uss_per_task"),
+            # The independent task count: one USS sample per task that ran. If
+            # this disagrees with task_count, trust this one.
             "uss_num_samples": dist.get("num_samples", 0),
             "uss_p90": dist.get("p90"),
             "task_count": getattr(rows, "count", None),
@@ -111,13 +117,14 @@ def main() -> int:
         "needs inputs and output alive together. Ignored by the pyarrow arm.",
     )
     parser.add_argument(
-        "--num-blocks",
+        "--chunk-mib",
         type=int,
         default=0,
-        help="override_num_blocks: how many read tasks to split the input into. "
-        "0 leaves Ray's choice (one task per file here). This is the axis that "
-        "separates 'the task holds all its output' (USS falls proportionally) "
-        "from 'the allocator never returns freed pages' (USS pinned regardless).",
+        help="DataContext.parquet_chunker_target_chunk_size, in MiB. This -- not "
+        "override_num_blocks, which the V2 path ignores entirely -- is what sizes "
+        "a read task: ParquetFileChunker splits a file only when its ON-DISK size "
+        "exceeds this, and the built-in default is 1 GiB, so ordinary files are "
+        "never split and each task decodes a whole file. 0 leaves the default.",
     )
     parser.add_argument(
         "--write-to",
@@ -144,16 +151,15 @@ def main() -> int:
     ray.init(ignore_reinit_error=True)
     ctx = DataContext.get_current()
     ctx.target_max_block_size = args.block_mib * MiB
+    if args.chunk_mib:
+        ctx.parquet_chunker_target_chunk_size = args.chunk_mib * MiB
 
     if args.write_to:
         shutil.rmtree(args.write_to, ignore_errors=True)
         os.makedirs(args.write_to, exist_ok=True)
 
     started = time.perf_counter()
-    read_kwargs = {}
-    if args.num_blocks:
-        read_kwargs["override_num_blocks"] = args.num_blocks
-    ds = ray.data.read_parquet(args.source, **read_kwargs)
+    ds = ray.data.read_parquet(args.source)
     if args.write_to:
         ds.write_parquet(args.write_to)
     else:
@@ -167,7 +173,7 @@ def main() -> int:
         "reader": args.reader,
         "block_mib": args.block_mib,
         "decode_budget_mib": args.decode_budget_mib or None,
-        "num_blocks": args.num_blocks or None,
+        "chunk_mib": args.chunk_mib or None,
         "mode": "write" if args.write_to else "iter_bundles",
         "source": args.source,
         "wall_s": round(wall, 2),

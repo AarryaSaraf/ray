@@ -50,7 +50,9 @@ WRITE_DIR="$LOCAL_ROOT/exp6_write"
 RESULTS="$OUT_DIR/exp6"
 BLOCKS="${BLOCKS:-16 64 128 512}"
 BUDGETS="${BUDGETS:-8 32 64 128}"
-NUM_BLOCKS="${NUM_BLOCKS:-4 16 64}"
+# On-disk bytes per read task. lineitem compresses ~4x, so these are roughly
+# 1 GiB / 256 MiB / 64 MiB of decoded data per task.
+CHUNKS="${CHUNKS:-256 64 16}"
 FIXED_BLOCK="${FIXED_BLOCK:-128}"
 mkdir -p "$RESULTS"
 
@@ -86,7 +88,16 @@ done
 # A flat block sweep does NOT mean "nothing is retained": if a task holds ALL of
 # its output, the total is invariant to how that output is chunked, so flat is
 # exactly what retention-of-everything looks like. The way to tell is to change
-# how much each task produces, which override_num_blocks does directly.
+# how much each task produces.
+#
+# The knob is parquet_chunker_target_chunk_size, NOT override_num_blocks -- the
+# V2 path ignores override_num_blocks entirely (no reference to it anywhere
+# under datasource_v2/), which is why the first attempt at this phase reported
+# 4 tasks for 4, 16 and 64 and therefore measured nothing. ParquetFileChunker
+# splits a file only when its ON-DISK size exceeds the target, and the built-in
+# default is 1 GiB, so ordinary files are never split: one task per file, each
+# decoding that file whole. Our lineitem files decode to ~1.03 GiB, which is
+# precisely the per-task USS we keep measuring.
 #
 #   USS falls ~proportionally  -> the task holds its output. Smaller read tasks
 #                                 are then an immediate mitigation, and the real
@@ -96,10 +107,13 @@ done
 #                                 lifetime churn, not live data. Then no amount
 #                                 of streaming helps and the lever is the
 #                                 allocator (arena count, trim, or task size).
-for nb in $NUM_BLOCKS; do
+#
+# Chunk sizes are on-disk bytes; lineitem compresses ~4x, so 64 MiB on disk is
+# roughly a 256 MiB decode.
+for chunk in $CHUNKS; do
   for reader in pyarrow arrow_rs; do
-    run_probe "C_${reader}_nb${nb}" \
-      --reader "$reader" --block-mib "$FIXED_BLOCK" --num-blocks "$nb"
+    run_probe "C_${reader}_chunk${chunk}" \
+      --reader "$reader" --block-mib "$FIXED_BLOCK" --chunk-mib "$chunk"
   done
 done
 rm -rf "$WRITE_DIR"
@@ -168,25 +182,36 @@ if subset:
         f"PHASE B blk={fixed}M",
     )
 
-# Phase C: the input is fixed, so bytes-per-task is inversely proportional to
-# the task count. Print USS x tasks -- constant means USS tracks per-task
-# volume; rising means USS is pinned regardless of how little a task produces.
+# Phase C: the input is fixed, so bytes-per-task falls as the task count rises.
+# USS x tasks constant means USS tracks per-task volume (retention); USS flat
+# while the task count climbs means it is pinned regardless of how little a task
+# produces (allocator high-water).
 for reader in ("pyarrow", "arrow_rs"):
     subset = sorted(
         (r for r in rows if r["tag"].startswith("C_") and r["reader"] == reader),
-        key=lambda r: r["num_blocks"] or 0,
+        key=lambda r: -(r["chunk_mib"] or 0),
     )
     if not subset:
         continue
-    head = f"{'PHASE C ' + reader:<22}{'avg USS/task':>15}{'tasks':>7}{'USS x tasks':>14}{'wall':>8}"
+    head = (
+        f"{'PHASE C ' + reader:<22}{'avg USS/task':>15}{'tasks':>7}"
+        f"{'USS x tasks':>14}{'wall':>8}"
+    )
     print(head)
     print("-" * len(head))
     for r in subset:
         avg = (r.get("avg_max_uss_per_task") or 0) / MiB
-        n = r.get("task_count") or 0
+        # uss_num_samples is one sample per task that ran -- an independent
+        # count, and the check that the chunk knob actually took effect.
+        n = r.get("uss_num_samples") or r.get("task_count") or 0
         print(
-            f"{'nb=' + str(r['num_blocks']):<22}{avg:>12.0f}MiB{n:>7}"
+            f"{'chunk=' + str(r['chunk_mib']) + 'M':<22}{avg:>12.0f}MiB{n:>7}"
             f"{avg * n / 1024:>11.1f}GiB{r['wall_s']:>8.1f}"
+        )
+    if len({r.get("uss_num_samples") for r in subset}) == 1:
+        print(
+            f"{'':<22}  !! task count never changed -- the chunk knob did not "
+            "take effect; this phase measured nothing"
         )
     print()
 
