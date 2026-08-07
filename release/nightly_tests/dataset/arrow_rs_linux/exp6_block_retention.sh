@@ -55,6 +55,11 @@ BUDGETS="${BUDGETS:-8 32 64 128}"
 CHUNKS="${CHUNKS:-256 64 16}"
 FIXED_BLOCK="${FIXED_BLOCK:-128}"
 mkdir -p "$RESULTS"
+# Every phase re-runs on every invocation, so any JSON already here is from an
+# older run -- possibly with different fields (an earlier Phase C keyed on
+# override_num_blocks, which the summary cannot sort alongside chunk_mib).
+# Clearing is what keeps the summary reading one coherent generation of results.
+rm -f "$RESULTS"/*.json
 
 # One process per arm: Ray reuses workers, and MemoryProfiler reads whole-process
 # private memory, so a second arm in the same cluster inherits the first arm's
@@ -189,7 +194,10 @@ if subset:
 for reader in ("pyarrow", "arrow_rs"):
     subset = sorted(
         (r for r in rows if r["tag"].startswith("C_") and r["reader"] == reader),
-        key=lambda r: -(r["chunk_mib"] or 0),
+        # .get, not [] -- a result file written by an older generation of this
+        # script lacks the key entirely, and a KeyError here would take out the
+        # whole summary after the arms have already run.
+        key=lambda r: -(r.get("chunk_mib") or 0),
     )
     if not subset:
         continue
@@ -205,7 +213,7 @@ for reader in ("pyarrow", "arrow_rs"):
         # count, and the check that the chunk knob actually took effect.
         n = r.get("uss_num_samples") or r.get("task_count") or 0
         print(
-            f"{'chunk=' + str(r['chunk_mib']) + 'M':<22}{avg:>12.0f}MiB{n:>7}"
+            f"{'chunk=' + str(r.get('chunk_mib')) + 'M':<22}{avg:>12.0f}MiB{n:>7}"
             f"{avg * n / 1024:>11.1f}GiB{r['wall_s']:>8.1f}"
         )
     if len({r.get("uss_num_samples") for r in subset}) == 1:
