@@ -70,9 +70,26 @@ start in that state rather than producing meaningless numbers.
 
 ## Run
 
+**Current batch (2026-08-07).** One command, one output to paste back:
+
 ```bash
 cd ~/ray/release/nightly_tests/dataset/arrow_rs_linux
-./run_all.sh            # ~45-60 min total; keeps going if one experiment fails
+source ~/ray/.venv/bin/activate
+./run_next.sh 2>&1 | tail -n 400        # ~60-75 min
+```
+
+It builds the two fixtures, re-runs exp7 phase S against the reader defaults
+shipped in `30297b9b7f` (every S3 number on record predates them), adds phase Z
+(the fixed per-task cost, measured at D ~= 0 on both transports instead of
+extrapolated) and phase P (does `prefetch_budget_mb` bind, on a layout where the
+fetch window actually can), and re-runs exp6 phase B unfused. Each script's
+header says what each outcome would mean. The summary lands in
+`out/next_summary.txt` between BEGIN/END PASTE markers.
+
+Everything, ~45-60 min, keeps going if one experiment fails:
+
+```bash
+./run_all.sh
 ```
 
 or individually:

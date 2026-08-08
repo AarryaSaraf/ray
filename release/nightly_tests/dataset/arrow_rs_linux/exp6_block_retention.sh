@@ -36,6 +36,25 @@
 #                                    target_block_size instead of a constant.
 #   USS flat                      -> the block builder is not the accumulator.
 #
+#   RE-RUN 2026-08-07, twice changed. (1) It now runs UNFUSED. Every earlier
+#   phase B arm carried a write, and phase F later showed the writer held 589 of
+#   1032 MiB at the default chunk -- so phase B was reading a knob's effect on
+#   the decoder through 57% of unrelated writer memory, which is enough to hide
+#   it. Phases F and G were already fixed; B was missed. (2) It now runs at
+#   threads=1, matching F, G and the shipped default, so the four arms differ in
+#   the budget and nothing else.
+#
+#   The reason to re-ask now is phase G. G swept the block size unfused and
+#   found arrow-rs costs about `base + 2.4 x target_max_block_size` -- 167 MiB
+#   at a 16 MiB block rising to 1051 at 512. A factor of 2.4 on a knob that is
+#   supposed to bound one block in flight is the signature of a copying
+#   concatenate: inputs plus output live at once is 2x, plus the block being
+#   handed onward is the remaining 0.4. If that is what it is, then feeding the
+#   builder batches the size of a block should collapse the 2.4 toward 1, and
+#   the budget default should be derived from target_max_block_size rather than
+#   pinned at a constant. The sweep spans the old default (2 MiB) through the
+#   one just shipped (32) to a full block (128).
+#
 # Local disk only: exp3 showed the transports agree, and S3 adds a fetch path
 # that is not under test here.
 #
@@ -49,7 +68,10 @@ DATA="${DATA:-$LOCAL_ROOT/lineitem}"
 WRITE_DIR="$LOCAL_ROOT/exp6_write"
 RESULTS="$OUT_DIR/exp6"
 BLOCKS="${BLOCKS:-16 64 128 512}"
-BUDGETS="${BUDGETS:-8 32 64 128}"
+# Spans the old shipping default (2), the one just shipped (32), and a full
+# block (128) -- the alignment point phase B exists to test. 8 keeps a point
+# between 2 and 32 so a monotone trend can be distinguished from a step.
+BUDGETS="${BUDGETS:-2 8 32 128}"
 # On-disk bytes per read task. lineitem compresses ~4x, so these are roughly
 # 1 GiB / 256 MiB / 64 MiB of decoded data per task.
 CHUNKS="${CHUNKS:-256 64 16}"
@@ -109,9 +131,14 @@ done
 fi
 
 if has_phase B; then
+# PROBE_WRITE=0 and --threads 1: see the phase B header. Fused, the writer's
+# 589 MiB sat on top of every arm; at four threads the fragment pool added a
+# floor that moves with neither knob. Both had to go before the budget's own
+# effect could be read.
 for budget in $BUDGETS; do
-  run_probe "B_arrow_rs_bud${budget}" \
-    --reader arrow_rs --block-mib "$FIXED_BLOCK" --decode-budget-mib "$budget"
+  PROBE_WRITE=0 run_probe "B_arrow_rs_bud${budget}" \
+    --reader arrow_rs --block-mib "$FIXED_BLOCK" --threads 1 \
+    --decode-budget-mib "$budget"
 done
 fi
 

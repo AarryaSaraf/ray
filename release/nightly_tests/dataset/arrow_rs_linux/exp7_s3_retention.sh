@@ -54,9 +54,26 @@
 #        removes overlap between one fragment's network wait and another's
 #        decode, which local disk cannot show. If serial costs real wall time
 #        here, the default has to be transport-aware.
+#   Z -- MEASURE the fixed per-task cost instead of extrapolating it. Both phase
+#        S fits have an intercept -- pyarrow ~189 MiB, arrow-rs ~306 -- and that
+#        +117 MiB gap is the whole reason arrow-rs loses below D ~= 700 MiB. Z
+#        reads a ~250 KiB fixture, so D ~= 0 and per-task USS IS the intercept.
+#        Run on both transports, because the local path builds no HTTP client,
+#        no connection pool and no tokio runtime: (s3 - local) is the
+#        transport's share of the constant and the remainder is the reader's.
+#   P -- what phase W thought it was measuring. See the S_WINDOW note below: on
+#        lineitem the fetch window CANNOT bind, so W's 892 -> 618 MiB was the
+#        derived prefetch budget moving, not the window. P sweeps
+#        prefetch_budget_mb DIRECTLY at a pinned window, over two layouts:
+#        lineitem (window provably inert -> isolates the budget) and the bigrg
+#        fixture (window binds: ~20 units at 16 MiB against ~2 at 128). bigrg is
+#        also the lone-big-row-group shape this whole project targets, and no
+#        knob measurement has ever been taken on it inside Ray.
 #
-# Runtime: ~35-45 min for 20 arms. Run in us-west-2 or the numbers are latency,
-# not memory.
+# Phases Z and P need `make_fixtures.py` to have run; run_next.sh does that.
+#
+# Runtime: ~35-45 min for the 20 arms of S/W/T; add ~10 min for Z and ~20 for P
+# at REPEAT=3. Run in us-west-2 or the numbers are latency, not memory.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 check_env
 check_s3
@@ -70,12 +87,28 @@ RESULTS="$OUT_DIR/exp7"
 MAX_FILES="${MAX_FILES:-4}"
 TOTAL_DECODED_MIB="${TOTAL_DECODED_MIB:-4219}"
 
+# Fixtures make_fixtures.py builds. tiny = ~250 KiB/file (phase Z); bigrg = one
+# incompressible row group per file (phase P). Both exist locally AND on S3 so
+# phase Z can difference the transports over identical bytes.
+S3_TINY="${S3_TINY:-$S3_ROOT/fixtures/tiny}"
+S3_BIGRG="${S3_BIGRG:-$S3_ROOT/fixtures/bigrg}"
+LOCAL_FIXTURES="${LOCAL_FIXTURES:-$HOME/arrow_rs_local/fixtures}"
+
 FIXED_BLOCK="${FIXED_BLOCK:-128}"
 S_CHUNKS="${S_CHUNKS:-16 64 256 0}"
-# fetch_window_mb for the phase S grid. 0 = the shipping default (16), which is
-# what the first run used -- and phase W then found 16 is the WORST setting on
-# this axis. `S_WINDOW=128 PHASES=S ./exp7_s3_retention.sh` re-asks the transport
-# question at the best one.
+# fetch_window_mb for the phase S grid.
+#
+# 0 = the shipping default (16), which is what the first run used. The second
+# run used 128 because phase W had found 16 to be the worst setting -- and that
+# reading is now RETRACTED. `window_rows_for` (crate lib.rs:955) converts the
+# MiB into a row count by dividing by compressed bytes/row, and `plan_s3_units`
+# clamps to the row group's length; lineitem is ~43 compressed B/row in
+# 122,428-row groups, so a 16 MiB window asks for ~390,000 rows and clamps to
+# the whole group. 16, 64 and 128 all plan the identical single unit. Whatever
+# moved USS in phase W, it was not the window.
+#
+# So 0 is the right default here again: it is what ships. Phase P is where the
+# knob question moved, on a fixture where the window can actually bind.
 S_WINDOW="${S_WINDOW:-0}"
 # Replicates per arm. Default 1 for a first look; use 3 before quoting anything.
 REPEAT="${REPEAT:-1}"
@@ -87,6 +120,16 @@ WINDOWS="${WINDOWS:-4 16 64 128}"
 # which separates "how much per unit" from "how many units in flight".
 BUDGETS_MB="${BUDGETS_MB:-0 16}"
 T_THREADS="${T_THREADS:-1 4}"
+# Phase P. The window is PINNED at the shipping 16 so the budget is the only
+# thing moving; the sweep brackets the derived default (4 x max(16,16) = 64) by
+# 4x in each direction. 1024 is well past the whole bigrg row group, so it is
+# the "budget removed" control: if USS is flat from 64 to 1024 the budget is not
+# binding either and the S3 surcharge is somewhere neither knob reaches.
+P_WINDOW="${P_WINDOW:-16}"
+P_BUDGETS="${P_BUDGETS:-16 64 256 1024}"
+# Which layouts phase P runs over. lineitem is the control where the window is
+# provably inert; bigrg is the target layout where it binds.
+P_LAYOUTS="${P_LAYOUTS:-lineitem bigrg}"
 PHASES="${PHASES:-S W T}"
 
 mkdir -p "$RESULTS"
@@ -118,8 +161,13 @@ python "$HERE/stage_data.py" --dst "$S3_DATA" --sf "$SF" \
 # (1.33 / 1.17 / 1.11) are not separable from each other at that noise level, and
 # a single arm cannot be quoted. The summary reports the median and the spread so
 # the noise is visible in the table instead of inferred across phases.
+# SRC / MAXF override the input for one call, for the phases that do not read
+# lineitem. They are per-call env, not globals, so a phase cannot leak its
+# fixture into the next one:  SRC="$S3_TINY" MAXF=4 run_probe ...
 run_probe() {  # tag, then probe args
   local tag="$1"; shift
+  local src="${SRC:-$S3_DATA}"
+  local maxf="${MAXF:-$MAX_FILES}"
   local rep
   for rep in $(seq 1 "${REPEAT:-1}"); do
     local rtag="$tag"
@@ -128,12 +176,30 @@ run_probe() {  # tag, then probe args
     env RAY_DATA_ARROW_RS_PROFILE=1 \
         RAY_DATA_ARROW_RS_PROFILE_DIR="$RESULTS/prof/$rtag" \
       python "$HERE/block_retention_probe.py" \
-        --source "$S3_DATA" --max-files "$MAX_FILES" \
+        --source "$src" --max-files "$maxf" \
         --out "$RESULTS/$rtag.json" "$@" \
         > "$RESULTS/$rtag.log" 2>&1 \
       || echo "  FAILED -- see $RESULTS/$rtag.log"
     grep -h "^WARNING:" "$RESULTS/$rtag.log" 2>/dev/null || true
   done
+}
+
+# Fail early and by name if a fixture phase was asked for without the fixture.
+# Otherwise the arms run, read nothing, and the summary shows a stats_error per
+# arm -- ten minutes to learn one listing would have told us.
+need_fixture() {  # human name, s3 uri
+  python - "$2" <<'PYEOF' || {
+import sys
+from pyarrow.fs import FileSelector, FileSystem, FileType
+fs, root = FileSystem.from_uri(sys.argv[1])
+infos = fs.get_file_info(FileSelector(root, recursive=True, allow_not_found=True))
+n = sum(1 for i in infos if i.type == FileType.File and i.path.endswith(".parquet"))
+sys.exit(0 if n else 1)
+PYEOF
+    echo "FATAL: no .parquet under $2 -- run make_fixtures.py (or run_next.sh,"
+    echo "       which does it for you) before PHASES=$1"
+    exit 1
+  }
 }
 
 # Phase S -- the exp6 phase F grid, over S3.
@@ -236,7 +302,113 @@ for threads in $T_THREADS; do
 done
 fi
 
+# Phase Z -- measure the fixed per-task cost instead of extrapolating it.
+#
+# Phase S fits two lines through four points:
+#     pyarrow    USS ~= 189 + 0.614 x D
+#     arrow_rs   USS ~= 306 + 0.361 x D
+# The SLOPE is the number that matters for OOMs -- it is the fraction of what a
+# task decodes that the task still holds at its peak -- and ours is 1.7x better.
+# The INTERCEPT is what a task costs before it decodes anything, and ours is
+# +117 MiB worse. That constant is the entire reason arrow-rs loses to PyArrow
+# below D ~= 700 MiB, which is where most read tasks live.
+#
+# Two problems with the 117. It is an extrapolation off a visibly concave curve,
+# so the fitted line does not have to pass anywhere near D = 0. And it is one
+# number for what should be at least two costs. Phase Z fixes both by reading a
+# fixture of a few hundred KiB: D ~= 0, so per-task USS IS the constant, no fit
+# involved. Running it on both transports splits it:
+#
+#     arrow_rs local           the reader's own floor -- crate, FFI, allocator
+#                              baseline, Ray worker. The local path memory-maps
+#                              and builds no HTTP client at all.
+#     arrow_rs s3 - local      the transport's floor -- object_store's client,
+#                              its connection pool, the shared tokio runtime's
+#                              thread stacks. NO KNOB IN THIS SCRIPT REACHES IT.
+#     arrow_rs - pyarrow       the number that has to shrink.
+#
+# The 44 MiB the fragment thread pool used to contribute is already gone: this
+# runs on the cherry-picked shipping default of one fragment thread.
+#
+#   s3 - local is most of the gap  -> the client is the target. One shared
+#       client across fragments, or a capped connection pool, and the 1.31x /
+#       1.16x / 1.12x rows at small D move as a block.
+#   local alone is most of it      -> the transport is innocent and the floor is
+#       the crate or the allocator, which is a much harder fix and probably
+#       means quoting the crossover honestly instead.
+if has_phase Z; then
+need_fixture Z "$S3_TINY"
+for reader in pyarrow arrow_rs; do
+  SRC="$S3_TINY" MAXF=4 run_probe "Z_${reader}_s3" \
+    --reader "$reader" --block-mib "$FIXED_BLOCK" --threads 1
+  SRC="$LOCAL_FIXTURES/tiny" MAXF=4 run_probe "Z_${reader}_local" \
+    --reader "$reader" --block-mib "$FIXED_BLOCK" --threads 1
+done
+fi
+
+# Phase P -- the experiment that replaced a default I was about to ship.
+#
+# Phase W measured USS falling from 892 to 618 MiB as fetch_window_mb went 16 ->
+# 128 and I read that as "fewer, larger in-flight units cost less". Then reading
+# the crate killed it. `window_rows_for` (lib.rs:955) turns the MiB into a ROW
+# COUNT by dividing by the row group's compressed bytes per row, and
+# `plan_s3_units` clamps each window to the group's length. lineitem is ~43
+# compressed B/row in 122,428-row groups, so a 16 MiB window asks for ~390,000
+# rows -- three times the group -- and clamps. 16, 64 and 128 MiB plan the SAME
+# SINGLE UNIT. The unit count I claimed as the mechanism never changed.
+#
+# What did change is prefetch_budget_mb, because -1 derives it as
+# 4 x max(fetch_window_mb, column_fetch_mb): 16 -> 64 MiB, 128 -> 512 MiB. And
+# it did not move monotonically with USS (window 16/64/256/512 gave 665/890/703/
+# 618), which is not what a knob that binds looks like. So phase P stops
+# inferring and sweeps the budget directly, at a pinned window, replicated.
+#
+# Two layouts, because one of them cannot answer the question alone:
+#
+#   lineitem  the control. The window is provably inert here, so anything the
+#             sweep moves is the budget and only the budget.
+#   bigrg     16 float64 columns of uniform random doubles -- 128 B/row decoded
+#             and incompressible, measured at 161 compressed B/row, 3.7x
+#             lineitem's 43 -- in ONE row group per file. Now a 16 MiB window
+#             really does plan ~20 units where a 128 MiB window plans ~2, and
+#             the row group is 256 MiB rather than 20. This is also the layout the
+#             entire project targets: the lone big row group where PyArrow has
+#             to materialize the whole decoded group and we are supposed not to.
+#             Every measurement of it so far has been in the standalone harness,
+#             outside Ray, with no read task and no output blocks around it.
+#
+# The pyarrow arm on bigrg is not decoration -- it is the first in-Ray baseline
+# for the shape the project exists to beat.
+#
+#   USS tracks the budget on both   -> prefetch_budget_mb is the S3 memory knob,
+#       set the default from a memory target, and phase W's effect is explained.
+#   USS tracks it only on bigrg     -> it binds only when the window fragments a
+#       row group, so the default has to be layout-aware, or the window should
+#       be derived from the row group rather than fixed in MiB.
+#   flat on both                    -> neither knob is the S3 surcharge; phase
+#       Z's client/runtime split is the only remaining lead.
+if has_phase P; then
+need_fixture P "$S3_BIGRG"
+for layout in $P_LAYOUTS; do
+  case "$layout" in
+    lineitem) psrc="$S3_DATA"; pmaxf="$MAX_FILES" ;;
+    bigrg)    psrc="$S3_BIGRG"; pmaxf=2 ;;
+    *) echo "FATAL: unknown P_LAYOUTS entry '$layout'"; exit 1 ;;
+  esac
+  # Control first: it is the cheapest arm and a failure here means the fixture
+  # itself is wrong, which is worth learning before four budget arms run.
+  SRC="$psrc" MAXF="$pmaxf" run_probe "P_pyarrow_${layout}_bud0" \
+    --reader pyarrow --block-mib "$FIXED_BLOCK" --threads 1
+  for budget in $P_BUDGETS; do
+    SRC="$psrc" MAXF="$pmaxf" run_probe "P_arrowrs_${layout}_bud${budget}" \
+      --reader arrow_rs --block-mib "$FIXED_BLOCK" --threads 1 \
+      --fetch-window-mb "$P_WINDOW" --prefetch-budget-mb "$budget"
+  done
+done
+fi
+
 RESULTS="$RESULTS" TOTAL_DECODED_MIB="$TOTAL_DECODED_MIB" \
+  P_WINDOW="$P_WINDOW" P_LAYOUTS="$P_LAYOUTS" \
   python - <<'PYEOF' | tee "$OUT_DIR/exp7_summary.txt"
 import glob
 import json
@@ -293,6 +465,12 @@ def collapse(records):
         "fetch_window_mb",
         "prefetch_budget_mb",
         "decode_budget_mib",
+        # Phases Z and P read different inputs at IDENTICAL knob settings --
+        # Z_arrow_rs_s3 and Z_arrow_rs_local differ in nothing else. Without the
+        # source in the key they collapse into one group and the median silently
+        # averages the two transports whose difference is the entire finding.
+        "source",
+        "num_files",
     )
     groups = {}
     for r in records:
@@ -334,9 +512,17 @@ else:
 # Every fit below divides TOTAL_DECODED_MIB by the task count, so a run that
 # read a different number of files than that constant assumes silently produces
 # a wrong x-axis and therefore a wrong slope. Cheap to check, expensive to miss.
-counts = {r.get("num_files") for r in rows if r.get("num_files")}
+#
+# Scoped to phase S. Phases Z and P deliberately read OTHER fixtures with other
+# file counts -- that is the point of them -- so a global check here would fire
+# on every run and train us to ignore it.
+counts = {
+    r.get("num_files")
+    for r in rows
+    if r.get("num_files") and r["tag"].startswith("S_")
+}
 if len(counts) > 1:
-    print(f"!! arms read differing file counts {sorted(counts)} -- not comparable\n")
+    print(f"!! phase S arms read differing file counts {sorted(counts)}\n")
 elif counts:
     print(
         f"input: {counts.pop()} files, assumed {TOTAL_DECODED_MIB:,.0f} MiB decoded "
@@ -482,16 +668,27 @@ if w_rows:
         if len(vals) > 1:
             print(f"{'':<20}  spread {max(vals) / min(vals):.2f}x")
     print(
-        f"\n{'':<20}  2026-08-07: memory FALLS as the window GROWS -- 892 MiB at\n"
-        f"{'':<20}  the shipping 16 MiB against 618 at 128, wall-neutral. Note\n"
-        f"{'':<20}  prefetch_budget_mb=-1 derives to 4 x max(window, 16), so the\n"
-        f"{'':<20}  128 arm had a 512 MiB byte budget and still used the least:\n"
-        f"{'':<20}  what costs is the NUMBER of concurrent units, not the bytes\n"
-        f"{'':<20}  admitted. A 4 MiB window carves a row group into many small\n"
-        f"{'':<20}  units and the budget admits ~16 at once, each with its own\n"
-        f"{'':<20}  decode state; a 128 MiB window means one. The budget=16 rows\n"
-        f"{'':<20}  confirm it from the other side -- capping the count directly\n"
-        f"{'':<20}  makes the window irrelevant (spread 1.03x).\n"
+        f"\n{'':<20}  2026-08-07: memory FELL as the window GREW -- 892 MiB at the\n"
+        f"{'':<20}  shipping 16 MiB against 618 at 128, wall-neutral, single-shot.\n"
+        f"{'':<20}\n"
+        f"{'':<20}  MECHANISM RETRACTED. This line used to say the cost was the\n"
+        f"{'':<20}  NUMBER of concurrent units, and that a 16 MiB window carves a\n"
+        f"{'':<20}  row group into many where 128 makes one. The crate says\n"
+        f"{'':<20}  otherwise: window_rows_for (lib.rs:955) divides the MiB by the\n"
+        f"{'':<20}  row group's COMPRESSED BYTES PER ROW to get a row count, and\n"
+        f"{'':<20}  plan_s3_units clamps it to the group's length. lineitem is ~43\n"
+        f"{'':<20}  compressed B/row in 122,428-row groups, so 16 MiB asks for\n"
+        f"{'':<20}  ~390,000 rows and clamps to the whole group -- as do 64 and\n"
+        f"{'':<20}  128. The unit count is 1 in every arm above. Whatever moved\n"
+        f"{'':<20}  USS here, it was not the window.\n"
+        f"{'':<20}\n"
+        f"{'':<20}  The remaining suspect is the DERIVED budget (-1 gives\n"
+        f"{'':<20}  4 x max(window, 16), so 16 -> 64 MiB and 128 -> 512), and it\n"
+        f"{'':<20}  moved USS NON-MONOTONICALLY: 665 / 890 / 703 / 618 MiB across\n"
+        f"{'':<20}  windows 16/64/256/512. That is not the shape of a knob that\n"
+        f"{'':<20}  binds. Phase P stops inferring, pins the window, sweeps the\n"
+        f"{'':<20}  budget itself, and repeats it on a fixture where the window is\n"
+        f"{'':<20}  actually capable of binding.\n"
     )
 
 # --- phase T: does the serial default survive latency? -----------------------
@@ -518,6 +715,137 @@ if t_rows:
         f"\n{'':<20}  Local: arrow_rs saved 96 MiB at 0.95-1.02x wall, pyarrow 18.\n"
         f"{'':<20}  On S3 serial also gives up fetch/decode overlap, so the wall\n"
         f"{'':<20}  cost column is what decides whether the default is safe.\n"
+    )
+
+# --- phase Z: the fixed per-task cost, measured rather than extrapolated -----
+z_rows = [r for r in rows if r["tag"].startswith("Z_") and not r.get("stats_error")]
+if z_rows:
+    head = (
+        f"{'PHASE Z ~0 MiB/task':<24}{'avg USS/task':>14}{'max/avg':>9}"
+        f"{'tasks':>7}{'wall':>8}"
+    )
+    print(head)
+    print("-" * len(head))
+    # tag is Z_<reader>_<transport>; reader comes off the record, transport off
+    # the tag, because "source" is a full URI and too long for a table.
+    z = {}
+    for r in z_rows:
+        transport = r["tag"].rsplit("_", 1)[-1]
+        z[(r["reader"], transport)] = r
+        avg = uss(r)
+        mx = (r.get("max_uss_per_task") or 0) / MiB
+        print(
+            f"{r['reader'] + ' ' + transport:<24}{avg:>11.0f}MiB"
+            f"{(mx / avg if avg else 0):>9.2f}{r.get('uss_num_samples') or 0:>7}"
+            f"{r['wall_s']:>8.1f}"
+        )
+
+    def zu(reader, transport):
+        arm = z.get((reader, transport))
+        return uss(arm) if arm else None
+
+    ar_s3, ar_loc = zu("arrow_rs", "s3"), zu("arrow_rs", "local")
+    pa_s3, pa_loc = zu("pyarrow", "s3"), zu("pyarrow", "local")
+    print()
+    if ar_s3 and ar_loc:
+        print(
+            f"{'':<4}arrow_rs transport surcharge (s3 - local): {ar_s3 - ar_loc:+.0f} MiB"
+            "  <- object_store client, connection pool, tokio stacks"
+        )
+    if pa_s3 and pa_loc:
+        print(
+            f"{'':<4}pyarrow  transport surcharge (s3 - local): {pa_s3 - pa_loc:+.0f} MiB"
+            "  <- the control: PyArrow pays a transport cost too"
+        )
+    if ar_s3 and pa_s3:
+        print(
+            f"{'':<4}the gap that has to shrink (arrow_rs - pyarrow, s3): "
+            f"{ar_s3 - pa_s3:+.0f} MiB"
+        )
+        print(
+            f"{'':<4}phase S's fitted intercepts predicted +117 MiB. A measured "
+            "value far\n"
+            f"{'':<4}below that means the fit was extrapolating a concave curve "
+            "past its\n"
+            f"{'':<4}data and the small-D deficit is smaller than we have been "
+            "quoting."
+        )
+    if ar_s3 and ar_loc and pa_s3 and pa_loc:
+        ours = (ar_s3 - ar_loc) - (pa_s3 - pa_loc)
+        floor = (ar_loc - pa_loc) if pa_loc else 0
+        print(
+            f"\n{'':<4}decomposition of the arrow_rs deficit at D ~= 0:\n"
+            f"{'':<6}{floor:+7.0f} MiB  reader floor (local arrow_rs - local pyarrow):"
+            " the crate,\n"
+            f"{'':<19}FFI, and allocator baseline. No knob in this script\n"
+            f"{'':<19}reaches it; the fix would be in the crate.\n"
+            f"{'':<6}{ours:+7.0f} MiB  transport (our s3 surcharge - PyArrow's): the S3\n"
+            f"{'':<19}client, connection pool and tokio runtime we build and\n"
+            f"{'':<19}they do not. THIS is the tractable one -- one shared\n"
+            f"{'':<19}client, or a capped pool.\n"
+            f"{'':<6}whichever term dominates is the one worth working on; if they are\n"
+            f"{'':<6}comparable, neither alone closes the small-D gap.\n"
+        )
+
+# --- phase P: does prefetch_budget_mb bind, and on which layout? -------------
+p_rows = [r for r in rows if r["tag"].startswith("P_") and not r.get("stats_error")]
+if p_rows:
+    head = (
+        f"{'PHASE P budget':<22}{'avg USS/task':>14}{'vs pyarrow':>12}"
+        f"{'MiB dec/task':>14}{'wall':>8}"
+    )
+    print(head)
+    print("-" * len(head))
+    # Order by P_LAYOUTS so the control layout prints above the one being
+    # judged against it; glob order would put bigrg first purely alphabetically.
+    wanted = os.environ.get("P_LAYOUTS", "lineitem bigrg").split()
+    found = {r["tag"].split("_")[2] for r in p_rows}
+    layouts = [x for x in wanted if x in found] + sorted(found - set(wanted))
+    for lay in layouts:
+        arms = [r for r in p_rows if r["tag"].split("_")[2] == lay]
+        ctl = next((r for r in arms if r["reader"] == "pyarrow"), None)
+        ours = sorted(
+            (r for r in arms if r["reader"] == "arrow_rs"),
+            key=lambda r: r.get("prefetch_budget_mb") or 0,
+        )
+        print(f"  {lay}  (window pinned at {os.environ.get('P_WINDOW', '16')} MiB)")
+        # Decoded-per-task cannot come from TOTAL_DECODED_MIB here: that constant
+        # describes lineitem's 4 files. The bigrg arms read a different fixture
+        # entirely, so the per-task volume is reported from the fixture's own
+        # geometry (rows/task x 128 B/row for bigrg's 16 float64 columns).
+        for r in ([ctl] if ctl else []) + ours:
+            u = uss(r)
+            rel = f"{u / uss(ctl):.2f}x" if ctl and uss(ctl) else "-"
+            rows_per = r.get("rows_per_task_mean") or 0
+            dec = rows_per * 16 * 8 / MiB if lay == "bigrg" else 0
+            dec_s = f"{dec:,.0f}" if dec else "-"
+            label = (
+                "    pyarrow (control)"
+                if r["reader"] == "pyarrow"
+                else f"    budget={r.get('prefetch_budget_mb')}M"
+            )
+            print(f"{label:<22}{u:>11.0f}MiB{rel:>12}{dec_s:>14}{r['wall_s']:>8.1f}")
+        vals = [uss(r) for r in ours if uss(r)]
+        if len(vals) > 1:
+            print(
+                f"{'':<22}  arrow_rs spread across the budget sweep: "
+                f"{max(vals) / min(vals):.2f}x"
+            )
+    print(
+        f"\n{'':<4}Read the spread against the replicate noise printed at the top. A\n"
+        f"{'':<4}sweep spread below the noise floor means the budget does NOT bind on\n"
+        f"{'':<4}that layout, whatever direction the numbers happen to point.\n"
+        f"{'':<4}\n"
+        f"{'':<4}lineitem is the control: the window provably cannot bind there (see\n"
+        f"{'':<4}the phase W note), so a spread on lineitem is the budget alone. A\n"
+        f"{'':<4}spread on bigrg but not lineitem means the budget only matters once\n"
+        f"{'':<4}the window has fragmented a row group -- which would make the right\n"
+        f"{'':<4}default derived from the row group, not a fixed number of MiB.\n"
+        f"{'':<4}\n"
+        f"{'':<4}The bigrg pyarrow control is the number to keep regardless of how\n"
+        f"{'':<4}the sweep comes out: it is the first in-Ray measurement of the lone\n"
+        f"{'':<4}big row group, the layout this reader exists for. Standalone, that\n"
+        f"{'':<4}shape was 3.2-3.3x lighter than PyArrow.\n"
     )
 
 # --- the column-group check, which USS alone cannot make -------------------
@@ -559,11 +887,14 @@ print(
     "\nwould dominate any S3 measurement the same way it dominated the local ones."
     "\nThe write path is a separate, shared-with-PyArrow workstream."
     "\n"
-    "\nWhat this experiment can and cannot settle: it is one box, one region, one"
-    "\nschema (lineitem, 16 narrow columns at 172 B/row). It cannot speak to wide"
-    "\nschemas, where the column-group planner actually fires, or to multi-node"
-    "\ncontention. It CAN settle whether the saturation that makes this reader"
-    "\nOOM-resistant is a local-filesystem artifact -- which is the one thing"
-    "\nstanding between the current results and a PR description."
+    "\nWhat this experiment can and cannot settle: one box, one region, and two"
+    "\nnarrow schemas -- lineitem (16 columns, 172 B/row, 49 row groups per file)"
+    "\nand the bigrg fixture (16 columns, 128 B/row, ONE row group per file). It"
+    "\ncannot speak to wide schemas, where the column-group planner actually fires"
+    "\nand where the release regressions were worst, nor to multi-node contention."
+    "\nIt CAN settle three things: whether the saturation that makes this reader"
+    "\nOOM-resistant survives S3 (phase S), how much a read task costs before it"
+    "\ndecodes anything and which half of that is the transport (phase Z), and"
+    "\nwhether prefetch_budget_mb is a memory knob or a red herring (phase P)."
 )
 PYEOF
