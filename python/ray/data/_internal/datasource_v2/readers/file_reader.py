@@ -459,6 +459,22 @@ class FileReader(Reader[FileManifest]):
         fragments_with_offsets = self._get_fragments_to_read(dataset, manifest)
         yield from self._dispatch_fragment_reads(fragments_with_offsets, scanner_kwargs)
 
+    def _num_fragment_read_threads(self) -> int:
+        """How many fragments this reader decodes concurrently within one read task.
+
+        Overridable because the right answer is reader-specific rather than a
+        property of the file format. PyArrow's per-fragment decode gives a read
+        task no intra-task parallelism of its own, so this pool is the only source
+        of it; a reader that already parallelises *inside* a fragment gets nothing
+        from the pool but still pays for every fragment it keeps in flight. See
+        ``ArrowRsParquetFileReader._num_fragment_read_threads``.
+
+        Returning 1 is not merely "less concurrency": ``_dispatch_fragment_reads``
+        takes the sequential branch and ``make_async_gen`` is never constructed at
+        all.
+        """
+        return _DEFAULT_NUM_THREADS
+
     def _dispatch_fragment_reads(
         self,
         fragments_with_offsets: List[Tuple[pds.Fragment, int]],
@@ -477,7 +493,9 @@ class FileReader(Reader[FileManifest]):
             return
 
         ctx = DataContext.get_current()
-        num_workers = min(_DEFAULT_NUM_THREADS, len(fragments_with_offsets))
+        num_workers = min(
+            self._num_fragment_read_threads(), len(fragments_with_offsets)
+        )
         if num_workers <= 1 or ctx.execution_options.preserve_order:
             yield from self._read_fragments_sequential(
                 iter(fragments_with_offsets), scanner_kwargs
