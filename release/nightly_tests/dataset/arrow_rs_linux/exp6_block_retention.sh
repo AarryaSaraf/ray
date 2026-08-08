@@ -571,8 +571,28 @@ for reader in ("pyarrow", "arrow_rs"):
         print(
             f"{'':<22}  unfused USS ~= {intercept:.0f} MiB + {slope:.3f} x D"
             f"   ({len(points)}/{len(subset)} arms)"
-            f"\n{'':<22}  compare fused, threads=1: arrow-rs was 162 + 0.825 x D"
         )
+        # This used to print "compare fused, threads=1: arrow-rs was 162 + 0.825
+        # x D" as a hardcoded string under BOTH reader tables, so under the
+        # pyarrow one it compared PyArrow's unfused fit to arrow-rs's fused fit
+        # -- two readers, two configurations, no shared axis. The comparison
+        # worth printing is the SAME reader on the other transport, which is
+        # what phase S measures, so the reference values are per reader.
+        s3_fit = {"pyarrow": (189, 0.614), "arrow_rs": (306, 0.361)}.get(reader)
+        if s3_fit:
+            di, ds = intercept - s3_fit[0], slope - s3_fit[1]
+            print(
+                f"{'':<22}  same reader over S3 (exp7 phase S): "
+                f"{s3_fit[0]} + {s3_fit[1]:.3f} x D"
+                f"\n{'':<22}  transport costs this reader {-di:+.0f} MiB fixed and "
+                f"{-ds:+.3f} per MiB decoded."
+                f"\n{'':<22}  A near-zero slope term means the transport is a "
+                "constant, which is\n"
+                f"{'':<22}  what PyArrow shows. A positive one means our S3 path "
+                "retains MORE\n"
+                f"{'':<22}  per byte, which no amount of shrinking the constant "
+                "will fix."
+            )
     print()
 
 # Phase G: the block sweep again, but unfused and serial -- i.e. the conditions
