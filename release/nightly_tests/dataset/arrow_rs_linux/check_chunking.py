@@ -99,10 +99,17 @@ def _list_parquet(uri: str) -> Tuple[Optional[List[Tuple[str, int]]], Optional[s
 
 
 def _row_groups(fs, path: str) -> Optional[Tuple[int, int]]:
-    """``(num_row_groups, max_row_group_compressed_bytes)`` from the footer only.
+    """``(num_row_groups, max_row_group_UNCOMPRESSED_bytes)`` from the footer only.
 
     ``read_metadata`` fetches the footer, not the data, so this costs one small
     ranged GET per file even on a multi-GiB object.
+
+    Note the units: Parquet's ``RowGroup.total_byte_size`` is the **uncompressed**
+    size, so it is NOT comparable to the file's on-disk size and can legitimately
+    exceed it (a 25.2 MiB wide_schema/tensors file reports a 38.2 MiB row group).
+    Uncompressed is the right currency anyway -- it is what bounds the DECODED
+    working set, it is what the crate's K-split threshold and byte budget compare
+    against, and it is what PR #64985's bin packer packs on.
     """
     try:
         import pyarrow.parquet as pq
@@ -184,7 +191,7 @@ def _report(uri: str, why: str, threshold: int, max_footers: int) -> Optional[bo
             note = "  -> 1 row group: the floor; no chunk size can split it"
         print(
             f"      {path.rsplit('/', 1)[-1]:<40} {_fmt(size):>12}  "
-            f"{n_rg:>4} rgs, largest rg {_fmt(biggest_rg):>11}{note}"
+            f"{n_rg:>4} rgs, largest rg {_fmt(biggest_rg):>11} uncompressed{note}"
         )
     return fires
 
