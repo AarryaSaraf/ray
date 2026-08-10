@@ -125,6 +125,15 @@ def _table(n_rows: int, n_cols: int, seed: int) -> pa.Table:
 TENSOR_SHAPE = (4, 4)
 
 
+def _tensor_row_divisor(n_cols: int) -> int:
+    """Per-row float64 slots in a ``tensors`` row: the tensor column's cells plus
+    the ``n_cols - 1`` plain columns beside it. Dividing ``rows x n_cols`` by this
+    gives the row count whose decoded bytes match a ``wide`` file of ``n_cols``
+    float64 columns, which is the only way the two fixtures' ratios compare.
+    """
+    return int(np.prod(TENSOR_SHAPE)) + max(n_cols - 1, 0)
+
+
 def _tensor_table(n_rows: int, n_cols: int, seed: int) -> pa.Table:
     """A schema mixing pyarrow canonical extension columns with plain float64.
 
@@ -343,16 +352,29 @@ def main() -> int:
         # Same geometry as `wide` so the two are comparable, but one column is a
         # pyarrow canonical extension type. `wide` measures the column-group
         # branch; `tensors` measures whether the file reaches the native path at
-        # all. Row count is divided by the tensor cell size so the file holds
-        # about the same BYTES as `wide` rather than the same rows.
+        # all -- so it has to be the same SIZE as `wide`, or its ratios are noise.
+        #
+        # The 2026-08-10 run proves that: dividing the row count by the tensor
+        # cell size (16) built a 20 MiB fixture against wide's 256 MiB, and its
+        # 2.1 s read told us nothing. That division was simply wrong arithmetic.
+        # The tensor column REPLACES one float64 column, so it adds
+        # (cells - 1) x 8 = 120 B/row, not a 16x factor:
+        #   wide    row = n_cols x 8                    = 512 B at 64 cols
+        #   tensors row = (cells + n_cols - 1) x 8      = 632 B at 64 cols
+        # Equal bytes therefore wants rows x n_cols / (cells + n_cols - 1) --
+        # about 0.81x the rows, not 0.06x.
         "tensors": dict(
             n_files=args.wide_files,
             rows_per_file=max(
-                (wide_rg_rows * args.wide_rgs_per_file) // int(np.prod(TENSOR_SHAPE)),
+                (wide_rg_rows * args.wide_rgs_per_file * args.wide_cols)
+                // _tensor_row_divisor(args.wide_cols),
                 1,
             ),
             n_cols=args.wide_cols,
-            row_group_rows=max(wide_rg_rows // int(np.prod(TENSOR_SHAPE)), 1),
+            row_group_rows=max(
+                (wide_rg_rows * args.wide_cols) // _tensor_row_divisor(args.wide_cols),
+                1,
+            ),
             kind="tensor",
         ),
     }
