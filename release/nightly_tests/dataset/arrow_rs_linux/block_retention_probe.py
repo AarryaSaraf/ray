@@ -108,6 +108,85 @@ def read_stats(ds) -> Dict[str, Any]:
     return {"stats_error": f"no Read operator among {seen or '[]'}"}
 
 
+def read_profile(profile_dir: str) -> Dict[str, Any]:
+    """Fold the crate's JSONL records into the arm's result.
+
+    Answers two questions a USS number alone cannot: **which decode branch ran**
+    (``s3_plan.col_group_rgs`` -- every measurement to date has reported 0, so
+    the column-group arm has to prove it fired before its numbers mean anything),
+    and **how much decoded data was held at once** (``s3_rg.retained_bytes``
+    against ``rg_uncompressed_bytes``). The Hstack arm accumulates every batch of
+    every column group before emitting, so a ratio near 1.0 there is the
+    mechanism itself, measured rather than argued.
+
+    Records land one file per worker pid. A missing directory is reported, not
+    raised: the local reader path emits nothing at all, and an arm that
+    legitimately has no S3 records should not fail.
+    """
+    recs = []
+    try:
+        names = sorted(os.listdir(profile_dir))
+    except OSError:
+        return {"profile_error": f"no profile dir at {profile_dir}"}
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        with open(os.path.join(profile_dir, name)) as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    recs.append(json.loads(line))
+                except ValueError:
+                    continue  # a worker killed mid-write leaves a partial line
+    if not recs:
+        return {"profile_error": f"no records under {profile_dir}"}
+
+    # Both halves of the reader key their records on "kind" and share the
+    # directory (see _prof_record in the reader), so the Rust planner records and
+    # the Python fragment records join on pid in one pass.
+    plans = [r for r in recs if r.get("kind") == "s3_plan"]
+    rgs = [r for r in recs if r.get("kind") == "s3_rg"]
+    out: Dict[str, Any] = {
+        "prof_files": len(names),
+        "prof_plans": len(plans),
+        "prof_row_groups": len(rgs),
+        "prof_col_group_rgs": sum(p.get("col_group_rgs", 0) for p in plans),
+        "prof_row_window_rgs": sum(p.get("row_window_rgs", 0) for p in plans),
+        "prof_oversized_units": sum(p.get("oversized_units", 0) for p in plans),
+    }
+    if rgs:
+        retained = [r.get("retained_bytes", 0) for r in rgs]
+        out["prof_max_retained_mib"] = round(max(retained) / MiB, 1)
+        out["prof_avg_retained_mib"] = round(sum(retained) / len(retained) / MiB, 1)
+        # Only the column-group records carry the row group's uncompressed size,
+        # which is the denominator that makes "retained the whole group" a claim
+        # about a ratio rather than about an absolute number of MiB.
+        sized = [r for r in rgs if r.get("rg_uncompressed_bytes")]
+        if sized:
+            out["prof_retained_over_rg"] = round(
+                max(
+                    r.get("retained_bytes", 0) / r["rg_uncompressed_bytes"]
+                    for r in sized
+                ),
+                3,
+            )
+    modes = sorted({r.get("mode", "?") for r in rgs})
+    if modes:
+        out["prof_modes"] = ",".join(modes)
+    # A fallback silently turns an arrow-rs arm into a PyArrow arm, which would
+    # make an A/B read as "no difference" for the wrong reason. Surface both the
+    # count and the distinct reasons.
+    falls = [r for r in recs if r.get("kind") == "fallback"]
+    if falls:
+        out["prof_fallbacks"] = len(falls)
+        out["prof_fallback_reasons"] = ",".join(
+            sorted({str(r.get("reason", "?")) for r in falls})
+        )[:200]
+    return out
+
+
 def _clamp_files(source: str, limit: int):
     """The first ``limit`` .parquet files under ``source``, as an explicit list.
 
@@ -196,6 +275,27 @@ def main() -> int:
         "~= prefetch_budget + decode_budget. 0 leaves the default.",
     )
     parser.add_argument(
+        "--column-fetch-mb",
+        type=int,
+        default=0,
+        help="RAY_DATA_ARROW_RS_COLUMN_FETCH_MB (default 16) -- compressed MiB "
+        "per COLUMN group. When one row group's projected compressed bytes "
+        "exceed this, plan_s3_units sends it down RgDecode::Hstack instead of "
+        "RgDecode::Windows. Pass -1 for the crate's `0`, which disables column "
+        "grouping outright: that is the same-fixture A/B for the branch, since "
+        "the Hstack arm accumulates every batch of every group before emitting "
+        "and so cannot saturate. 0 leaves the default.",
+    )
+    parser.add_argument(
+        "--profile-to",
+        default=None,
+        help="RAY_DATA_ARROW_RS_PROFILE_DIR -- have the crate and the Python "
+        "reader emit JSONL per read task (s3_plan carries col_group_rgs; s3_rg "
+        "carries retained_bytes and rg_uncompressed_bytes). Cheap, but it writes "
+        "one file per worker pid, so keep it off the timed arms you intend to "
+        "compare on wall time.",
+    )
+    parser.add_argument(
         "--write-to",
         default=None,
         help="fuse a write onto the read (the release write_parquet shape). "
@@ -230,6 +330,26 @@ def main() -> int:
         os.environ["RAY_DATA_ARROW_RS_PREFETCH_BUDGET_MB"] = str(
             args.prefetch_budget_mb
         )
+    if args.column_fetch_mb:
+        # -1 on the command line means the crate's 0 ("disable column grouping").
+        # 0 on the command line means "leave the default alone", so the two
+        # cannot share an encoding.
+        os.environ["RAY_DATA_ARROW_RS_COLUMN_FETCH_MB"] = str(
+            0 if args.column_fetch_mb < 0 else args.column_fetch_mb
+        )
+    if args.profile_to:
+        os.makedirs(args.profile_to, exist_ok=True)
+        os.environ["RAY_DATA_ARROW_RS_PROFILE"] = "1"
+        os.environ["RAY_DATA_ARROW_RS_PROFILE_DIR"] = args.profile_to
+    # exp7 turns profiling on through the environment for every arm rather than
+    # through this flag, so honour either. Without this the JSONL would be written
+    # and then never read.
+    profile_dir = args.profile_to or (
+        os.environ.get("RAY_DATA_ARROW_RS_PROFILE_DIR")
+        if os.environ.get("RAY_DATA_ARROW_RS_PROFILE", "").lower()
+        not in ("", "0", "false")
+        else None
+    )
     # Read before ray.data imports: _DEFAULT_NUM_THREADS is a module-level
     # env_integer, so setting it afterwards has no effect at all.
     if args.threads:
@@ -286,12 +406,15 @@ def main() -> int:
         "threads": args.threads or None,
         "fetch_window_mb": args.fetch_window_mb or None,
         "prefetch_budget_mb": args.prefetch_budget_mb or None,
+        "column_fetch_mb": args.column_fetch_mb or None,
         "mode": "write" if args.write_to else "iter_bundles",
         "source": args.source,
         "num_files": len(source) if isinstance(source, list) else None,
         "wall_s": round(wall, 2),
     }
     result.update(read_stats(ds))
+    if profile_dir:
+        result.update(read_profile(profile_dir))
     if result.get("stats_error"):
         print(f"WARNING: {result['stats_error']}", file=sys.stderr)
     print(json.dumps(result, indent=2))

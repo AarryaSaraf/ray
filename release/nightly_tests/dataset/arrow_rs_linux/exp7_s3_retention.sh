@@ -69,11 +69,26 @@
 #        fixture (window binds: ~20 units at 16 MiB against ~2 at 128). bigrg is
 #        also the lone-big-row-group shape this whole project targets, and no
 #        knob measurement has ever been taken on it inside Ray.
+#   D -- the decode budget, ON S3. Phases W, P, T and Z between them killed every
+#        other candidate: the window plans one unit, the prefetch budget is flat
+#        and non-monotone, serial threads are strictly better, and the fixed cost
+#        is 3 MiB BELOW PyArrow's. What is left is a per-BYTE surcharge (slope
+#        0.503 on S3 against 0.229 local, ~335 MiB at the release shape), and the
+#        remaining structural difference between the paths is the decoded channel:
+#        depth 2 on S3, absent locally. exp6 phase B swept this knob on local disk
+#        and found it flat, which is the right answer where there is no channel.
+#   X -- the COLUMN-group path (RgDecode::Hstack), which no arm of exp6 or exp7 has
+#        ever executed -- every one reported col_group_rgs = 0, because lineitem
+#        and bigrg are both 16 narrow columns. That branch accumulates every batch
+#        of every column group before emitting one row, so it cannot saturate; it
+#        holds the whole decoded row group, which is exactly what PyArrow does.
+#        Needs the `wide` fixture. Prediction: parity, not regression.
 #
-# Phases Z and P need `make_fixtures.py` to have run; run_next.sh does that.
+# Phases Z, P and X need `make_fixtures.py` to have run; run_next.sh does that.
 #
-# Runtime: ~35-45 min for the 20 arms of S/W/T; add ~10 min for Z and ~20 for P
-# at REPEAT=3. Run in us-west-2 or the numbers are latency, not memory.
+# Runtime: ~35-45 min for the 20 arms of S/W/T; add ~10 min for Z, ~20 for P,
+# ~15 for D and ~10 for X at REPEAT=3. Run in us-west-2 or the numbers are
+# latency, not memory.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 check_env
 check_s3
@@ -130,6 +145,17 @@ P_BUDGETS="${P_BUDGETS:-16 64 256 1024}"
 # Which layouts phase P runs over. lineitem is the control where the window is
 # provably inert; bigrg is the target layout where it binds.
 P_LAYOUTS="${P_LAYOUTS:-lineitem bigrg}"
+# Phase D. Brackets the shipped 32 MiB by 16x in each direction. The S3 driver
+# holds S3_CHANNEL_DEPTH=2 decoded batches per stream, so the prediction is a
+# ~2 x delta-budget swing -- 2 MiB should sit ~60 MiB under 32 MiB if the channel
+# is the mechanism. 512 is past the point where one batch is a whole block, which
+# is the "batching removed" control.
+D_BUDGETS="${D_BUDGETS:-2 8 32 128 512}"
+# Phase X. 4 files x 4 row groups x 64 MiB decoded = 256 MiB per file, and Ray's
+# 1 GiB chunker default gives one read task per file, so D = 256 MiB per task.
+S3_WIDE="${S3_WIDE:-$S3_ROOT/fixtures/wide}"
+X_FILES="${X_FILES:-4}"
+X_DECODED_MIB="${X_DECODED_MIB:-256}"
 PHASES="${PHASES:-S W T}"
 
 mkdir -p "$RESULTS"
@@ -407,8 +433,129 @@ for layout in $P_LAYOUTS; do
 done
 fi
 
+# Phase D -- the one cell of the knob x transport matrix nobody filled.
+#
+# After phases W, P and T, three candidates for the S3 surcharge are dead: the
+# fetch window (it plans one unit on every layout measured), prefetch_budget_mb
+# (phase P: 1.26x on lineitem, non-monotone, with the shipping default as the
+# WORST arm; 1.14x on bigrg, which is the noise floor), and the fragment pool
+# (phase T: serial is both lighter and no slower). What is left is not a
+# surcharge on a constant -- phase Z showed the constant is 3 MiB BELOW PyArrow's
+# -- it is a surcharge per byte decoded:
+#
+#     arrow_rs local   USS ~= 238 + 0.229 x D        marginal 0.95 / 0.30 / 0.04
+#     arrow_rs s3      USS ~= 254 + 0.503 x D        marginal 0.75 / 0.48 / 0.47
+#     pyarrow  local   USS ~= 169 + 0.675 x D
+#     pyarrow  s3      USS ~= 186 + 0.629 x D        <- slope FALLS on S3
+#
+# Both readers pay the same ~+16 MiB to cross to S3. Only ours pays per byte:
+# +0.274 per MiB decoded, worth ~290 MiB at the release shape (D = 1055). Locally
+# the marginal cost decays to 0.04 -- extra data is nearly free -- and on S3 it
+# plateaus at 0.47 and stays there. That plateau IS the gap.
+#
+# The remaining structural difference between the paths is the decoded channel.
+# The S3 driver gives each stream `mpsc::channel(S3_CHANNEL_DEPTH)` -- depth 2
+# (crate lib.rs:919, 1709) -- and sizes each batch with
+# byte_budget_rows(decode_budget). At the shipped 32 MiB that is ~64 MiB of
+# DECODED batches resident that the local path never allocates: local drives the
+# sync reader, one batch at a time, straight into Python.
+#
+# exp6 phase B swept this knob on LOCAL disk, where the channel does not exist,
+# and correctly found it flat (443/489/462/463 MiB across 64x). It has never been
+# swept on S3, where it is multiplied by the channel depth.
+#
+#   USS falls ~2 x delta-budget  -> confirmed, and the fix is either a shallower
+#       channel or a budget default that accounts for the depth. Predicts ~60 MiB
+#       of the 335, so a partial explanation even if it lands exactly.
+#   USS flat as it is locally    -> the channel is not it either, and the next
+#       suspect is allocator retention on the async fetch path (many transient
+#       HTTP body buffers), whose discriminator is MALLOC_ARENA_MAX, not a knob.
+#   USS RISES as the budget falls -> more, smaller batches cost more round trips
+#       through the channel; then the knob is a throughput/memory trade rather
+#       than free, and the 32 MiB default is already the right side of it.
+#
+# The pyarrow arm is the control: it ignores the knob entirely, so any movement in
+# it is the noise floor for this grid, measured rather than assumed.
+if has_phase D; then
+run_probe "D_pyarrow" --reader pyarrow --block-mib "$FIXED_BLOCK" --threads 1
+for budget in $D_BUDGETS; do
+  run_probe "D_arrowrs_bud${budget}" \
+    --reader arrow_rs --block-mib "$FIXED_BLOCK" --threads 1 \
+    --decode-budget-mib "$budget"
+done
+fi
+
+# Phase X -- the column-group path, which no measurement here has ever executed.
+#
+# `plan_s3_units` sends a row group down RgDecode::Hstack instead of
+# RgDecode::Windows when its projected COMPRESSED bytes exceed column_fetch_mb
+# (16 MiB). Every arm of exp6 and exp7 so far has reported col_group_rgs = 0:
+# lineitem is 16 columns at ~5.3 MB compressed per group, an order of magnitude
+# under the budget, and the bigrg fixture is 16 columns too. So the one branch the
+# 2026-08-05 root-cause blamed for the release regressions has never run under a
+# per-task USS measurement inside Ray.
+#
+# It matters because that branch cannot saturate, by construction. The Hstack arm
+# decodes column group 0 to completion, then group 1, ... accumulating every batch
+# of every group in `group_batches` before it emits the first stitched row (crate
+# lib.rs ~1645). Peak therefore tracks the whole DECODED row group and
+# decode_budget_bytes bounds nothing at all.
+#
+# Verified on moto before this phase was written, 64 columns x 65,536 rows in one
+# row group, same data both ways:
+#
+#     column_fetch_mb=16   col_group_rgs=1, 3 groups   retained 51.4 MiB  (1.29x
+#                                                      the 39.9 MiB row group)
+#     column_fetch_mb=0    col_group_rgs=0, 3 windows  retained 25.7 MiB  (one
+#                                                      batch, bounded by the budget)
+#
+# So the mechanism is settled and this phase is only for the consequence: what it
+# costs in per-task USS against PyArrow, which is the number a PR can quote.
+#
+# The prediction is PARITY, NOT REGRESSION. Holding the whole decoded row group is
+# exactly what PyArrow's scanner does, so on wide schemas arrow-rs should stop
+# being memory-advantaged rather than become worse. The standalone Linux/S3 run
+# agrees (5000 columns, cf=16 gave 4.30 GB against PyArrow's 6.78) -- but
+# standalone drops its output where a Ray read task retains it, which is the whole
+# reason to re-ask the question here.
+#
+# Four arms, and the cf0 arm is the one that makes this an experiment rather than
+# an observation: it is the same fixture with only the branch changed.
+#
+#   arrow_rs cf16 ~= pyarrow          -> parity confirmed. The honest scope of the
+#       memory claim is "narrow-to-medium schemas", said out loud, and the
+#       streaming-hstack fix becomes a real improvement over PyArrow rather than a
+#       regression repair.
+#   arrow_rs cf16 >> pyarrow          -> worse than PyArrow on the layout the
+#       release suite regressed on. That is the release regression, found.
+#   cf0 much lighter than cf16        -> the accumulation is the cost and the fix
+#       is to interleave the groups (pull batch i from all N streams, stitch, emit,
+#       drop) instead of materialising them. Peak goes from the row group to one
+#       full-width batch.
+#   cf0 no lighter                    -> the cost is the fetch, not the hstack,
+#       and column_fetch_mb is doing its job.
+if has_phase X; then
+need_fixture X "$S3_WIDE"
+SRC="$S3_WIDE" MAXF="$X_FILES" run_probe "X_pyarrow" \
+  --reader pyarrow --block-mib "$FIXED_BLOCK" --threads 1
+SRC="$S3_WIDE" MAXF="$X_FILES" run_probe "X_arrowrs_cf16" \
+  --reader arrow_rs --block-mib "$FIXED_BLOCK" --threads 1
+# -1 encodes the crate's 0 ("disable column grouping"); the probe's own 0 means
+# "leave the default", so the two cannot share an encoding.
+SRC="$S3_WIDE" MAXF="$X_FILES" run_probe "X_arrowrs_cf0" \
+  --reader arrow_rs --block-mib "$FIXED_BLOCK" --threads 1 \
+  --column-fetch-mb -1
+# Does the decode budget reach this path at all? The mechanism says no -- the
+# accumulation is over every batch regardless of how big each one is. If USS moves
+# here, the mechanism is wrong and worth re-reading before anything is fixed.
+SRC="$S3_WIDE" MAXF="$X_FILES" run_probe "X_arrowrs_cf16_bud2" \
+  --reader arrow_rs --block-mib "$FIXED_BLOCK" --threads 1 \
+  --decode-budget-mib 2
+fi
+
 RESULTS="$RESULTS" TOTAL_DECODED_MIB="$TOTAL_DECODED_MIB" \
   P_WINDOW="$P_WINDOW" P_LAYOUTS="$P_LAYOUTS" \
+  D_BUDGETS="$D_BUDGETS" X_DECODED_MIB="$X_DECODED_MIB" \
   python - <<'PYEOF' | tee "$OUT_DIR/exp7_summary.txt"
 import glob
 import json
@@ -465,6 +612,10 @@ def collapse(records):
         "fetch_window_mb",
         "prefetch_budget_mb",
         "decode_budget_mib",
+        # Phase X's cf16 and cf0 arms differ in NOTHING else -- same fixture, same
+        # block, same threads -- so leaving this out would median the two sides of
+        # the A/B together and report their average as both.
+        "column_fetch_mb",
         # Phases Z and P read different inputs at IDENTICAL knob settings --
         # Z_arrow_rs_s3 and Z_arrow_rs_local differ in nothing else. Without the
         # source in the key they collapse into one group and the median silently
@@ -848,6 +999,132 @@ if p_rows:
         f"{'':<4}shape was 3.2-3.3x lighter than PyArrow.\n"
     )
 
+# --- phase D: does the decode budget bind on S3, where it did not locally? ---
+d_rows = [r for r in rows if r["tag"].startswith("D_") and not r.get("stats_error")]
+if d_rows:
+    head = (
+        f"{'PHASE D decode budget':<24}{'avg USS/task':>14}{'vs 32M':>9}"
+        f"{'vs pyarrow':>12}{'wall':>8}"
+    )
+    print(head)
+    print("-" * len(head))
+    ctl = next((r for r in d_rows if r["reader"] == "pyarrow"), None)
+    ours = sorted(
+        (r for r in d_rows if r["reader"] == "arrow_rs"),
+        key=lambda r: r.get("decode_budget_mib") or 0,
+    )
+    # The shipped default is the reference, not the smallest arm: the question is
+    # whether moving OFF 32 MiB buys memory, so every delta is against it.
+    base = next((uss(r) for r in ours if (r.get("decode_budget_mib") or 0) == 32), 0)
+    if ctl:
+        print(
+            f"{'  pyarrow (control)':<24}{uss(ctl):>11.0f}MiB{'-':>9}"
+            f"{'1.00x':>12}{ctl['wall_s']:>8.1f}"
+        )
+    for r in ours:
+        u = uss(r)
+        vs_base = f"{u - base:+.0f}M" if base else "-"
+        vs_ctl = f"{u / uss(ctl):.2f}x" if ctl and uss(ctl) else "-"
+        print(
+            f"{'  budget=' + str(r.get('decode_budget_mib')) + 'M':<24}"
+            f"{u:>11.0f}MiB{vs_base:>9}{vs_ctl:>12}{r['wall_s']:>8.1f}"
+        )
+    vals = [uss(r) for r in ours if uss(r)]
+    if len(vals) > 1:
+        print(f"{'':<24}  spread across the sweep: {max(vals) / min(vals):.2f}x")
+    print(
+        f"\n{'':<4}Local (exp6 phase B, unfused, threads=1, 128 MiB blocks) was FLAT:\n"
+        f"{'':<4}443 / 489 / 462 / 463 MiB across 2 / 8 / 32 / 128 -- 1.10x over a 64x\n"
+        f"{'':<4}sweep, non-monotone, minimum on the OLD default. That is the correct\n"
+        f"{'':<4}answer locally, because the local path drives the sync reader one batch\n"
+        f"{'':<4}at a time and there is no channel for batches to sit in.\n"
+        f"{'':<4}\n"
+        f"{'':<4}On S3 each stream holds S3_CHANNEL_DEPTH=2 decoded batches, so the\n"
+        f"{'':<4}prediction is a swing of about 2 x the budget difference: 2 MiB should\n"
+        f"{'':<4}land ~60 MiB under 32 MiB. Compare the spread against the replicate\n"
+        f"{'':<4}noise at the top before believing any of it.\n"
+        f"{'':<4}\n"
+        f"{'':<4}Even a clean hit only explains ~60 of the 335 MiB the S3 slope costs at\n"
+        f"{'':<4}D = 1055. If the spread is at the noise floor, the channel is not it\n"
+        f"{'':<4}either and the next instrument is MALLOC_ARENA_MAX, not a knob.\n"
+    )
+
+# --- phase X: the column-group path, finally executed inside Ray -------------
+x_rows = [r for r in rows if r["tag"].startswith("X_") and not r.get("stats_error")]
+if x_rows:
+    xdec = float(os.environ.get("X_DECODED_MIB", "256"))
+    head = (
+        f"{'PHASE X wide (64 cols)':<26}{'avg USS/task':>14}{'vs pyarrow':>12}"
+        f"{'col grp rgs':>13}{'retained':>11}{'wall':>8}"
+    )
+    print(head)
+    print("-" * len(head))
+    ctl = next((r for r in x_rows if r["reader"] == "pyarrow"), None)
+
+    def _xlabel(r):
+        if r["reader"] == "pyarrow":
+            return "  pyarrow (control)"
+        cf = r.get("column_fetch_mb")
+        bud = r.get("decode_budget_mib")
+        if cf and cf < 0:
+            return "  cf=0 (grouping OFF)"
+        return f"  cf=16 budget={bud}M" if bud else "  cf=16 (shipping)"
+
+    # Explicit order: control, the shipping arm, then the two arms that exist to
+    # explain it. Glob order puts cf=0 above cf=16, which reads as though the
+    # disabled-grouping arm were the configuration under test.
+    # shipping -> grouping OFF (the A/B) -> budget=2 (the control for the claim
+    # that the budget cannot reach this path at all).
+    def _xrank(r):
+        cf, bud = r.get("column_fetch_mb"), r.get("decode_budget_mib")
+        if cf and cf < 0:
+            return 1
+        return 2 if bud else 0
+
+    order = ([ctl] if ctl else []) + sorted(
+        (r for r in x_rows if r["reader"] == "arrow_rs"), key=_xrank
+    )
+    for r in order:
+        u = uss(r)
+        rel = f"{u / uss(ctl):.2f}x" if ctl and uss(ctl) else "-"
+        # Straight off the profiler, per arm: an arm that did not actually take the
+        # branch is not evidence about the branch, however its USS came out.
+        cg = r.get("prof_col_group_rgs")
+        cg_s = "-" if cg is None else str(cg)
+        ret = r.get("prof_max_retained_mib")
+        ret_s = "-" if ret is None else f"{ret:,.0f}MiB"
+        print(
+            f"{_xlabel(r):<26}{u:>11.0f}MiB{rel:>12}{cg_s:>13}{ret_s:>11}"
+            f"{r['wall_s']:>8.1f}"
+        )
+    print(
+        f"\n{'':<4}D is fixed at ~{xdec:,.0f} MiB decoded per task here, so read this as one\n"
+        f"{'':<4}point on the phase S curve, not a sweep. For scale, phase S at the\n"
+        f"{'':<4}nearest chunk (D = 211) had arrow-rs at 377 and PyArrow at 357 MiB on\n"
+        f"{'':<4}16 NARROW columns, where the column-group branch cannot fire.\n"
+        f"{'':<4}\n"
+        f"{'':<4}The col-grp-rgs column is the arm's own proof it took the branch. Any\n"
+        f"{'':<4}cf=16 row showing 0 there measures nothing about wide schemas -- check\n"
+        f"{'':<4}the fixture's per-column compressed bytes before reading further.\n"
+        f"{'':<4}\n"
+        f"{'':<4}Expected, from moto (64 cols x 65,536 rows, one row group): cf=16 fires\n"
+        f"{'':<4}3 groups and retains 51.4 MiB against a 39.9 MiB row group (1.29x);\n"
+        f"{'':<4}cf=0 takes row windows and retains 25.7 MiB, one batch. The mechanism\n"
+        f"{'':<4}is already settled -- Hstack accumulates every batch of every group\n"
+        f"{'':<4}before emitting (crate lib.rs ~1645) -- so what is being measured here\n"
+        f"{'':<4}is only what it COSTS against PyArrow inside a real read task.\n"
+        f"{'':<4}\n"
+        f"{'':<4}Prediction: PARITY. Holding the whole decoded row group is what\n"
+        f"{'':<4}PyArrow's scanner does too, so wide schemas should show arrow-rs losing\n"
+        f"{'':<4}its advantage rather than going backwards. If cf=16 is much WORSE than\n"
+        f"{'':<4}PyArrow, that is the release regression located. If cf=0 is much\n"
+        f"{'':<4}lighter than cf=16, the fix is to interleave the groups -- pull batch i\n"
+        f"{'':<4}from all N streams, stitch, emit, drop -- which turns peak from the row\n"
+        f"{'':<4}group into one full-width batch. The budget=2M arm is the control for\n"
+        f"{'':<4}that claim: the mechanism says the budget cannot reach this path, so if\n"
+        f"{'':<4}USS moves there, re-read the crate before fixing anything.\n"
+    )
+
 # --- the column-group check, which USS alone cannot make -------------------
 # A read whose memory looks fine can still have taken the branch that retains a
 # whole decoded row group -- it just did not happen to be the peak. exp2 found
@@ -887,14 +1164,21 @@ print(
     "\nwould dominate any S3 measurement the same way it dominated the local ones."
     "\nThe write path is a separate, shared-with-PyArrow workstream."
     "\n"
-    "\nWhat this experiment can and cannot settle: one box, one region, and two"
-    "\nnarrow schemas -- lineitem (16 columns, 172 B/row, 49 row groups per file)"
-    "\nand the bigrg fixture (16 columns, 128 B/row, ONE row group per file). It"
-    "\ncannot speak to wide schemas, where the column-group planner actually fires"
-    "\nand where the release regressions were worst, nor to multi-node contention."
-    "\nIt CAN settle three things: whether the saturation that makes this reader"
-    "\nOOM-resistant survives S3 (phase S), how much a read task costs before it"
-    "\ndecodes anything and which half of that is the transport (phase Z), and"
-    "\nwhether prefetch_budget_mb is a memory knob or a red herring (phase P)."
+    "\nWhat this experiment can and cannot settle: one box, one region, and three"
+    "\nschemas -- lineitem (16 columns, 172 B/row, 49 row groups per file), bigrg"
+    "\n(16 columns, 128 B/row, ONE row group per file) and wide (64 columns, fat"
+    "\nenough row groups to trip the column-group planner). It CAN settle:"
+    "\n  S  does the saturation that makes this reader OOM-resistant survive S3"
+    "\n  Z  what a read task costs before it decodes anything, and which half of"
+    "\n     that is the transport rather than the reader"
+    "\n  P  is prefetch_budget_mb a memory knob or a red herring"
+    "\n  D  is the decoded channel the per-byte S3 surcharge"
+    "\n  X  what the column-group path costs against PyArrow inside a read task"
+    "\n"
+    "\nIt still cannot speak to MULTI-NODE contention, which is where the release"
+    "\nsuite runs and where a per-task number and a per-node number diverge; nor to"
+    "\nschemas in the thousands of columns, where the standalone harness measured"
+    "\n5000 and this tops out at 64; nor to anything fused, since every arm here is"
+    "\nread-only on purpose."
 )
 PYEOF
