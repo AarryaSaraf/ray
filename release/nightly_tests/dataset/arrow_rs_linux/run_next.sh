@@ -48,9 +48,14 @@
 #      allocator retention, whose instrument is MALLOC_ARENA_MAX, not a knob.
 #
 #   2. What does the column-group path cost inside Ray?  (exp7 phase X)
-#      RgDecode::Hstack has never executed under measurement here (every arm
-#      reported col_group_rgs = 0: lineitem and bigrg are both 16 narrow
-#      columns). Mechanism already confirmed on moto -- it accumulates every
+#      RgDecode::Hstack has never executed under measurement here -- lineitem and
+#      bigrg are both 16 narrow columns. (An earlier version of this header said
+#      "every arm reported col_group_rgs = 0". That was never a measurement: the
+#      profile directory was set through the environment and never created, the
+#      reader's writes failed into a blanket except-pass, and the empty column
+#      read as a zero. Fixed 2026-08-10 -- the probe now creates the directory and
+#      the tables print NOPROF instead of a blank.)
+#      Mechanism already confirmed on moto -- it accumulates every
 #      batch of every column group before emitting one row, retaining 51.4 MiB
 #      against a 39.9 MiB row group where the row-window path holds one 25.7 MiB
 #      batch. Prediction: PARITY, not regression, because holding a whole decoded

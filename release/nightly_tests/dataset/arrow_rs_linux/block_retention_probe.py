@@ -372,7 +372,6 @@ def main() -> int:
             0 if args.column_fetch_mb < 0 else args.column_fetch_mb
         )
     if args.profile_to:
-        os.makedirs(args.profile_to, exist_ok=True)
         os.environ["RAY_DATA_ARROW_RS_PROFILE"] = "1"
         os.environ["RAY_DATA_ARROW_RS_PROFILE_DIR"] = args.profile_to
     # exp7 turns profiling on through the environment for every arm rather than
@@ -384,6 +383,15 @@ def main() -> int:
         not in ("", "0", "false")
         else None
     )
+    # The reader appends with a bare open(..., "a") inside a blanket
+    # `except Exception: pass` -- instrumentation must never fail a read -- so a
+    # missing directory silently discards EVERY record, and the empty result then
+    # reads as "the counter was zero". It is not: exp7 and exp8 both set the
+    # directory through the environment and neither created it, which is why every
+    # col_group_rgs/fallback column in those runs came back blank. Create it here,
+    # once, for whichever way it was requested.
+    if profile_dir:
+        os.makedirs(profile_dir, exist_ok=True)
     # Read before ray.data imports: _DEFAULT_NUM_THREADS is a module-level
     # env_integer, so setting it afterwards has no effect at all.
     if args.threads:

@@ -477,7 +477,13 @@ if frows:
         if not (p and a):
             continue
         fb = a.get("prof_fallbacks")
-        native = "-" if fb is None else ("FELL BACK" if fb else "native")
+        # Three states, not two. A blank column used to mean either "zero
+        # fallbacks" or "no records were ever written", and the 2026-08-10 run
+        # spent its whole phase F in the second state without saying so.
+        if a.get("profile_error"):
+            native = "NO PROF"
+        else:
+            native = "FELL BACK" if fb else "native"
         print(
             f"{fx:>8} | {fmt(mib(p)):>7} {fmt(mib(a)):>7} "
             f"{ratio(mib(a), mib(p)):>6} | "
@@ -491,8 +497,15 @@ if frows:
         if not a:
             continue
         reasons = a.get("prof_fallback_reasons")
+        if a.get("profile_error"):
+            print(f"  {fx}: NO PROFILING RECORDS -- {a['profile_error']}")
+            print(
+                "     every counter below is uncollected, NOT zero; this phase"
+                " cannot answer the fallback question"
+            )
+            continue
         print(
-            f"  {fx}: fallbacks={a.get('prof_fallbacks')}, "
+            f"  {fx}: fallbacks={a.get('prof_fallbacks', 0)}, "
             f"col_group_rgs={a.get('prof_col_group_rgs')}, "
             f"row_window_rgs={a.get('prof_row_window_rgs')}"
         )

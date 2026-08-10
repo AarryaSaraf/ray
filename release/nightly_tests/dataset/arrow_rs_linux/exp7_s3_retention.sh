@@ -1090,9 +1090,14 @@ if x_rows:
         # Straight off the profiler, per arm: an arm that did not actually take the
         # branch is not evidence about the branch, however its USS came out.
         cg = r.get("prof_col_group_rgs")
-        cg_s = "-" if cg is None else str(cg)
         ret = r.get("prof_max_retained_mib")
-        ret_s = "-" if ret is None else f"{ret:,.0f}MiB"
+        # "no records written" and "the counter really was 0" are different
+        # claims, and a bare "-" conflated them for the whole 2026-08-10 run.
+        if r.get("profile_error"):
+            cg_s = ret_s = "NOPROF"
+        else:
+            cg_s = "-" if cg is None else str(cg)
+            ret_s = "-" if ret is None else f"{ret:,.0f}MiB"
         print(
             f"{_xlabel(r):<26}{u:>11.0f}MiB{rel:>12}{cg_s:>13}{ret_s:>11}"
             f"{r['wall_s']:>8.1f}"
