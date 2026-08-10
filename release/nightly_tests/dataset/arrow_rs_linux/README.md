@@ -11,12 +11,23 @@ of it runs in CI.
 > `python/ray/data/arrow_rs_docs/TODO.md` §1 carries what is left to do. This
 > file is only how to run things.
 >
-> Headline, so nobody re-derives it: the crate is **not** the problem (outside
-> Ray it is 1.57× faster on 1.62× less CPU at equal cores, at 20–40× less
-> memory). What remains is a **~104 MiB fixed cost per read task** that arrow-rs
-> pays and PyArrow does not, which makes arrow-rs win on big read tasks and lose
-> on small ones. Neither block size (32× sweep) nor decode budget (16× sweep)
-> touches it.
+> Headline as of **2026-08-10**, so nobody re-derives it:
+>
+> * The crate is **not** the problem. Outside Ray it is 1.57× faster on 1.62×
+>   less CPU at equal cores, at 20–40× less memory.
+> * On memory we are at-or-better everywhere measured: **0.55–0.63×** on the
+>   lone-big-row-group layout over S3, **0.90×** at the default read shape,
+>   **0.49×** on local disk, parity-to-1.24× on small tasks (≤52 MiB absolute).
+> * **Two claims that were written here and are wrong.** There is no *~104 MiB
+>   fixed cost per read task* and no *+117 MiB fixed S3 cost* — both were
+>   intercepts of straight lines fitted to a concave curve, read off at an
+>   x-value the data never visited. Measured directly at D ≈ 0, arrow-rs is
+>   1 MiB below PyArrow locally and 3 MiB below on S3. The real remaining gap is
+>   a per-**byte** S3 surcharge (slope 0.503 vs 0.229 local).
+> * **The release regressions are mostly speed, not memory.** The three worst are
+>   read-operator wall time, and `read_parquet_fixed_size` is 2.64× slower while
+>   *winning* on both memory metrics. Everything in exp6/exp7 measured per-task
+>   USS. exp8 is the correction.
 
 ## Why the first three
 
@@ -39,6 +50,9 @@ no-op on re-runs.
 | 1 | `exp1_iter_batches.sh` | Does the decode memory win exist in Ray *at all*? This is the release test verbatim — same bucket, same sf10 data, same consume mode. At 145 B/row the 2 MiB decode budget genuinely binds, so it is the best case for the premise. The release run measured **1.01×** per-task USS where the local control predicts ~0.3×. |
 | 2 | `exp2_fat_col.sh` | Is the column-group branch mis-selected? `fat_col` (1 fat + 1 small column) takes it, because "a single column always fits" makes `partition_columns_by_budget` return >1 group; that branch **retains the whole decoded row group**, i.e. PyArrow's exact behaviour. `fat_col_solo` has the same bytes in one column and cannot be split, so it must take the windowed path. Same bytes, opposite branch — the pair is its own control. |
 | 3 | `exp3_write_parquet.sh` | The only unambiguous per-task memory regression in the release run: **2.28× max USS at 1.00× wall time**. Time-neutral and memory-negative is the signature of accumulation. Sweeping the decode budget 2 → 32 → 128 MiB is the direct test: if USS is flat, that hypothesis is dead. |
+| 6 | `exp6_block_retention.sh` | Local disk. What a Ray read task actually holds, as task size, block size, decode budget and fragment threads vary. Produced the saturation curve and the finding that a fused writer held 589 of 1032 MiB. |
+| 7 | `exp7_s3_retention.sh` | The same questions over **real S3** — the transport every regression came from, and the only one that executes `plan_s3_units`, the column-group planner and the prefetch loop. Phases S/W/T/Z/P are answered; **D** (the decoded channel) and **X** (the column-group branch) are open. |
+| 8 | `exp8_ray_tuning.sh` | **Tune Ray for arrow-rs, and chase the read-*time* regression.** Every ratio in exps 1–7 was measured at defaults Ray tuned for PyArrow over years, and the release suite's worst numbers are read-op wall, not memory. Phase **C** varies task concurrency (the one release axis always pinned at 8); **K** sweeps chunk and block size on *both* readers and prints two argmins instead of a ratio; **F** asks whether the worst release regression is even on the arrow-rs path. |
 
 ## Setup (once)
 
@@ -75,16 +89,23 @@ start in that state rather than producing meaningless numbers.
 ```bash
 cd ~/ray/release/nightly_tests/dataset/arrow_rs_linux
 source ~/ray/.venv/bin/activate
-./run_next.sh 2>&1 | tail -n 400        # ~60-75 min
+./run_next.sh 2>&1 | tail -n 500        # ~90-110 min
 ```
 
-It builds the two fixtures, re-runs exp7 phase S against the reader defaults
-shipped in `30297b9b7f` (every S3 number on record predates them), adds phase Z
-(the fixed per-task cost, measured at D ~= 0 on both transports instead of
-extrapolated) and phase P (does `prefetch_budget_mb` bind, on a layout where the
-fetch window actually can), and re-runs exp6 phase B unfused. Each script's
-header says what each outcome would mean. The summary lands in
-`out/next_summary.txt` between BEGIN/END PASTE markers.
+It builds the four fixtures, then runs the four open questions: exp7 phase **D**
+(is the decoded S3 channel the per-byte surcharge?) and phase **X** (what does
+the column-group branch cost inside Ray?), then exp8 phases **C** (is task
+concurrency the read-time regression?), **K** (does any Ray knob have a different
+optimum per reader?) and **F** (is the worst release regression even on our
+path?). Each script's header says what each outcome would mean. The summary lands
+in `out/next_summary.txt` between BEGIN/END PASTE markers.
+
+Split it if you would rather not wait in one block:
+
+```bash
+STAGES="fixtures exp7" ./run_next.sh     # ~40-50 min
+STAGES="exp8"          ./run_next.sh     # ~40-55 min
+```
 
 Everything, ~45-60 min, keeps going if one experiment fails:
 

@@ -80,10 +80,29 @@ def read_stats(ds) -> Dict[str, Any]:
             ),
             None,
         )
+        # The release A/B's worst verified ratios are on the READ OPERATOR's
+        # summed task time ("read op wall": 2.64x on read_parquet_fixed_size,
+        # 4.90x on wide_schema_pipeline_tensors), not on whole-workload wall --
+        # and on read_parquet_fixed_size that same case is a memory WIN (0.77x
+        # USS). Total wall cannot separate those, because a read that is slower
+        # per task but overlapped with a downstream operator can still finish in
+        # the same wall time. So capture the operator's own summed and worst task
+        # time; `read_cpu_sum_s` against `read_wall_sum_s` is also the
+        # oversubscription check (a crate that runs tokio threads inside a 1-CPU
+        # task shows cpu/wall > 1).
+        read_op = next(
+            (o for o in (node.operators_stats or []) if "Read" in o.operator_name),
+            None,
+        )
+        wall_t = getattr(read_op, "wall_time", None) if read_op else None
+        cpu_t = getattr(read_op, "cpu_time", None) if read_op else None
         out = {
             "operators": names,
             "avg_max_uss_per_task": extra.get("average_max_uss_per_task"),
             "max_uss_per_task": extra.get("max_uss_per_task"),
+            "read_wall_sum_s": round(wall_t.sum, 2) if wall_t else None,
+            "read_wall_max_s": round(wall_t.max, 2) if wall_t else None,
+            "read_cpu_sum_s": round(cpu_t.sum, 2) if cpu_t else None,
             # The independent task count: one USS sample per task that ran. If
             # this disagrees with task_count, trust this one.
             "uss_num_samples": dist.get("num_samples", 0),
@@ -312,6 +331,21 @@ def main() -> int:
         "MiB-decoded-per-task axis every fit is against would be wrong. "
         "0 reads everything.",
     )
+    parser.add_argument(
+        "--num-cpus",
+        type=int,
+        default=0,
+        help="ray.init(num_cpus=N) -- how many read tasks run CONCURRENTLY in "
+        "this node's worker processes. Every experiment so far pinned this at 8 "
+        "(common.sh), so it is the one release-suite axis never varied here, and "
+        "it is the axis where the two readers are least alike: PyArrow overlaps "
+        "S3 latency with an 8-thread io pool plus batch/fragment readahead, "
+        "while the arrow-rs path runs 1 fragment thread and relies on tokio "
+        "INSIDE the task. At 1 concurrent task that favours us; at 8 the tokio "
+        "threads of 8 tasks contend for the same cores, which is the only "
+        "mechanism proposed so far that makes read-op time worse while memory "
+        "gets better. 0 leaves common.sh's RAY_num_cpus alone.",
+    )
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
@@ -358,7 +392,12 @@ def main() -> int:
     import ray
     from ray.data import DataContext
 
-    ray.init(ignore_reinit_error=True)
+    # num_cpus must go through ray.init: RAY_num_cpus (set by common.sh) is read
+    # at cluster start, so overriding it afterwards is silently ignored.
+    if args.num_cpus:
+        ray.init(ignore_reinit_error=True, num_cpus=args.num_cpus)
+    else:
+        ray.init(ignore_reinit_error=True)
     ctx = DataContext.get_current()
     ctx.target_max_block_size = args.block_mib * MiB
     if args.chunk_mib:
@@ -407,6 +446,7 @@ def main() -> int:
         "fetch_window_mb": args.fetch_window_mb or None,
         "prefetch_budget_mb": args.prefetch_budget_mb or None,
         "column_fetch_mb": args.column_fetch_mb or None,
+        "num_cpus": args.num_cpus or None,
         "mode": "write" if args.write_to else "iter_bundles",
         "source": args.source,
         "num_files": len(source) if isinstance(source, list) else None,

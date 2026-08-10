@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Three Parquet layouts the TPC-H input cannot produce, written local and to S3.
+"""Four Parquet layouts the TPC-H input cannot produce, written local and to S3.
 
 Why lineitem is not enough
 --------------------------
@@ -14,7 +14,7 @@ even the smallest window we tried, 16 MiB, asks for ~390,000 rows against a
 plan the **same one unit**. Phase W's 892 -> 618 MiB was real, but it cannot
 have been the window doing it.
 
-So this file builds the two layouts that isolate the things lineitem confounds:
+So this file builds the layouts that isolate the things lineitem confounds:
 
 ``bigrg`` -- ONE row group per file, high-entropy so it does not compress.
     16 float64 columns of uniform random bits: 128 bytes/row decoded, and Snappy
@@ -30,15 +30,18 @@ So this file builds the two layouts that isolate the things lineitem confounds:
 
 ``tiny`` -- the same 16 columns, ~2,000 rows per file, a few hundred KiB.
     A read task that decodes essentially nothing. Its per-task USS is the FIXED
-    cost of being a read task at all, measured rather than extrapolated. Both
-    fits of the S3 sweep have an intercept -- PyArrow ~189 MiB, arrow-rs ~306 --
-    and that +117 MiB gap is the entire reason arrow-rs loses below D ~= 700
-    MiB. A straight line through four points that are visibly concave is a weak
-    way to learn a constant; this measures it at D ~= 0 directly. Writing the
-    fixture to BOTH local disk and S3 also splits the constant in two, because
-    the local path memory-maps and constructs no HTTP client, no connection
-    pool and no tokio runtime: (arrow_rs s3 - arrow_rs local) is the transport's
-    share and the rest is the reader's.
+    cost of being a read task at all, measured rather than extrapolated. It was
+    built to check an apparent +117 MiB fixed S3 penalty (fitted intercepts of
+    306 for arrow-rs against PyArrow's 189) and it **deleted** it: at D ~= 0,
+    arrow-rs reads 114 MiB against PyArrow's 117 on S3, and 109 against 110
+    locally. A straight line through four visibly concave points necessarily
+    overshoots at the low end, so an intercept here is an extrapolation and not
+    a measurement -- the lesson generalises to every fit in these docs. Writing
+    the fixture to BOTH local disk and S3 also splits the constant in two,
+    because the local path memory-maps and constructs no HTTP client, no
+    connection pool and no tokio runtime: (arrow_rs s3 - arrow_rs local) is the
+    transport's share (+4 MiB, against PyArrow's +6) and the rest is the
+    reader's (-1 MiB).
 
 ``wide`` -- 64 columns, row groups deliberately fat enough to trip the
     COLUMN-group path. ``plan_s3_units`` sends a row group down
@@ -68,7 +71,16 @@ So this file builds the two layouts that isolate the things lineitem confounds:
     disables column grouping outright, giving a same-fixture A/B where the only
     difference is the branch taken.
 
-All three layouts get ``write_page_index=True``: the crate requires the page
+``tensors`` -- the same geometry as ``wide`` with one column carrying pyarrow's
+    canonical ``fixed_shape_tensor`` extension type. The support gate rejects any
+    field with an ``extension_name``, so this fixture tests a question about the
+    single worst release regression (``wide_schema_pipeline_tensors``, read op
+    **4.90x**) that no primitive fixture can reach: whether that case runs on the
+    arrow-rs path at all, or falls back to PyArrow in both arms -- in which case
+    the gap is the cost of *deciding* to fall back, not of decoding. See
+    :func:`_tensor_table`.
+
+All four layouts get ``write_page_index=True``: the crate requires the page
 index to plan byte-budgeted reads, and without it the read silently falls back.
 
 Data is generated locally and pushed with ``aws s3 sync`` rather than written
@@ -108,6 +120,45 @@ def _table(n_rows: int, n_cols: int, seed: int) -> pa.Table:
     return pa.table({f"c{i}": pa.array(rng.random(n_rows)) for i in range(n_cols)})
 
 
+# Elements per tensor cell in the `tensors` fixture. 4x4 float64 = 128 B/cell, so
+# one tensor column carries as many bytes per row as all 16 columns of `bigrg`.
+TENSOR_SHAPE = (4, 4)
+
+
+def _tensor_table(n_rows: int, n_cols: int, seed: int) -> pa.Table:
+    """A schema mixing pyarrow canonical extension columns with plain float64.
+
+    This exists to answer a question about the WORST regression in the release
+    A/B (``wide_schema_pipeline_tensors``, read op 4.90x) that no experiment can
+    answer with primitives: **is that case even on the arrow-rs path?**
+
+    The reader's support gate rejects any field carrying an ``extension_name``
+    -- including pyarrow's own canonical ``fixed_shape_tensor`` -- and routes the
+    whole file to the PyArrow fallback by documented decision. If the release
+    tensors case falls back, then both arms of that A/B decoded through PyArrow
+    and a 4.90x gap cannot be the decoder: it would have to be the cost of
+    deciding to fall back (a native footer read, then a pyarrow read of the same
+    file). That is a very different bug from a slow decode, and the profiler
+    reports which happened directly -- ``kind: "fallback"`` records carry the
+    reason string.
+
+    Mixed deliberately, one extension column among primitives: the gate is
+    per-FILE, so a single extension column is enough to divert a file whose other
+    columns the native path handles perfectly well. That is the realistic shape
+    (nobody writes an all-tensor table) and it is the pessimistic one.
+    """
+    rng = np.random.default_rng(seed)
+    cells = int(np.prod(TENSOR_SHAPE))
+    data = {}
+    # One extension column is sufficient to trip a per-file gate; a second only
+    # costs generation time.
+    values = rng.random(n_rows * cells).reshape((n_rows, *TENSOR_SHAPE))
+    data["t0"] = pa.FixedShapeTensorArray.from_numpy_ndarray(values)
+    for i in range(max(n_cols - 1, 0)):
+        data[f"c{i}"] = pa.array(rng.random(n_rows))
+    return pa.table(data)
+
+
 def _manifest_path(d: str) -> str:
     return os.path.join(d, ".fixture.json")
 
@@ -135,11 +186,13 @@ def _write(
     n_cols: int,
     row_group_rows: int,
     want: dict,
+    kind: str = "plain",
 ):
     os.makedirs(d, exist_ok=True)
+    builder = {"plain": _table, "tensor": _tensor_table}[kind]
     for f in range(n_files):
         path = os.path.join(d, f"part{f}.parquet")
-        table = _table(rows_per_file, n_cols, seed=f)
+        table = builder(rows_per_file, n_cols, seed=f)
         pq.write_table(
             table,
             path,
@@ -151,6 +204,11 @@ def _write(
             # --bigrg-mib is bounded by RAM rather than by patience.
             row_group_size=row_group_rows,
         )
+        # Read the decoded size off the table rather than computing
+        # rows x cols x 8: a tensor cell is a whole sub-array, so the arithmetic
+        # would understate `tensors` by the number of elements per cell.
+        decoded = table.nbytes
+        del table
         on_disk = os.path.getsize(path)
         meta = pq.read_metadata(path)
         rg0 = meta.row_group(0)
@@ -166,7 +224,7 @@ def _write(
         print(
             f"  {os.path.basename(path)}: {rows_per_file:,} rows x {n_cols} cols, "
             f"{meta.num_row_groups} row group(s), "
-            f"{rows_per_file * n_cols * 8 / MiB:,.0f} MiB decoded, "
+            f"{decoded / MiB:,.0f} MiB decoded, "
             f"{on_disk / MiB:,.0f} MiB on disk "
             f"({on_disk / max(rows_per_file, 1):.0f} compressed B/row); "
             f"row group 0: {rg0_compressed / MiB:,.1f} MiB compressed, "
@@ -201,7 +259,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--bucket", required=True, help="s3://bucket/prefix to sync under")
     p.add_argument(
-        "--cases", default="tiny,bigrg,wide", help="comma list of {tiny,bigrg,wide}"
+        "--cases",
+        default="tiny,bigrg,wide,tensors",
+        help="comma list of {tiny,bigrg,wide,tensors}",
     )
     p.add_argument(
         "--local-root",
@@ -279,6 +339,21 @@ def main() -> int:
             rows_per_file=wide_rg_rows * args.wide_rgs_per_file,
             n_cols=args.wide_cols,
             row_group_rows=wide_rg_rows,
+        ),
+        # Same geometry as `wide` so the two are comparable, but one column is a
+        # pyarrow canonical extension type. `wide` measures the column-group
+        # branch; `tensors` measures whether the file reaches the native path at
+        # all. Row count is divided by the tensor cell size so the file holds
+        # about the same BYTES as `wide` rather than the same rows.
+        "tensors": dict(
+            n_files=args.wide_files,
+            rows_per_file=max(
+                (wide_rg_rows * args.wide_rgs_per_file) // int(np.prod(TENSOR_SHAPE)),
+                1,
+            ),
+            n_cols=args.wide_cols,
+            row_group_rows=max(wide_rg_rows // int(np.prod(TENSOR_SHAPE)), 1),
+            kind="tensor",
         ),
     }
 
