@@ -46,21 +46,28 @@ So this file builds the layouts that isolate the things lineitem confounds:
 ``wide`` -- 64 columns, row groups deliberately fat enough to trip the
     COLUMN-group path. ``plan_s3_units`` sends a row group down
     ``RgDecode::Hstack`` instead of ``RgDecode::Windows`` when its projected
-    compressed bytes exceed ``column_fetch_mb`` (16 MiB), and every measurement
-    in exp6/exp7 so far has reported ``col_group_rgs = 0`` -- on lineitem the
-    branch is unreachable (16 columns, ~5.3 MB compressed per group, an order of
-    magnitude under the budget) and ``bigrg`` is 16 columns too. So the one
-    branch the 2026-08-05 root-cause blamed has never executed under a per-task
-    USS measurement inside Ray.
+    compressed bytes exceed ``column_fetch_mb`` (16 MiB). On lineitem the branch
+    is unreachable (16 columns, ~5.3 MB compressed per group, an order of
+    magnitude under the budget) and ``bigrg`` is 16 columns too, so the branch the
+    2026-08-05 root-cause blamed had never executed under a per-task USS
+    measurement inside Ray. (Earlier docs said every arm "reported
+    ``col_group_rgs = 0``". That was never a measurement -- the profile directory
+    was never created and every record was silently discarded; fixed
+    ``cabad18352``.)
 
     Why it should matter: the Hstack arm decodes column group 0 to completion,
     then group 1, ... accumulating EVERY batch of EVERY group in
     ``group_batches`` before it emits the first stitched row
     (``lib.rs`` ~1645). Peak therefore tracks the whole DECODED row group and
     ``decode_budget_bytes`` bounds nothing at all -- which is precisely what
-    PyArrow's scanner does, so the prediction is **parity, not regression**: on
-    wide schemas arrow-rs should simply stop being memory-advantaged rather than
-    become worse. The standalone Linux/S3 run agrees (5000 columns, cf=16 gave
+    PyArrow's scanner does, so the prediction was **parity, not regression**.
+    MEASURED 2026-08-10, and parity was beaten: 16/16 row groups took the branch,
+    retaining 76 MiB against a 64 MiB decoded group (1.19x, replicating moto's
+    1.29x) at **0.66x PyArrow's per-task memory** and wall parity. The surprise is
+    what ``column_fetch_mb=0`` does: retention DROPS to 26 MiB and memory RISES to
+    1.05x, because all 24 fetch units then exceed the prefetch budget, each takes
+    the whole semaphore, and fetch stops overlapping decode -- 25.6 s against 5.0.
+    Column grouping earns its keep on the FETCH side, not by bounding retention. The standalone Linux/S3 run agrees (5000 columns, cf=16 gave
     4.30 GB against PyArrow's 6.78; see the ``column_fetch_mb`` docstring), but
     standalone drops its output where a Ray read task retains it.
 
@@ -72,13 +79,13 @@ So this file builds the layouts that isolate the things lineitem confounds:
     difference is the branch taken.
 
 ``tensors`` -- the same geometry as ``wide`` with one column carrying pyarrow's
-    canonical ``fixed_shape_tensor`` extension type. The support gate rejects any
-    field with an ``extension_name``, so this fixture tests a question about the
-    single worst release regression (``wide_schema_pipeline_tensors``, read op
-    **4.90x**) that no primitive fixture can reach: whether that case runs on the
-    arrow-rs path at all, or falls back to PyArrow in both arms -- in which case
-    the gap is the cost of *deciding* to fall back, not of decoding. See
-    :func:`_tensor_table`.
+    canonical ``fixed_shape_tensor`` extension type. It exists to measure the
+    release suite's worst-regressing schema family on a shape we control. (It was
+    built to test whether the support gate diverts the file -- it does NOT; see
+    :func:`_tensor_table`.) Measured 2026-08-10: **native, 0 fallbacks, 0.63x
+    PyArrow's per-task memory at 1.04x read-op time** -- so
+    ``wide_schema_pipeline_tensors``'s 4.90x read-op regression is on the native
+    path, not a fallback-decision cost. See :func:`_tensor_table`.
 
 All four layouts get ``write_page_index=True``: the crate requires the page
 index to plan byte-budgeted reads, and without it the read silently falls back.
@@ -141,9 +148,14 @@ def _tensor_table(n_rows: int, n_cols: int, seed: int) -> pa.Table:
     A/B (``wide_schema_pipeline_tensors``, read op 4.90x) that no experiment can
     answer with primitives: **is that case even on the arrow-rs path?**
 
-    The reader's support gate rejects any field carrying an ``extension_name``
-    -- including pyarrow's own canonical ``fixed_shape_tensor`` -- and routes the
-    whole file to the PyArrow fallback by documented decision. If the release
+    NOTE -- this fixture was built on a STALE belief about our own reader: that
+    the support gate rejects any field carrying an ``extension_name``. The
+    per-type gate was REMOVED on 2026-07-28 (see the comment above
+    ``_pyarrow_fragment_int96_roots``): extension types decode byte-identically
+    through the crate's C data interface, asserted by
+    ``test_extension_types_native_parity``. Measured 2026-08-10: **0 fallbacks,
+    fully native, 0.63x PyArrow's per-task memory at 1.04x read-op time.** The
+    reasoning below is kept only to record what the phase was FOR. If the release
     tensors case falls back, then both arms of that A/B decoded through PyArrow
     and a 4.90x gap cannot be the decoder: it would have to be the cost of
     deciding to fall back (a native footer read, then a pyarrow read of the same

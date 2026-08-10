@@ -35,7 +35,29 @@
 #      (max 1.82x); only `autoscaling` WALL TIME has the ~2.5x control floor. So
 #      read_parquet_fixed_size at 2.64x is signal.
 #
-# Hence the four open questions, in two scripts:
+# ALL FOUR RAN 2026-08-10 (real S3, us-west-2, REPEAT=3). Verdicts, so the
+# predictions below are read as history and not as open questions -- full data in
+# regression_testing.md §8.11 and the corrections in §8.12:
+#
+#   1 (D)  DEAD. A 256x budget sweep moves USS DOWN 99 MiB; spread 1.20x against a
+#          1.13x floor. A batch cannot exceed its row group, so the knob has no
+#          range on this layout. 32 MiB is still the best memory arm.
+#   2 (X)  Parity BEATEN -- 0.66x memory at wall parity, 16/16 row groups on the
+#          branch, 0 oversized units. But the MECHANISM below is wrong: cf=0
+#          retains LESS decoded data (26 vs 76 MiB) and uses MORE memory, because
+#          all 24 of its fetch units exceed the prefetch budget and serialise
+#          (25.6 s vs 5.0). Column grouping earns its keep on the FETCH side.
+#   3 (C)  DEAD. arrow-rs is 0.73-0.79x read-op time at every num_cpus in
+#          {1,2,4,8}; cpu/wall never exceeds 1.11, so no oversubscription. But
+#          read time is SCHEMA-DEPENDENT: 1.04-1.22x on the 64-column fixtures and
+#          1.29-1.32x on chunked files, so "the regression inverts" holds for
+#          narrow schemas only.
+#   4 (K)  Argmins DO differ (PyArrow's best read time at 128 MiB blocks, ours at
+#          32) -- but target_max_block_size is a GLOBAL DataContext knob for every
+#          operator, not a reader setting, and at equal config we win at all three
+#          sizes (0.76 / 0.90 / 0.74x). So it is evidence, not an action item.
+#
+# The four questions as they were posed:
 #
 #   1. Is the decoded channel the per-byte S3 surcharge?  (exp7 phase D)
 #      Local slope 0.229, S3 slope 0.503, worth ~335 MiB at D = 1055. Both
@@ -72,9 +94,10 @@
 #      Every ratio ever quoted here was measured at defaults tuned for PyArrow
 #      over years. K sweeps chunk size and block size with BOTH readers and
 #      prints two argmins instead of a ratio. F asks whether the worst release
-#      regression (wide_schema tensors) is even on our path -- the support gate
-#      rejects extension types, so if it falls back, both release arms decoded
-#      through PyArrow and 4.90x is the cost of DECIDING to fall back.
+#      regression (wide_schema tensors) is even on our path. ANSWERED: it IS --
+#      0 fallbacks, fully native, 0.63x memory at 1.04x read-op time. The premise
+#      (a support gate rejecting extension types) was falsified by our own
+#      2026-07-28 commit removing the per-type gate.
 #
 # Runtime ~90-110 min all in: fixtures ~15 (the `tensors` layout is new),
 # exp7 D+X ~25-35, exp8 C+K+F ~40-55, all at REPEAT=3. Split it if you prefer:

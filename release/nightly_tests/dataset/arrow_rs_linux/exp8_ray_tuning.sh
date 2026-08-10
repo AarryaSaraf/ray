@@ -43,23 +43,28 @@
 #    two optima differ we get either a per-reader default (as already happened
 #    with the fragment pool, 4 -> 1) or a documented recommendation.
 #
-# What this does NOT assume
-# -------------------------
-# A tempting hypothesis got demoted while writing this, and the demotion is
-# recorded so it is not re-derived: on files LARGER than the chunk size, the
-# reader builds one native fragment PER ROW GROUP
+# A demotion that was WRONG -- corrected by this script's own phase K
+# ------------------------------------------------------------------
+# While writing this, one hypothesis was demoted: on files LARGER than the chunk
+# size, the reader builds one native fragment PER ROW GROUP
 # (arrow_rs_parquet_file_reader.py:1171) rather than one per range, so a chunk of
 # 16 row groups is 16 separate crate calls -- and with threads=1 they are serial,
-# no cross-row-group fetch overlap. That looked like a clean explanation for
+# with no cross-row-group fetch overlap. That looked like a clean explanation for
 # "slower reads, better memory".
 #
-# But exp7 phase S ALREADY RAN THAT PATH. At chunk = 16 / 64 / 256 MiB against
-# ~677 MiB lineitem files, chunk_metadata is not None, so every one of those arms
-# used per-row-group fragments -- and wall time was at parity throughout
-# (11.8 / 11.2 / 10.4 vs PyArrow's 11.9 / 11.0 / 10.5). Per-row-group dispatch
-# costs nothing measurable at this scale. Phase K re-checks it as a side effect
-# (it sweeps chunk size on both readers and prints read-op time, which phase S
-# did not capture), but it is not the premise of any phase here.
+# It was demoted because exp7 phase S already ran that path at chunk =
+# 16 / 64 / 256 MiB against ~677 MiB lineitem files and reported wall at parity
+# (11.8 / 11.2 / 10.4 vs PyArrow's 11.9 / 11.0 / 10.5).
+#
+# THAT WAS THE WRONG INFERENCE. Phase S measured WHOLE-JOB wall, which divides a
+# per-task cost away: 20 read tasks across 8 CPUs overlap, so a 1.3x per-task
+# penalty disappears into the schedule. Phase K, which prints summed READ-OP
+# time, found chunk 64 at 1.29x and chunk 256 at 1.32x read-op time plus 1.13x
+# memory -- the only shape where arrow-rs loses on both axes.
+#
+# The transferable rule: whole-job wall cannot falsify a per-task claim. This is
+# also why block_retention_probe.py now captures read_wall_sum_s / read_cpu_sum_s
+# separately from total wall.
 #
 # The phases
 # ----------
@@ -83,13 +88,17 @@
 #   F  FALLBACK AUDIT. The `tensors` fixture (one pyarrow canonical
 #      fixed_shape_tensor column among primitives) against the `wide` fixture of
 #      the same geometry. wide_schema_pipeline_tensors is the worst regression in
-#      the release run at 4.90x read-op wall, and the support gate rejects any
-#      field with an extension_name -- so the first question is not "why is our
-#      decode slow", it is "does our decoder run at all?" If the file falls back,
-#      both release arms decoded through PyArrow and the 4.90x is the cost of
-#      DECIDING to fall back (native footer read, then a pyarrow read of the same
-#      file), which is a different bug in a different place. The profiler answers
-#      it directly: `kind: "fallback"` records carry the reason.
+#      the release run at 4.90x read-op wall.
+#
+#      ANSWERED 2026-08-10, and the phase's premise was WRONG. It assumed the
+#      support gate rejects any field with an extension_name; that per-type gate
+#      was removed by our own commit on 2026-07-28, and extension types decode
+#      byte-identically through the C data interface
+#      (test_extension_types_native_parity). Measured: 0 fallbacks, fully native,
+#      0.63x PyArrow's per-task memory at 1.04x read-op time. So the 4.90x is on
+#      the NATIVE path -- not the cost of deciding to fall back. Kept as the
+#      standing wide-schema read-time probe (wide 1.22x, tensors 1.04x), which is
+#      the only reader-attributable time loss outside the chunked-file shape.
 #
 # All phases are unfused (no --write-to): exp6 phase F showed a fused writer
 # holds 589 of 1032 MiB, which would dominate any memory number here, and the
@@ -460,11 +469,13 @@ if frows:
     print("=== phase F: does the wide/tensor shape reach the native path? ===")
     print(
         "wide_schema_pipeline_tensors is the worst release regression (4.90x\n"
-        "read-op wall). The support gate rejects any field with an\n"
-        "extension_name, so if `tensors` shows fallbacks, BOTH release arms\n"
-        "decoded through PyArrow and that 4.90x cannot be our decoder -- it is\n"
-        "the cost of deciding to fall back. `wide` is the same geometry with no\n"
-        "extension column, so it is the control.\n"
+        "read-op wall). NOTE: this phase was built on the belief that the support\n"
+        "gate rejects any field with an extension_name. It does not -- that\n"
+        "per-type gate was removed 2026-07-28, and 2026-08-10 measured 0\n"
+        "fallbacks, fully native, 0.63x memory at 1.04x read-op time. So the\n"
+        "phase now reads as a wide-schema READ-TIME probe (wide 1.22x), with\n"
+        "`wide` as the no-extension control. A nonzero fallback count here would\n"
+        "mean a REGRESSION in the gate, not the expected behaviour.\n"
     )
     print(
         f"{'fixture':>8} | {'USS P':>7} {'USS R':>7} {'ratio':>6} | "
