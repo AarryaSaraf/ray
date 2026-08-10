@@ -53,7 +53,7 @@
 # "slower reads, better memory".
 #
 # It was demoted because exp7 phase S already ran that path at chunk =
-# 16 / 64 / 256 MiB against ~677 MiB lineitem files and reported wall at parity
+# 16 / 64 / 256 MiB against the 271 MiB lineitem files and reported wall at parity
 # (11.8 / 11.2 / 10.4 vs PyArrow's 11.9 / 11.0 / 10.5).
 #
 # THAT WAS THE WRONG INFERENCE. Phase S measured WHOLE-JOB wall, which divides a
@@ -125,8 +125,11 @@ FIXED_BLOCK="${FIXED_BLOCK:-128}"
 # all); 8 is what common.sh pins and what every prior experiment measured; 2 and
 # 4 bracket the middle so a monotone trend is distinguishable from a cliff.
 C_CPUS="${C_CPUS:-1 2 4 8}"
-# Phase K. The chunker splits on ON-DISK size, and lineitem files are ~677 MiB,
-# so 1024 (and anything above it) leaves files whole while 256/64 split them.
+# Phase K. The chunker splits on ON-DISK size. Measured by check_chunking.py:
+# sf10 lineitem is 271 MiB/file with 49 row groups (largest 24.4 MiB), so 1024
+# (and anything above) leaves files whole while 256/64 split them. The predicted
+# task counts match the run exactly: ceil(271/64)=5 chunks x 4 files = 20 tasks,
+# ceil(271/256)=2 x 4 = 8, and 1 x 4 = 4 at both 1024 and 4096.
 # 4096 is the "chunker removed" arm -- identical to 1024 on this input, and it is
 # the control proving that the default is already in the no-split regime here.
 K_CHUNKS="${K_CHUNKS:-64 256 1024 4096}"
