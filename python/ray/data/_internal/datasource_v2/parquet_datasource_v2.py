@@ -152,7 +152,9 @@ class ParquetDatasourceV2(DataSourceV2[FileManifest]):
         return ParquetInMemorySizeEstimator()
 
     @override
-    def resolve_partitioning(self, sample: FileManifest) -> Optional[Partitioning]:
+    def resolve_partitioning(
+        self, sample: Optional[FileManifest]
+    ) -> Optional[Partitioning]:
         """Return ``self._partitioning`` with path-discovered field names.
 
         Hive partitioning ships with ``field_names=None`` by default and
@@ -163,7 +165,8 @@ class ParquetDatasourceV2(DataSourceV2[FileManifest]):
         """
         import copy
 
-        if self._partitioning is None or len(sample) == 0:
+        # ``not sample`` covers both no sample at all and an empty one.
+        if self._partitioning is None or not sample:
             return copy.deepcopy(self._partitioning)
         if self._partitioning.field_names:
             return copy.deepcopy(self._partitioning)
@@ -180,6 +183,10 @@ class ParquetDatasourceV2(DataSourceV2[FileManifest]):
             field_types=self._partitioning.field_types,
             filesystem=self._partitioning.filesystem,
         )
+
+    @property
+    def schema_needs_file_sample(self) -> bool:
+        return True
 
     def infer_schema(self, sample: FileManifest) -> pa.Schema:
         """Read Parquet footers from the sample manifest; unify and augment.

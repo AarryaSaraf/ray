@@ -59,6 +59,18 @@ class ArrowFileScanner(
             return set()
         return set(self.partitioning.field_names or [])
 
+    def preserves_all_rows(self) -> bool:
+        """``True`` when no row-reducing pushdown is set on this scanner.
+
+        Column projection is deliberately not consulted: it changes the width of
+        the output, never the row count.
+        """
+        return (
+            self.predicate is None
+            and self.partition_predicate is None
+            and self.limit is None
+        )
+
     def read_schema(self) -> pa.Schema:
         """Return the logical schema after column pruning.
 

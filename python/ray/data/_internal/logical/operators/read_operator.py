@@ -1,4 +1,5 @@
 import functools
+import logging
 import math
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Union
@@ -37,6 +38,8 @@ __all__ = [
     "Read",
     "ReadFiles",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, repr=False, eq=False)
@@ -391,8 +394,20 @@ class ReadFiles(
         )
 
         if not partition_cols:
-            new_scanner, _residual = self.scanner.push_filters(predicate_expr)
-            return replace(self, scanner=new_scanner)
+            new_scanner, residual = self.scanner.push_filters(predicate_expr)
+            new_op = replace(self, scanner=new_scanner)
+            if residual is None:
+                return new_op
+            # Our caller replaces the whole ``Filter`` -> ``ReadFiles`` subtree
+            # with what we return, so the leftover needs a ``Filter`` of its own
+            # or it never runs.
+            logger.debug(
+                "%s returned a residual predicate (%s); re-emitting it as a "
+                "Filter above the read.",
+                type(self.scanner).__name__,
+                residual,
+            )
+            return Filter(predicate_expr=residual, input_dependencies=[new_op])
 
         split = _split_predicate_by_columns(predicate_expr, partition_cols)
 

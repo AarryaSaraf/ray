@@ -38,6 +38,29 @@ class Scanner(ABC, Generic[InputSplit]):
         """
         ...
 
+    def preserves_all_rows(self) -> bool:
+        """Whether this scanner returns every row of every file it is given.
+
+        Answers one question: may a row count be taken from file metadata
+        instead of by reading the data? (See
+        ``ray.data._internal.logical.rules.pushdown_count_files``.)
+
+        **The default is ``False`` because the failure is silent.** A scanner
+        that reduces rows -- a pushed predicate, a limit, partition pruning --
+        but claims otherwise makes ``count()`` return the *pre-filter* total,
+        with no error and no way for a caller to notice. Declining merely costs
+        a real read. So override this only to report a condition you check
+        directly, and include every row-reducing knob the scanner has,
+        **whether it arrived via pushdown or was set at construction** (e.g.
+        ``read_iceberg(row_filter=...)``).
+
+        Note the polarity is the opposite of
+        :meth:`SupportsFilterPushdown.pushed_predicate`, where under-reporting
+        is the safe direction: there it only forgoes listing-time pruning, here
+        it corrupts a result.
+        """
+        return False
+
     @abstractmethod
     def create_reader(self) -> Reader[InputSplit]:
         """Create a Reader configured for this scanner.
