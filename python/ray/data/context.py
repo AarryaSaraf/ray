@@ -84,6 +84,13 @@ DEFAULT_READ_OP_MIN_NUM_BLOCKS = 200
 
 DEFAULT_USE_DATASOURCE_V2 = env_bool("RAY_DATA_USE_DATASOURCE_V2", True)
 
+# Iceberg's V2 migration is gated separately from ``use_datasource_v2``: the
+# Parquet path it shares is already default-on, whereas Iceberg-on-V2 is opt-in
+# until it has parity.
+DEFAULT_USE_ICEBERG_DATASOURCE_V2 = env_bool(
+    "RAY_DATA_USE_ICEBERG_DATASOURCE_V2", False
+)
+
 # Default target chunk size for ``ParquetFileChunker``. ``None`` means the chunker
 # uses its built-in default (currently 1 GiB).
 DEFAULT_PARQUET_CHUNKER_TARGET_CHUNK_SIZE: Optional[int] = None
@@ -591,6 +598,11 @@ class DataContext:
             override with ``RAY_DATA_USE_DATASOURCE_V2`` (``0`` for V1, ``1`` for
             V2). Parquet is the only reader migrated to V2 so far; the others
             read through V1 for now regardless of this flag.
+        use_iceberg_datasource_v2: When True, ``ray.data.read_iceberg()`` routes
+            through the DataSourceV2 pipeline instead of the V1 ``Datasource``.
+            Defaults to False; override with
+            ``RAY_DATA_USE_ICEBERG_DATASOURCE_V2``. Gated separately from
+            ``use_datasource_v2`` because the Iceberg path is still opt-in.
         parquet_chunker_target_chunk_size: Target chunk size in bytes used by
             ``ParquetFileChunker`` when splitting large Parquet files into
             multiple read tasks. When ``None``, the chunker's built-in default
@@ -899,6 +911,7 @@ class DataContext:
     min_parallelism: int = DEFAULT_MIN_PARALLELISM
     read_op_min_num_blocks: int = DEFAULT_READ_OP_MIN_NUM_BLOCKS
     use_datasource_v2: bool = DEFAULT_USE_DATASOURCE_V2
+    use_iceberg_datasource_v2: bool = DEFAULT_USE_ICEBERG_DATASOURCE_V2
     # Target chunk size in bytes for ``ParquetFileChunker``. When ``None``, the
     # chunker uses its built-in default (currently 1 GiB).
     parquet_chunker_target_chunk_size: Optional[

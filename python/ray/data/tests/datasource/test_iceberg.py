@@ -1,10 +1,13 @@
+import decimal
 import os
 import random
+import uuid
 from typing import Any, Dict, Generator, List, Tuple, Type
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from pkg_resources import parse_version
 from pyiceberg import (
@@ -15,8 +18,9 @@ from pyiceberg import (
 )
 from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.sql import SqlCatalog
+from pyiceberg.manifest import DataFile
 from pyiceberg.partitioning import PartitionField, PartitionSpec
-from pyiceberg.table import Table
+from pyiceberg.table import FileScanTask, Table
 from pyiceberg.transforms import IdentityTransform
 
 import ray
@@ -116,6 +120,19 @@ def pyiceberg_table():
 
     # Delete some data so there are delete file(s)
     table.delete(delete_filter=pyi_expr.GreaterThanOrEqual("col_a", 101))
+
+
+@pytest.fixture(params=[False, True], ids=["reader_v1", "reader_v2"])
+def both_iceberg_readers(request, restore_data_context):
+    """Run a read-path test against both the V1 and V2 Iceberg datasources.
+
+    ``read_iceberg`` picks the implementation off ``DataContext``, so flipping
+    the flag here is enough; ``restore_data_context`` puts it back afterwards.
+    Applied with ``usefixtures`` so the tests themselves stay reader-agnostic:
+    every assertion below must hold for both, which is the parity bar.
+    """
+    restore_data_context.use_iceberg_datasource_v2 = request.param
+    return request.param
 
 
 @pytest.fixture
@@ -227,6 +244,7 @@ def test_filtered_read():
     get_pyarrow_version() < parse_version("14.0.0"),
     reason="PyIceberg 0.7.0 fails on pyarrow <= 14.0.0",
 )
+@pytest.mark.usefixtures("both_iceberg_readers")
 def test_read_basic():
 
     row_filter = pyi_expr.In("col_c", {1, 2, 3, 4, 5, 6, 7, 8})
@@ -327,6 +345,7 @@ def test_write_concurrency():
     get_pyarrow_version() < parse_version("14.0.0"),
     reason="PyIceberg 0.7.0 fails on pyarrow <= 14.0.0",
 )
+@pytest.mark.usefixtures("both_iceberg_readers")
 def test_predicate_pushdown():
     """Test that predicate pushdown works correctly with Iceberg datasource."""
     # Read the table and apply filters using Ray Data expressions
@@ -369,6 +388,7 @@ def test_predicate_pushdown():
     get_pyarrow_version() < parse_version("14.0.0"),
     reason="PyIceberg 0.7.0 fails on pyarrow <= 14.0.0",
 )
+@pytest.mark.usefixtures("both_iceberg_readers")
 def test_predicate_pushdown_with_initial_filter():
     """Test that predicate pushdown works when combined with initial row_filter."""
     # Read with an initial PyIceberg filter
@@ -418,6 +438,7 @@ def test_predicate_pushdown_with_initial_filter():
     get_pyarrow_version() < parse_version("14.0.0"),
     reason="PyIceberg 0.7.0 fails on pyarrow <= 14.0.0",
 )
+@pytest.mark.usefixtures("both_iceberg_readers")
 def test_projection_pushdown():
     """Test that projection pushdown works correctly with Iceberg datasource."""
     # Read the table and apply projection using select
@@ -493,6 +514,7 @@ def test_projection_pushdown():
         ),
     ],
 )
+@pytest.mark.usefixtures("both_iceberg_readers")
 def test_projection_and_predicate_pushdown(
     selected_cols, filter_expr, pyi_filter, expected_cols
 ):
@@ -631,6 +653,7 @@ def test_projection_and_predicate_pushdown(
         ),
     ],
 )
+@pytest.mark.usefixtures("both_iceberg_readers")
 def test_rename_select_filter_combinations(
     rename_map, select_cols, filter_expr, pyi_filter, expected_cols
 ):
@@ -724,6 +747,7 @@ def test_rename_select_filter_combinations(
     get_pyarrow_version() < parse_version("14.0.0"),
     reason="PyIceberg 0.7.0 fails on pyarrow <= 14.0.0",
 )
+@pytest.mark.usefixtures("both_iceberg_readers")
 def test_predicate_pushdown_complex_expression():
     """Test predicate pushdown with complex expressions."""
     # Apply a complex filter expression
@@ -774,6 +798,139 @@ def test_predicate_pushdown_complex_expression():
     )
 
     assert rows_same(result, expected_table)
+
+
+@pytest.mark.skipif(
+    get_pyarrow_version() < parse_version("14.0.0"),
+    reason="PyIceberg 0.7.0 fails on pyarrow <= 14.0.0",
+)
+def test_predicate_pushdown_with_untranslatable_conjunct(both_iceberg_readers):
+    """A predicate Iceberg cannot express must still be applied, above the read.
+
+    Iceberg's expression language has no arithmetic, so ``col_a * 2 <= 100``
+    has no equivalent to push. What must not happen is the predicate being
+    dropped: whatever the scanner declines to take has to come back as a
+    ``Filter``, or the read returns rows the user filtered out.
+
+    Not a parity test: V1 has no residual mechanism at all, so it raises on the
+    whole query rather than filtering above the read. Pinned here so that the
+    difference is deliberate and so V1's behaviour cannot change unnoticed.
+    """
+    ds = ray.data.read_iceberg(
+        table_identifier=f"{_DB_NAME}.{_TABLE_NAME}",
+        catalog_kwargs=_CATALOG_KWARGS.copy(),
+    )
+    filtered_ds = ds.filter(expr=(col("col_c") >= 3) & (col("col_a") * 2 <= 100))
+
+    if not both_iceberg_readers:
+        with pytest.raises(ValueError, match="Arithmetic operations"):
+            filtered_ds.to_pandas()
+        return
+
+    result = filtered_ds.to_pandas()
+
+    optimized_plan = LogicalOptimizer().optimize(filtered_ds._logical_plan)
+    assert _has_operator_type(optimized_plan, Filter), (
+        "the untranslatable conjunct has to survive as a Filter, got operators: "
+        f"{_get_operator_types(optimized_plan)}"
+    )
+
+    sql_catalog = pyi_catalog.load_catalog(**_CATALOG_KWARGS)
+    expected = sql_catalog.load_table(f"{_DB_NAME}.{_TABLE_NAME}").scan().to_pandas()
+    expected = expected[(expected["col_c"] >= 3) & (expected["col_a"] * 2 <= 100)]
+    assert len(expected) > 0, "fixture must leave rows on both sides of the filter"
+    assert rows_same(result, expected)
+
+
+@pytest.fixture
+def empty_iceberg_table():
+    """A table that exists and declares its schema but holds no data files."""
+    catalog = SqlCatalog(
+        _CATALOG_NAME,
+        **{
+            "uri": f"sqlite:///{_WAREHOUSE_PATH}/ray_pyiceberg_test_catalog.db",
+            "warehouse": f"file://{_WAREHOUSE_PATH}",
+        },
+    )
+    identifier = f"{_DB_NAME}.ray_empty"
+    if (_DB_NAME, "ray_empty") in catalog.list_tables(_DB_NAME):
+        catalog.drop_table(identifier)
+    catalog.create_table(
+        identifier,
+        schema=pyi_schema.Schema(
+            pyi_types.NestedField(
+                field_id=1,
+                name="col_a",
+                field_type=pyi_types.IntegerType(),
+                required=False,
+            ),
+            pyi_types.NestedField(
+                field_id=2,
+                name="col_b",
+                field_type=pyi_types.StringType(),
+                required=False,
+            ),
+        ),
+    )
+    yield identifier
+    catalog.drop_table(identifier)
+
+
+@pytest.mark.skipif(
+    get_pyarrow_version() < parse_version("14.0.0"),
+    reason="PyIceberg 0.7.0 fails on pyarrow <= 14.0.0",
+)
+def test_read_table_with_no_data_files(both_iceberg_readers, empty_iceberg_table):
+    """A declared-but-empty table reads as an empty dataset with the right schema.
+
+    The catalog knows the columns exactly, so there is nothing to sample and
+    nothing to fail on -- which is what ``schema_needs_file_sample = False``
+    buys.
+
+    Not a parity test: V1 derives its schema from the files it read, of which
+    there are none, so it reports no schema at all. Pinned here for the same
+    reason as the residual test above.
+    """
+    ds = ray.data.read_iceberg(
+        table_identifier=empty_iceberg_table,
+        catalog_kwargs=_CATALOG_KWARGS.copy(),
+    )
+    if not both_iceberg_readers:
+        assert ds.schema() is None
+        assert ds.count() == 0
+        return
+
+    assert ds.schema().names == ["col_a", "col_b"]
+    assert ds.count() == 0
+    assert ds.take_all() == []
+
+
+@pytest.mark.skipif(
+    get_pyarrow_version() < parse_version("14.0.0"),
+    reason="PyIceberg 0.7.0 fails on pyarrow <= 14.0.0",
+)
+@pytest.mark.usefixtures("both_iceberg_readers")
+def test_read_pins_the_snapshot_across_executions():
+    """Two executions of one ``Dataset`` see the same table version.
+
+    V2 lists files inside a task at execution time rather than on the driver at
+    plan time, so without pinning the snapshot up front, a write between two
+    executions would change the answer -- and so would a retried task.
+    """
+    ds = ray.data.read_iceberg(
+        table_identifier=f"{_DB_NAME}.{_TABLE_NAME}",
+        catalog_kwargs=_CATALOG_KWARGS.copy(),
+    )
+    before = len(ds.take_all())
+
+    sql_catalog = pyi_catalog.load_catalog(**_CATALOG_KWARGS)
+    sql_catalog.load_table(f"{_DB_NAME}.{_TABLE_NAME}").append(create_pa_table())
+
+    after = len(ds.take_all())
+    assert before == after, (
+        "the second execution picked up rows written after the read was "
+        f"created ({before} -> {after})"
+    )
 
 
 # Helper functions and fixtures for schema evolution tests
@@ -2025,6 +2182,477 @@ def test_write_retry_on_transient_error(pyiceberg_table, fast_retry_config):
 
     # Verify write result has data files
     assert len(result.data_files) > 0, "Expected data files in result"
+
+
+@pytest.mark.skipif(
+    get_pyarrow_version() < parse_version("14.0.0"),
+    reason="PyIceberg 0.7.0 fails on pyarrow <= 14.0.0",
+)
+@pytest.mark.usefixtures("both_iceberg_readers")
+def test_count_and_empty_projection():
+    """``count()`` and a zero-column read must still see every row.
+
+    Both go through an empty projection, where a reader can silently return
+    zero-row blocks instead of zero-width ones.
+    """
+    sql_catalog = pyi_catalog.load_catalog(**_CATALOG_KWARGS)
+    expected = len(
+        sql_catalog.load_table(f"{_DB_NAME}.{_TABLE_NAME}").scan().to_arrow()
+    )
+
+    ds = ray.data.read_iceberg(
+        table_identifier=f"{_DB_NAME}.{_TABLE_NAME}",
+        catalog_kwargs=_CATALOG_KWARGS.copy(),
+    )
+    assert ds.count() == expected
+    empty_projection = ds.select_columns([])
+    assert empty_projection.count() == expected
+    assert empty_projection.schema().names == []
+
+
+@pytest.mark.skipif(
+    get_pyarrow_version() < parse_version("14.0.0"),
+    reason="PyIceberg 0.7.0 fails on pyarrow <= 14.0.0",
+)
+class TestIcebergDatasourceV2:
+    """Tests for the V2-only machinery, which has no V1 counterpart.
+
+    The parity tests above cover behavior shared with V1; these cover the two
+    pieces V2 adds: the manifest that carries per-file Iceberg state from the
+    listing task to the read tasks, and the bin packing that decides how many
+    read tasks there are.
+    """
+
+    @staticmethod
+    def _load_table() -> Table:
+        return pyi_catalog.load_catalog(**_CATALOG_KWARGS).load_table(
+            f"{_DB_NAME}.{_TABLE_NAME}"
+        )
+
+    @staticmethod
+    def _indexer(**kwargs: Any):
+        from ray.data._internal.datasource_v2.listing.iceberg_file_indexer import (
+            IcebergFileIndexer,
+        )
+
+        catalog_kwargs = _CATALOG_KWARGS.copy()
+        return IcebergFileIndexer(
+            table_identifier=f"{_DB_NAME}.{_TABLE_NAME}",
+            catalog_name=catalog_kwargs.pop("name"),
+            catalog_kwargs=catalog_kwargs,
+            scan_kwargs={},
+            snapshot_id=None,
+            row_filter=pyi_expr.AlwaysTrue(),
+            **kwargs,
+        )
+
+    def test_manifest_preserves_every_field_the_reader_uses(self):
+        """A manifest round trip must rebuild each scan task field-for-field."""
+        from ray.data._internal.datasource_v2.iceberg_manifest import (
+            manifest_from_scan_tasks,
+            scan_tasks_from_manifest,
+        )
+
+        table = self._load_table()
+        tasks = list(table.scan().plan_files())
+        assert tasks, "fixture table should plan at least one file"
+
+        manifest = manifest_from_scan_tasks(tasks, table.metadata)
+        assert len(manifest) == len(tasks)
+
+        rebuilt = list(scan_tasks_from_manifest(manifest, table.metadata))
+        assert len(rebuilt) == len(tasks)
+        for original, copied in zip(tasks, rebuilt):
+            assert copied.file.file_path == original.file.file_path
+            assert copied.file.file_format == original.file.file_format
+            assert copied.file.spec_id == original.file.spec_id
+            assert copied.file.record_count == original.file.record_count
+            assert copied.file.file_size_in_bytes == original.file.file_size_in_bytes
+            # Identity partition values back a projected column that is
+            # missing from the data file, so they must survive verbatim --
+            # including their Iceberg-internal Python types (a date is an int
+            # of days), which is what the typed struct column preserves.
+            assert copied.file.partition == original.file.partition
+            assert [type(v) for v in copied.file.partition] == [
+                type(v) for v in original.file.partition
+            ]
+            assert sorted(f.file_path for f in copied.delete_files) == sorted(
+                f.file_path for f in original.delete_files
+            )
+
+    def test_manifest_carries_delete_files(self):
+        """Delete files attached to a task must survive the round trip.
+
+        Built by hand rather than from the fixture: PyIceberg 0.11.1 deletes
+        copy-on-write (it rewrites the data files), so no scan task it plans
+        ever carries one -- yet a table written by an engine that deletes
+        merge-on-read will, and dropping them would silently resurrect deleted
+        rows.
+        """
+        from pyiceberg.manifest import DataFileContent, FileFormat
+
+        from ray.data._internal.datasource_v2.iceberg_manifest import (
+            manifest_from_scan_tasks,
+            scan_tasks_from_manifest,
+        )
+
+        table = self._load_table()
+        task = list(table.scan().plan_files())[0]
+        delete_paths = [
+            "s3://bucket/deletes/b.parquet",
+            "s3://bucket/deletes/a.parquet",
+        ]
+        deletes = {
+            DataFile.from_args(
+                content=DataFileContent.POSITION_DELETES,
+                file_path=path,
+                file_format=FileFormat.PARQUET,
+                partition=task.file.partition,
+                record_count=1,
+                file_size_in_bytes=1,
+            )
+            for path in delete_paths
+        }
+        with_deletes = FileScanTask(task.file, delete_files=deletes)
+
+        (rebuilt,) = scan_tasks_from_manifest(
+            manifest_from_scan_tasks([with_deletes], table.metadata), table.metadata
+        )
+        # A set on both sides: PyIceberg holds delete files unordered, so only
+        # membership is meaningful (the manifest column itself is sorted, which
+        # is what makes a row reproducible).
+        assert {f.file_path for f in rebuilt.delete_files} == set(delete_paths)
+        assert all(
+            f.content == DataFileContent.POSITION_DELETES for f in rebuilt.delete_files
+        )
+
+    def test_position_deletes_are_applied_by_the_reader(self, tmp_path):
+        """A merge-on-read table's deleted rows must not come back.
+
+        The carrier test above proves the delete file survives the manifest;
+        this one proves it is then acted on. Both build the delete file by hand
+        for the same reason: PyIceberg 0.11.1 can only delete copy-on-write, so
+        no table it writes has one, and the whole merge-on-read path -- which
+        every other engine's deletes take -- would otherwise ship with no test
+        at all.
+        """
+        from pyiceberg.manifest import DataFileContent, FileFormat
+
+        from ray.data._internal.datasource_v2.iceberg_manifest import (
+            manifest_from_scan_tasks,
+        )
+        from ray.data._internal.datasource_v2.readers.iceberg_file_reader import (
+            IcebergFileReader,
+        )
+
+        table = self._load_table()
+        task = list(table.scan().plan_files())[0]
+
+        def read(scan_task) -> List[int]:
+            reader = IcebergFileReader(
+                table_metadata=table.metadata,
+                io=table.io,
+                projected_schema=table.scan().projection(),
+                row_filter=pyi_expr.AlwaysTrue(),
+            )
+            manifest = manifest_from_scan_tasks([scan_task], table.metadata)
+            return [
+                value
+                for block in reader.read(manifest)
+                for value in block.column("col_a").to_pylist()
+            ]
+
+        before = read(task)
+        assert len(before) > 3, "need a file with rows to delete from"
+
+        # Position deletes name (data file, row offset) pairs. Offsets are
+        # absolute within the file, which is why a reader may not split one.
+        deleted_positions = [0, 2]
+        delete_path = tmp_path / "pos-deletes.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "file_path": pa.array(
+                        [task.file.file_path] * len(deleted_positions), pa.string()
+                    ),
+                    "pos": pa.array(deleted_positions, pa.int64()),
+                }
+            ),
+            delete_path,
+        )
+        delete_file = DataFile.from_args(
+            content=DataFileContent.POSITION_DELETES,
+            file_path=f"file://{delete_path}",
+            file_format=FileFormat.PARQUET,
+            partition=task.file.partition,
+            record_count=len(deleted_positions),
+            file_size_in_bytes=delete_path.stat().st_size,
+        )
+
+        after = read(FileScanTask(task.file, delete_files={delete_file}))
+        expected = [
+            value
+            for position, value in enumerate(before)
+            if position not in deleted_positions
+        ]
+        assert after == expected
+
+    def test_rebuilt_scan_tasks_decode_identically(self):
+        """The rebuilt tasks must read byte-for-byte what the originals do."""
+        from pyiceberg.io.pyarrow import ArrowScan
+
+        from ray.data._internal.datasource_v2.iceberg_manifest import (
+            manifest_from_scan_tasks,
+            scan_tasks_from_manifest,
+        )
+
+        table = self._load_table()
+        scan = table.scan()
+        tasks = list(scan.plan_files())
+        rebuilt = list(
+            scan_tasks_from_manifest(
+                manifest_from_scan_tasks(tasks, table.metadata), table.metadata
+            )
+        )
+
+        def read(scan_tasks):
+            return ArrowScan(
+                table_metadata=table.metadata,
+                io=table.io,
+                projected_schema=scan.projection(),
+                row_filter=pyi_expr.AlwaysTrue(),
+                case_sensitive=True,
+            ).to_table(scan_tasks)
+
+        assert read(rebuilt).equals(read(tasks))
+
+    @staticmethod
+    def _typed_partition_metadata(*specs: PartitionSpec):
+        """Table metadata over a schema wide enough to partition on every
+        awkward type, without writing a table (writing a transformed partition
+        needs the ``pyiceberg_core`` extra)."""
+        from pyiceberg.table.metadata import TableMetadataV2
+        from pyiceberg.table.sorting import UNSORTED_SORT_ORDER
+
+        schema = pyi_schema.Schema(
+            pyi_types.NestedField(1, "region", pyi_types.StringType(), required=False),
+            pyi_types.NestedField(2, "ts", pyi_types.TimestampType(), required=False),
+            pyi_types.NestedField(
+                3, "amount", pyi_types.DecimalType(9, 2), required=False
+            ),
+            pyi_types.NestedField(4, "gid", pyi_types.UUIDType(), required=False),
+            pyi_types.NestedField(5, "blob", pyi_types.BinaryType(), required=False),
+            pyi_types.NestedField(6, "flag", pyi_types.BooleanType(), required=False),
+        )
+        return TableMetadataV2(
+            location="file:///tmp/typed_partitions",
+            last_column_id=6,
+            current_schema_id=0,
+            schemas=[schema],
+            partition_specs=list(specs),
+            default_spec_id=specs[0].spec_id,
+            last_partition_id=1005,
+            sort_orders=[UNSORTED_SORT_ORDER],
+            default_sort_order_id=UNSORTED_SORT_ORDER.order_id,
+        )
+
+    @staticmethod
+    def _scan_task(spec_id: int, partition, path: str) -> FileScanTask:
+        from pyiceberg.manifest import DataFileContent, FileFormat
+
+        data_file = DataFile.from_args(
+            content=DataFileContent.DATA,
+            file_path=path,
+            file_format=FileFormat.PARQUET,
+            partition=partition,
+            record_count=7,
+            file_size_in_bytes=99,
+        )
+        data_file.spec_id = spec_id
+        return FileScanTask(data_file)
+
+    def test_partition_column_is_typed_and_lossless(self):
+        """Partition values survive as Iceberg's own internal representations.
+
+        The manifest stores them as an Arrow struct typed by the partition spec
+        -- the same shape Iceberg stores them in -- so a date stays the int of
+        days PyIceberg reads positionally, not a ``datetime.date``. The types
+        here are the ones a naive encoding gets wrong: a transform whose result
+        type differs from its source (``day(ts)`` is a date over a timestamp),
+        a decimal, a UUID (which Arrow maps to an extension type), raw binary,
+        and a bucket transform.
+        """
+        from pyiceberg.transforms import BucketTransform, DayTransform
+        from pyiceberg.typedef import Record
+
+        from ray.data._internal.datasource_v2.iceberg_manifest import (
+            manifest_from_scan_tasks,
+            partition_arrow_type,
+            scan_tasks_from_manifest,
+        )
+
+        spec = PartitionSpec(
+            PartitionField(1, 1000, IdentityTransform(), "region"),
+            PartitionField(2, 1001, DayTransform(), "ts_day"),
+            PartitionField(3, 1002, IdentityTransform(), "amount"),
+            PartitionField(4, 1003, IdentityTransform(), "gid"),
+            PartitionField(5, 1004, IdentityTransform(), "blob"),
+            PartitionField(6, 1005, BucketTransform(16), "flag_bucket"),
+            spec_id=0,
+        )
+        metadata = self._typed_partition_metadata(spec)
+        partition_type = partition_arrow_type(metadata)
+        assert partition_type is not None
+        assert [field.name for field in partition_type] == [
+            "region",
+            "ts_day",
+            "amount",
+            "gid",
+            "blob",
+            "flag_bucket",
+        ]
+
+        tasks = [
+            # 19723 = 2024-01-01 in days since the epoch; -1 is pre-epoch.
+            self._scan_task(
+                0,
+                Record(
+                    "us-west-2",
+                    19723,
+                    decimal.Decimal("1.25"),
+                    uuid.UUID(int=7).bytes,
+                    b"\x01\x02",
+                    3,
+                ),
+                "a.parquet",
+            ),
+            self._scan_task(
+                0, Record(None, -1, decimal.Decimal("0.01"), None, None, 0), "b.parquet"
+            ),
+        ]
+        manifest = manifest_from_scan_tasks(tasks, metadata)
+        assert manifest.as_block().schema.field("__ib_partition").type == partition_type
+
+        for original, copied in zip(
+            tasks, scan_tasks_from_manifest(manifest, metadata)
+        ):
+            assert copied.file.partition == original.file.partition
+            assert [type(v) for v in copied.file.partition] == [
+                type(v) for v in original.file.partition
+            ]
+
+    def test_partition_column_survives_partition_evolution(self):
+        """Files written under different specs decode against their own spec.
+
+        The struct is the union of every spec's fields keyed by partition-field
+        id, so a row fills only its own spec's children -- and a record rebuilt
+        for the narrower spec has that spec's arity, not the union's.
+        """
+        from pyiceberg.typedef import Record
+
+        from ray.data._internal.datasource_v2.iceberg_manifest import (
+            manifest_from_scan_tasks,
+            scan_tasks_from_manifest,
+        )
+
+        wide = PartitionSpec(
+            PartitionField(1, 1000, IdentityTransform(), "region"),
+            PartitionField(3, 1002, IdentityTransform(), "amount"),
+            spec_id=0,
+        )
+        narrow = PartitionSpec(
+            PartitionField(1, 1000, IdentityTransform(), "region"), spec_id=1
+        )
+        metadata = self._typed_partition_metadata(wide, narrow)
+        tasks = [
+            self._scan_task(0, Record("us", decimal.Decimal("2.00")), "a.parquet"),
+            self._scan_task(1, Record("eu"), "b.parquet"),
+        ]
+
+        rebuilt = list(
+            scan_tasks_from_manifest(
+                manifest_from_scan_tasks(tasks, metadata), metadata
+            )
+        )
+        assert [len(t.file.partition) for t in rebuilt] == [2, 1]
+        for original, copied in zip(tasks, rebuilt):
+            assert copied.file.partition == original.file.partition
+
+    def test_unpartitioned_table_has_no_partition_struct(self):
+        """An unpartitioned table carries a null column, not an empty struct."""
+        from pyiceberg.typedef import Record
+
+        from ray.data._internal.datasource_v2.iceberg_manifest import (
+            manifest_from_scan_tasks,
+            partition_arrow_type,
+            scan_tasks_from_manifest,
+        )
+
+        metadata = self._typed_partition_metadata(PartitionSpec(spec_id=0))
+        assert partition_arrow_type(metadata) is None
+
+        tasks = [self._scan_task(0, Record(), "a.parquet")]
+        (rebuilt,) = scan_tasks_from_manifest(
+            manifest_from_scan_tasks(tasks, metadata), metadata
+        )
+        assert rebuilt.file.partition == Record()
+
+    def test_bin_packing_sets_the_number_of_read_units(self):
+        """Read units are whole files packed up to the byte budget.
+
+        The budget counts *estimated decoded* bytes, not the compressed bytes
+        Iceberg records -- decoded is the quantity that matters downstream, and
+        the estimate is the one thing in the path expected to be replaced
+        (:func:`estimate_decoded_size`), so the test goes through it rather
+        than around it.
+        """
+        from ray.data._internal.datasource_v2.listing.iceberg_file_indexer import (
+            estimate_decoded_size,
+        )
+
+        tasks = list(self._load_table().scan().plan_files())
+        compressed_bytes = sum(task.file.file_size_in_bytes for task in tasks)
+        estimated_bytes = sum(estimate_decoded_size(task.file) for task in tasks)
+
+        # A budget below any single file gives one file per read unit.
+        per_file = list(
+            self._indexer(max_bin_bytes=1).list_files(None, filesystem=None)
+        )
+        assert len(per_file) == len(tasks)
+        assert all(len(manifest) == 1 for manifest in per_file)
+
+        # A budget above the whole table's estimate gives one read unit.
+        packed = list(
+            self._indexer(max_bin_bytes=estimated_bytes * 2).list_files(
+                None, filesystem=None
+            )
+        )
+        assert len(packed) == 1
+        assert len(packed[0]) == len(tasks)
+
+        # ... and the estimate is what is being counted: a budget equal to the
+        # table's compressed size is not enough to hold it in one unit.
+        assert estimated_bytes > compressed_bytes
+        by_compressed = list(
+            self._indexer(max_bin_bytes=compressed_bytes).list_files(
+                None, filesystem=None
+            )
+        )
+        assert len(by_compressed) > 1
+
+    def test_listing_prunes_files_with_the_pushed_predicate(self):
+        """A pushed predicate must reach ``plan_files``, not just the reader.
+
+        Pruning during listing is the whole point of pushing the predicate onto
+        ``ListFiles``: the fixture is partitioned by ``col_c``, so a predicate
+        on it should leave whole files unlisted.
+        """
+        indexer = self._indexer(max_bin_bytes=1)
+        unfiltered = list(indexer.list_files(None, filesystem=None))
+        filtered = list(
+            indexer.list_files(None, filesystem=None, predicate=col("col_c") == 3)
+        )
+        assert 0 < len(filtered) < len(unfiltered)
 
 
 if __name__ == "__main__":
